@@ -11,5 +11,6 @@
     clippy::suboptimal_flops
 )]
 
+pub mod classify;
 pub mod entropy;
 pub mod model;
