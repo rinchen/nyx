@@ -1,0 +1,33 @@
+[package]
+name = "nyx"
+version = "0.1.0"
+edition = "2021"
+description = "Nyx: adaptive staged context-mixing compressor"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+byteorder = "1"
+crc32fast = "1"
+thiserror = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "nyx"
+path = "src/main.rs"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
