@@ -4,6 +4,7 @@
 //! the true bit is known. The codec uses a stack of these per block, mixed by
 //! [`mixer::LogisticMixer`](super::model::mixer::LogisticMixer).
 
+pub mod ctable;
 pub mod exec;
 pub mod lzp;
 pub mod mixer;

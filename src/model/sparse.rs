@@ -7,16 +7,17 @@
 
 use super::BitModel;
 use super::ByteAssembler;
+use super::ctable::CtxTable;
 
-const INIT: u32 = 32;
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
+const CTX_BITS: u32 = 21;
 
 /// Sparse-context bit model keyed on **byte** history (offsets -1, -4, and the most
 /// recent completed byte).
 pub struct Sparse {
     asm: ByteAssembler,
-    tables: std::collections::HashMap<u64, [u32; 2]>,
+    ctab: CtxTable,
 }
 
 impl Sparse {
@@ -25,10 +26,11 @@ impl Sparse {
     pub fn new() -> Self {
         Self {
             asm: ByteAssembler::new(8),
-            tables: std::collections::HashMap::new(),
+            ctab: CtxTable::new(CTX_BITS),
         }
     }
 
+    #[inline]
     fn key(&self) -> u64 {
         let n = self.asm.bytes_len();
         let last = self.asm.last_byte();
@@ -38,31 +40,26 @@ impl Sparse {
         // distinct, initially-uniform contexts rather than colliding with full history.
         (n << 40) | (u64::from(last) << 16) | (u64::from(m4) << 8) | u64::from(m1)
     }
-
-    fn entry(&self) -> [u32; 2] {
-        self.tables.get(&self.key()).copied().unwrap_or([INIT, INIT])
-    }
 }
 
 impl BitModel for Sparse {
     fn predict(&self) -> u16 {
-        let [c0, c1] = self.entry();
+        let [c0, c1] = self.ctab.get(self.key());
         let tot = f64::from(c0 + c1);
         (f64::from(c1) / tot * f64::from(MAX_PROB))
             .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
     }
 
     fn update(&mut self, bit: bool) {
-        // Advance byte context when a full byte completes; the key then reflects it.
-        let _ = self.asm.push_bit(bit);
+        // Use the pre-push context (matches predict), then advance the assembler.
         let k = self.key();
-        let e = self.tables.entry(k).or_insert([INIT, INIT]);
-        e[usize::from(bit)] += 1;
+        self.asm.push_bit(bit);
+        self.ctab.update(k, bit);
     }
 
     fn reset(&mut self) {
         self.asm.reset();
-        self.tables.clear();
+        self.ctab.reset();
     }
 }
 

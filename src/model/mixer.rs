@@ -5,6 +5,11 @@
 //! the weights online via stochastic gradient descent on the logistic loss. This is the
 //! "context mixing" step that lets heterogeneous models (order, sparse, exec, LZP) cover
 //! for each other per bit, rather than picking a single best model.
+//!
+//! Note: a secondary SSE refinement stage was prototyped but measured as neutral on the
+//! Silesia/Mixed subset (the 2-bit history context was too weak to pay off), so the
+//! production mixer is the single linear logistic mix. See the plan (§10) for the
+//! higher-order / indirect-context redesign that is the actual path to zstd ratio parity.
 
 use super::BitModel;
 
@@ -121,7 +126,7 @@ mod tests {
     #[test]
     fn mixer_favors_correct_model() {
         // Biased data: feed bytes that are mostly 1-bits (0xFF 3 of every 4 steps).
-        // The models learn the bias and the mixer's fused prob should track it.
+        // The linear logistic mix learns the bias, so the fused prob should track it.
         let mut m0 = OrderN::new(0);
         let mut m1 = OrderN::new(0);
         let mut mixer = LogisticMixer::new(2);

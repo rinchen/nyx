@@ -7,15 +7,16 @@
 
 use super::BitModel;
 use super::ByteAssembler;
+use super::ctable::CtxTable;
 
-const INIT: u32 = 32;
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
+const CTX_BITS: u32 = 20;
 
 /// Executable-oriented 2D-context bit model.
 pub struct Exec {
     asm: ByteAssembler,
-    tables: std::collections::HashMap<u32, [u32; 2]>,
+    ctab: CtxTable,
 }
 
 impl Exec {
@@ -24,19 +25,17 @@ impl Exec {
     pub fn new() -> Self {
         Self {
             asm: ByteAssembler::new(2),
-            tables: std::collections::HashMap::new(),
+            ctab: CtxTable::new(CTX_BITS),
         }
     }
 
-    fn key(&self) -> u32 {
+    #[inline]
+    fn key(&self) -> u64 {
         let prev = self.asm.prev_byte();
         let cur = self.asm.last_byte();
         let delta = cur.wrapping_sub(prev);
-        (u32::from(prev) << 8) | u32::from(delta)
-    }
-
-    fn entry(&self) -> [u32; 2] {
-        self.tables.get(&self.key()).copied().unwrap_or([INIT, INIT])
+        // pack (prev, delta) into a 64-bit context
+        (u64::from(prev) << 8) | u64::from(delta)
     }
 }
 
@@ -45,23 +44,22 @@ impl BitModel for Exec {
         if !self.asm.has_byte() {
             return 2048; // no byte context yet
         }
-        let [c0, c1] = self.entry();
+        let [c0, c1] = self.ctab.get(self.key());
         let tot = f64::from(c0 + c1);
         (f64::from(c1) / tot * f64::from(MAX_PROB))
             .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
     }
 
     fn update(&mut self, bit: bool) {
-        // Advance byte context; key() reflects completed bytes thereafter.
-        let _ = self.asm.push_bit(bit);
+        // Use the pre-push context (matches predict), then advance the assembler.
         let k = self.key();
-        let e = self.tables.entry(k).or_insert([INIT, INIT]);
-        e[bit as usize] += 1;
+        self.asm.push_bit(bit);
+        self.ctab.update(k, bit);
     }
 
     fn reset(&mut self) {
         self.asm.reset();
-        self.tables.clear();
+        self.ctab.reset();
     }
 }
 

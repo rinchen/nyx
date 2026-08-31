@@ -1,29 +1,30 @@
 //! Order-N adaptive bit model with per-context bit frequency counts.
 //!
 //! Context is the last `order` bytes (or fewer at the start of a block). Each context
-//! holds a `[count0, count1]` tally; the prediction is `count1 / (count0+count1)`,
-//! quantized to 12-bit and clamped away from the extremes so the entropy coder never
-//! sees a probability of exactly 0 or 1.
+//! holds a `[count0, count1]` tally (stored in a direct-addressed [`CtxTable`]); the
+//! prediction is `count1 / (count0+count1)`, quantized to 12-bit and clamped away from
+//! the extremes so the entropy coder never sees a probability of exactly 0 or 1.
 
 use super::BitModel;
 use super::ByteAssembler;
+use super::ctable::CtxTable;
 
-const INIT: u32 = 32; // initial count per side so a fresh context is ~50/50
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
+/// Address bits for the context table (2^21 = 2M buckets). Order-2 byte context has at
+/// most 2^16 contexts × 8 bit-positions = 2^19 live keys, so this leaves headroom.
+const CTX_BITS: u32 = 21;
 
 /// Order-N context model over **bytes**.
 ///
-/// `update` receives one coded bit at a time; a [`ByteAssembler`] rebuilds whole
-/// bytes from those bits, and the model's context is the last `order` *completed
-/// bytes* (not bits). Each byte-context holds a `[count0, count1]` tally for the
-/// current bit position; the prediction is `count1 / (count0+count1)`, quantized to
-/// 12-bit and clamped away from the extremes.
+/// `update` receives one coded bit at a time; a [`ByteAssembler`] rebuilds whole bytes
+/// from those bits, and the model's context is the last `order` *completed bytes* (not
+/// bits). Each byte-context holds a `[count0, count1]` tally for the current bit
+/// position; the prediction is `count1 / (count0+count1)`.
 pub struct OrderN {
     order: usize,
     asm: ByteAssembler,
-    // Keyed by (byte-context, bit-position-in-byte). bit_pos in 0..8.
-    tables: std::collections::HashMap<(u64, u8), [u32; 2]>,
+    ctab: CtxTable,
 }
 
 impl OrderN {
@@ -33,52 +34,47 @@ impl OrderN {
         Self {
             order,
             asm: ByteAssembler::new(order.max(1)),
-            tables: std::collections::HashMap::new(),
+            ctab: CtxTable::new(CTX_BITS),
         }
     }
 
-    fn key(&self) -> (u64, u8) {
+    /// Context key: the last `order` bytes, shifted up, OR'd with the current bit
+    /// position within the byte (so the same bytes predict different bits per position).
+    #[inline]
+    fn ctx(&self) -> u64 {
         let bytes = self.asm.last(self.order);
         let mut k = 0u64;
         for &b in bytes {
             k = (k << 8) | u64::from(b);
         }
-        // The bit position within the current byte matters: the same preceding
-        // bytes predict different bits depending on which bit of the byte we're on.
-        let bit_pos = self.asm.nbits();
-        (k, bit_pos)
-    }
-
-    fn entry(&self) -> [u32; 2] {
-        self.tables.get(&self.key()).copied().unwrap_or([INIT, INIT])
+        (k << 3) | u64::from(self.asm.nbits())
     }
 }
 
 impl BitModel for OrderN {
     fn predict(&self) -> u16 {
-        let [c0, c1] = self.entry();
+        let [c0, c1] = self.ctab.get(self.ctx());
         let tot = f64::from(c0 + c1);
         (f64::from(c1) / tot * f64::from(MAX_PROB))
             .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
     }
 
     fn update(&mut self, bit: bool) {
-        // Record the tally under the bit position we're currently coding (before the
-        // byte assembler advances), so the 8th bit of a byte is filed at bit_pos 7, not 0.
-        let bit_pos = self.asm.nbits();
-        self.asm.push_bit(bit);
+        // File the tally under the SAME context `predict()` used (the pre-push state), so
+        // the model learns causally and correctly. Predict keys on the assembler's current
+        // bytes + current bit position; compute that here *before* advancing the assembler.
         let mut k = 0u64;
         for &b in self.asm.last(self.order) {
             k = (k << 8) | u64::from(b);
         }
-        let key = (k, bit_pos);
-        let e = self.tables.entry(key).or_insert([INIT, INIT]);
-        e[bit as usize] += 1;
+        let ctx = (k << 3) | u64::from(self.asm.nbits());
+        self.asm.push_bit(bit);
+        self.ctab.update(ctx, bit);
     }
 
     fn reset(&mut self) {
         self.asm.reset();
-        self.tables.clear();
+        self.ctab.reset();
     }
 }
 
