@@ -43,7 +43,13 @@ impl LogisticMixer {
             *slot = (s * MAX_PROB as f32).clamp(MIN_PROB as f32, MAX_PROB as f32) as u16;
         }
         Self {
-            weights: vec![0.0; n],
+            // Start each weight at 1.0 so the mix is a sensible average of the
+            // (stretched) model probabilities from the first bit. A zero
+            // initialization makes `mix` return 50/50 until SGD slowly learns to
+            // trust the models — which costs most of the compression on small/early
+            // blocks. Positive weights also keep the mix grounded in the models'
+            // evidence rather than the prior.
+            weights: vec![1.0; n],
             lr: 0.02,
             stretch,
             squash,
@@ -114,23 +120,25 @@ mod tests {
 
     #[test]
     fn mixer_favors_correct_model() {
-        // Biased data: bit stream is mostly 1s. A single order-0 model and the mixer
-        // should both learn, and the mixer's fused prob should track the bias.
+        // Biased data: feed bytes that are mostly 1-bits (0xFF 3 of every 4 steps).
+        // The models learn the bias and the mixer's fused prob should track it.
         let mut m0 = OrderN::new(0);
         let mut m1 = OrderN::new(0);
         let mut mixer = LogisticMixer::new(2);
         let mut last_probs = [2048u16; 2];
         for step in 0..200 {
-            let bit = step % 4 != 0; // ~75% ones
-            last_probs[0] = m0.predict();
-            last_probs[1] = m1.predict();
-            let fused = mixer.mix(&last_probs);
-            // fused should drift above 2048 on average
-            m0.update(bit);
-            m1.update(bit);
-            mixer.update(&last_probs, bit);
-            if step > 150 {
-                assert!(i32::from(fused) > 2048, "mixer should learn the bias");
+            let byte: u8 = if step % 4 != 0 { 0xFF } else { 0x00 };
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1 == 1;
+                last_probs[0] = m0.predict();
+                last_probs[1] = m1.predict();
+                let fused = mixer.mix(&last_probs);
+                m0.update(bit);
+                m1.update(bit);
+                mixer.update(&last_probs, bit);
+                if step > 150 && bit {
+                    assert!(i32::from(fused) > 2048, "mixer should learn the bias");
+                }
             }
         }
     }

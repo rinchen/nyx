@@ -6,14 +6,16 @@
 //! memory cost.
 
 use super::BitModel;
+use super::ByteAssembler;
 
 const INIT: u32 = 32;
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
-/// Sparse-context bit model.
+/// Sparse-context bit model keyed on **byte** history (offsets -1, -4, and the most
+/// recent completed byte).
 pub struct Sparse {
-    ctx: Vec<u8>,
+    asm: ByteAssembler,
     tables: std::collections::HashMap<u64, [u32; 2]>,
 }
 
@@ -22,18 +24,19 @@ impl Sparse {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            ctx: Vec::with_capacity(4),
+            asm: ByteAssembler::new(8),
             tables: std::collections::HashMap::new(),
         }
     }
 
     fn key(&self) -> u64 {
-        let n = self.ctx.len();
-        let last = *self.ctx.last().unwrap_or(&0);
-        let m1 = *self.ctx.get(n.wrapping_sub(1)).unwrap_or(&0);
-        let m4 = *self.ctx.get(n.wrapping_sub(4)).unwrap_or(&0);
-        // key = last<<16 | m4<<8 | m1
-        (u64::from(last) << 16) | (u64::from(m4) << 8) | u64::from(m1)
+        let n = self.asm.bytes_len();
+        let last = self.asm.last_byte();
+        let m1 = *self.asm.last(2).first().unwrap_or(&0);
+        let m4 = *self.asm.last(5).first().unwrap_or(&0);
+        // Include n in the key so partial history (fewer than 4 bytes seen) maps to
+        // distinct, initially-uniform contexts rather than colliding with full history.
+        (n << 40) | (u64::from(last) << 16) | (u64::from(m4) << 8) | u64::from(m1)
     }
 
     fn entry(&self) -> [u32; 2] {
@@ -50,17 +53,15 @@ impl BitModel for Sparse {
     }
 
     fn update(&mut self, bit: bool) {
+        // Advance byte context when a full byte completes; the key then reflects it.
+        let _ = self.asm.push_bit(bit);
         let k = self.key();
         let e = self.tables.entry(k).or_insert([INIT, INIT]);
         e[usize::from(bit)] += 1;
-        if self.ctx.len() == 4 {
-            self.ctx.remove(0);
-        }
-        self.ctx.push(u8::from(bit));
     }
 
     fn reset(&mut self) {
-        self.ctx.clear();
+        self.asm.reset();
         self.tables.clear();
     }
 }
