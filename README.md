@@ -56,31 +56,41 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 > **Both ratio and speed, on every run.** nyx codes bit-by-bit, so a fair comparison
 > must report both axes. Full-corpus (12-file Silesia + mixed) numbers are expensive at
 > ~1.5 MB/s, so the headline table below is a representative **5-file subset**
-> (dickens, webster, nci, mr, json — text, mixed-binary, structured). `ratio%` is size
-> normalized against the original (lower is better); the rest is MB/s (higher is better).
-> See [BENCH.md](BENCH.md) for the before/after optimization tables and full notes.
+> (dickens, webster, nci, mr, json — text, mixed-binary, structured). `ratio%` is the
+> compressed size as a percentage of the original (lower is better); speed is in MB/s
+> (higher is better). See [BENCH.md](BENCH.md) for the before/after optimization tables
+> and full notes.
 
 ### Current (post causal-fix; 27 tests, clippy clean)
 
-| file    | nyx %  | zstd-19 % | xz-9 % | lz4-9 % | nyx cmp MB/s | nyx dec MB/s | zstd-19 dec MB/s |
-|---------|-------:|----------:|-------:|--------:|-------------:|-------------:|-----------------:|
-| dickens | 58.4   | 28.0      | 27.8   | 43.6    | 1.5          | 0.7          | 252.0            |
-| webster | 54.7   | 69.0      | 60.9   | 79.1    | 1.5          | 0.6          | 666.6            |
-| nci     | 30.6   | 31.2      | 27.6   | 42.6    | 1.3          | 0.7          | 226.7            |
-| mr      | 30.7   | 5.0       | 5.2    | 11.0    | 1.5          | 0.9          | 754.4            |
-| json    | 13.6   | ~0        | ~0     | 0.4     | 1.6          | 1.1          | 16.6             |
+| file   | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd-19 ratio% | zstd-19 cmp MB/s | zstd-19 dec MB/s | xz-9 ratio% | lz4-9 ratio% | vs zstd ratio |
+|--------|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|------------:|------------:|:-------------:|
+| dickens | 58.4       | 1.5          | 0.7          | 28.0           | 3.3              | 252.0            | 27.8        | 43.6        | → zstd        |
+| webster | 54.7       | 1.5          | 0.6          | 69.0           | 3.3              | 666.6            | 60.9        | 79.1        | **← nyx**     |
+| nci     | 30.6       | 1.3          | 0.7          | 31.2           | 3.7              | 226.7            | 27.6        | 42.6        | **← nyx**     |
+| mr      | 30.7       | 1.5          | 0.9          | 5.0            | 3.5              | 754.4            | 5.2         | 11.0        | → zstd        |
+| json    | 13.6       | 1.6          | 1.1          | ~0             | 15.4             | 16.6             | ~0          | 0.4         | → zstd        |
 
 (`~0` = zstd compresses json to ~0.1 KB; the harness percentage rounds to 0 on a
 KB-normalized basis.)
+
+### Reading the table
+
+- **Ratio:** lower % is better. `→ zstd` means zstd-19 beats nyx on ratio for that file;
+  `← nyx` means nyx beats zstd-19.
+- **Speed:** higher MB/s is better. nyx is **~1.5 MB/s** compress / **~0.7 MB/s** decode
+  across the board; `zstd -19` is **~3–4 MB/s** compress / **200–880 MB/s** decode.
+  That is a **~100–500× decode gap** — an architectural constant of bit-level context
+  mixing, not a tuning target.
 
 ### Honest assessment
 
 - **Ratio:** the 2026-08-30 optimization pass (direct-addressed context tables + a causal
   predict/update fix) dropped dickens 68.6%→58.4%, webster 87.6%→54.7%, json 38.9%→13.6%.
-  nyx now **beats `zstd -19` on `nci`** (30.6 vs 31.2) and is close to xz on several files.
-  But on **text it is still ~2× worse** than zstd (dickens 58.4 vs 28.0). Reaching zstd
-  text parity requires PPM-style adaptive higher-order modeling with escape (a planned
-  future stage), not a tuning knob.
+  nyx now **beats `zstd -19` on `nci` and `webster`** (30.6 vs 31.2; 54.7 vs 69.0). But on
+  text it is still **~2× worse** than zstd (dickens 58.4 vs 28.0). Reaching zstd text
+  parity requires PPM-style adaptive higher-order modeling with escape (a planned future
+  stage), not a tuning knob.
 - **Speed:** nyx compresses at **~1.5 MB/s** vs zstd's ~3–9 MB/s, and decodes at
   **~0.7 MB/s** vs zstd's **200–880 MB/s**. That is a ~100–500× decode gap — an
   architectural constant of bit-level context mixing, not a tuning target.
