@@ -9,6 +9,7 @@ pub mod exec;
 pub mod lzp;
 pub mod mixer;
 pub mod order;
+pub mod ppm;
 pub mod sparse;
 
 /// Assembles whole bytes from the per-bit [`BitModel::update`] stream so context
