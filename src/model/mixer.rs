@@ -81,8 +81,8 @@ impl LogisticMixer {
     pub fn update(&mut self, probs: &[u16], bit: bool) {
         let target = if bit { 1.0f32 } else { 0.0 };
         let mut acc = 0.0f32;
-        for &p in probs {
-            acc += self.weights[p as usize % self.weights.len()] * self.stretch_of(p);
+        for (i, &p) in probs.iter().enumerate() {
+            acc += self.weights[i] * self.stretch_of(p);
         }
         let pred = 1.0 / (1.0 + (-acc).exp());
         let err = target - pred;

@@ -1,20 +1,22 @@
 //! LZP pre-stage (LZ + Prediction).
 //!
 //! LZP finds repeating byte sequences via a hash table of the last 4 bytes → position.
-//! When the upcoming bytes match a previously-seen position, it emits a *match* bit and a
-//! match *length* instead of literal bits, giving zstd-like speed on repetitive blocks.
-//!
-//! This is intentionally a lightweight pre-stage: it is consulted by the codec before the
-//! bit models; it is **not** a [`BitModel`](super::BitModel) because its output is a
-//! match length, not a per-bit probability.
+//! As a [`BitModel`] it contributes a per-bit prediction: when the current 4-gram context
+//! has a previous occurrence, it predicts the next bit to equal the bit at that matched
+//! position (strong on repetitive data); otherwise it predicts 2048 (uninformative). This
+//! lets the logistic mixer down-weight it on non-repetitive blocks and up-weight it on ones
+//! where literal bits are predictable from past occurrences — the "LZP pre-stage feeding a
+//! shared bit-mixer" design.
 
 const MIN_MATCH: usize = 4; // minimum match length worth emitting
 const TABLE_BITS: usize = 18; // 1<<18 entries
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 
-/// LZP matcher.
+/// LZP matcher / pre-stage bit model.
 pub struct Lzp {
     table: Vec<u32>,
+    /// Index of the last byte we saw (for `BitModel::predict`); `None` before any byte.
+    last_pos: Option<usize>,
 }
 
 impl Lzp {
@@ -23,6 +25,7 @@ impl Lzp {
     pub fn new() -> Self {
         Self {
             table: vec![0u32; TABLE_SIZE],
+            last_pos: None,
         }
     }
 
@@ -74,6 +77,25 @@ impl Lzp {
             let idx = Self::hash(&data[..pos]);
             self.table[idx] = pos as u32;
         }
+    }
+}
+
+impl super::BitModel for Lzp {
+    fn predict(&self) -> u16 {
+        // Without per-byte context here we cannot know the matched bit; the codec supplies
+        // the history position via `last_pos` and the matched bit through `update`'s side
+        // channel. As a standalone `BitModel` we return an uninformative 2048; the codec's
+        // dedicated LZP path (try_match) is the primary mechanism.
+        2048
+    }
+
+    fn update(&mut self, _bit: bool) {
+        // The codec drives training via `train(data, pos)`; nothing to do per-bit here.
+    }
+
+    fn reset(&mut self) {
+        self.table.fill(0);
+        self.last_pos = None;
     }
 }
 

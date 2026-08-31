@@ -10,22 +10,34 @@
 //! **reverse** order, decoder reads forward, final state is the 4-byte LE tail.
 
 use ans::{AnsError, FrequencyTable, RansDecoder, RansEncoder};
+use std::sync::OnceLock;
 
 const PRECISION: u32 = 12; // total = 1<<12 = 4096 frequency mass, 12-bit probabilities
 const TOTAL: u32 = 1 << PRECISION;
 
-/// Build a 2-symbol frequency table for a predicted P(bit==1) in `[1, TOTAL-1]`.
+/// Lazily-built cache of every possible 2-symbol rANS table (one per `p` in `[1, TOTAL-1]`).
+/// Building a `FrequencyTable` per bit was the dominant cost (heap alloc + normalization on
+/// every one of millions of bits); caching makes `bit_table` O(1).
+fn table_cache() -> &'static Vec<FrequencyTable> {
+    static CACHE: OnceLock<Vec<FrequencyTable>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        (1..TOTAL)
+            .map(|p1| {
+                let p0 = TOTAL - p1;
+                FrequencyTable::from_counts(&[p0, p1], PRECISION).expect("bit table always valid")
+            })
+            .collect()
+    })
+}
+
+/// Look up the precomputed 2-symbol table for a predicted P(bit==1) in `[1, TOTAL-1]`.
 ///
 /// Symbol 1 (bit set) gets frequency `p`; symbol 0 gets the complement `TOTAL - p`.
 #[inline]
 #[must_use]
-fn bit_table(p1: u16) -> FrequencyTable {
-    let max = u16::try_from(TOTAL - 1).expect("TOTAL-1 fits in u16");
-    let p1 = u32::from(p1.clamp(1, max));
-    let p0 = TOTAL - p1;
-    // `from_counts` normalizes to sum == TOTAL exactly; a valid 2-symbol table
-    // cannot fail, so unwrap is safe.
-    FrequencyTable::from_counts(&[p0, p1], PRECISION).expect("bit table always valid")
+fn bit_table(p1: u16) -> &'static FrequencyTable {
+    let idx = (p1.clamp(1, (TOTAL - 1) as u16) as usize) - 1;
+    &table_cache()[idx]
 }
 
 /// Bit-level arithmetic encoder over rANS.
@@ -63,7 +75,7 @@ impl BitEncoder {
         // Feed in reverse: the last buffered bit is encoded first.
         for &(bit, p) in self.pending.iter().rev() {
             let table = bit_table(p);
-            enc.put(u32::from(bit), &table)
+            enc.put(u32::from(bit), table)
                 .expect("rANS put cannot fail for a valid 2-symbol table");
         }
         enc.finish()
@@ -103,7 +115,7 @@ impl<'a> BitDecoder<'a> {
     /// Returns [`AnsError`] on a corrupt or truncated stream.
     pub fn decode_bit(&mut self, p: u16) -> Result<bool, AnsError> {
         let table = bit_table(p);
-        let sym = self.dec.get(&table)?; // 0 or 1
+        let sym = self.dec.get(table)?; // 0 or 1
         Ok(sym == 1)
     }
 }
