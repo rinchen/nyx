@@ -18,11 +18,11 @@ slower than byte-level decoders).
 
 | file   | nyx ratio% | zstd -1 ratio% | zstd -19 ratio% | FSE ratio% | winner on ratio |
 |--------|-----------:|---------------:|---------------:|-----------:|:---------------:|
-| dickens | 57.5 | 41.7 | 28.0 | 57.0 | zstd -19 |
-| webster | 54.7 | 33.5 | 21.1 | 62.6 | zstd -19 |
-| nci | 30.4 | 85.2 | 49.5 | 30.2 | nyx (≈ FSE) |
-| mr | 30.5 | 38.5 | 31.3 | 44.0 | nyx (narrow) |
-| json | 7.8 | 0.3 | 0.1 | 52.8 | zstd -19 |
+| dickens | 56.4 | 41.7 | 28.0 | 57.0 | zstd -19 |
+| webster | 51.1 | 33.5 | 21.1 | 62.6 | zstd -19 |
+| nci | 27.6 | 85.2 | 49.5 | 30.2 | **nyx** |
+| mr | 29.4 | 38.5 | 31.3 | 44.0 | **nyx** |
+| json | 5.6 | 0.3 | 0.1 | 52.8 | zstd -19 |
 
 Round-trip verified for every file. Speed: nyx ~0.6–1.0 MB/s cmp / ~0.4–0.5 MB/s dec;
 zstd -1 ~400–12000 MB/s cmp / ~1000–36000 MB/s dec; FSE ~200–1600 MB/s both ways.
@@ -60,6 +60,9 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
 - **PPM/escape order-3 as an extra mixer input (hybrid_ppm3)**. Improved all five
   subset files (dickens 58.4 → 57.5, webster 54.7 → 51.8, nci 30.7 → 30.4,
   mr 30.6 → 30.5, json 13.6 → 7.8). This is the current default stack.
+- **Per-bit-position mixer context** (2026-09 experiment). Improved all five
+  subset files: dickens 57.5 → 56.4, webster 54.7 → 51.1, nci 30.4 → 27.6,
+  mr 30.5 → 29.4, json 7.8 → 5.6. This is now the default mixer config.
 - **README/BENCH rewrite** (2026-09): removed “honest” framing, added zstd-1/FSE
   comparison, added explicit ratio-win and speed-win columns.
 
@@ -74,19 +77,16 @@ specific file instance. Concretely:
 - Any new behavior must be justified by data-type characteristics, not by memorizing
   corpus patterns.
 
-## 7. Where we are now
+## 7. What we are currently doing
 
 - The default stack is **orders 0–2 + Sparse + Lzp + Exec + PpmModel order 3**,
-  direct-addressed `CtxTable`, single logistic mix, causal predict/update.
-- Recent negative results have ruled out simple additive experiments in this
-  region: adaptive LZP confidence, mixer bias variants, and PPM order-4 all
-  failed to improve the measured subset.
-- The next real options are more substantial: **richer mixer context** or
-  **classifier-aware model selection**.
+  direct-addressed `CtxTable`, **per-bit-position logistic mix**, causal predict/update.
+- The next step is continuing Option A (richer mixer context) or moving to Option B
+  (classifier-aware model selection).
 
 ## 8. Two remaining options
 
-### Option A — Richer mixer context (preferred next step)
+### Option A — Richer mixer context (in progress / preferred)
 
 - Add a small amount of per-bit or per-byte context inside the mixer itself,
   without changing the container format.
@@ -112,6 +112,8 @@ specific file instance. Concretely:
   context sets per class.
 
 ## 9. Ideas and things left to be done
+
+### Near-term experiments
 
 1. **PPM/escape order-4** — evaluated as extra mixer input; no gain on `dickens`
    at current implementation. Deprioritized unless Option A changes context.

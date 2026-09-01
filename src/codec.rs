@@ -84,12 +84,13 @@ where
     for &byte in block {
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
+            let bit_pos = bit_idx as u8;
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs);
+            let p = mixer.mix(&probs, bit_pos);
             enc.encode_bit(bit, p);
-            mixer.update(&probs, bit);
+            mixer.update(&probs, bit, bit_pos);
             for m in &mut models {
                 m.update(bit);
             }
@@ -192,14 +193,15 @@ where
     while out.len() < orig_len {
         let mut byte = 0u8;
         for bit_idx in (0..8).rev() {
+            let bit_pos = bit_idx as u8;
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs);
+            let p = mixer.mix(&probs, bit_pos);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs, bit);
+            mixer.update(&probs, bit, bit_pos);
             for m in &mut models {
                 m.update(bit);
             }

@@ -16,10 +16,18 @@ use super::BitModel;
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
-/// Logistic mixer over `n` model probabilities.
+/// Logistic mixer over `n` model probabilities, with per-bit-position context.
+///
+/// The bit position within a byte (0 = MSB, 7 = LSB) is a cheap, decoder-safe signal:
+/// text bytes have very different bit distributions per position (e.g. ASCII high
+/// bits are nearly always 0), so conditioning the mixer weights on `bit_pos`
+/// lets it specialize without changing the container format.
 pub struct LogisticMixer {
     weights: Vec<f32>,
     lr: f32,
+    // Per (model, bit_position) weight deltas. `bit_pos` ∈ [0,7].
+    // The effective weight for model `i` at bit position `b` is `base[i] + pos_weights[i][b]`.
+    pos_weights: Vec<[f32; 8]>,
     // Precomputed stretch/squash tables (12-bit probability in, logit out / prob out).
     stretch: [f32; 4096],
     squash: [u16; 4096],
@@ -55,6 +63,9 @@ impl LogisticMixer {
             // blocks. Positive weights also keep the mix grounded in the models'
             // evidence rather than the prior.
             weights: vec![1.0; n],
+            // Position deltas start at 0 so the initial mix is identical to the
+            // non-context-aware version (pure 1.0 base weights).
+            pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
             lr: 0.02,
             stretch,
             squash,
@@ -79,26 +90,32 @@ impl LogisticMixer {
     }
 
     /// Mix `probs` (one P(bit==1) per model, each in `[1,4095]`) → fused P in `[1,4095]`.
+    /// `bit_pos` is the 0-based MSB-first bit position within the current byte.
     #[must_use]
-    pub fn mix(&self, probs: &[u16]) -> u16 {
+    pub fn mix(&self, probs: &[u16], bit_pos: u8) -> u16 {
+        let b = usize::from(bit_pos.min(7));
         let mut acc = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
-            acc += self.weights[i] * self.stretch_of(p);
+            let w = self.weights[i] + self.pos_weights[i][b];
+            acc += w * self.stretch_of(p);
         }
         self.squash_of(acc)
     }
 
     /// Online update after the true `bit` is known.
-    pub fn update(&mut self, probs: &[u16], bit: bool) {
+    pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8) {
+        let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
         let mut acc = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
-            acc += self.weights[i] * self.stretch_of(p);
+            let w = self.weights[i] + self.pos_weights[i][b];
+            acc += w * self.stretch_of(p);
         }
         let pred = 1.0 / (1.0 + (-acc).exp());
         let err = target - pred;
         for (i, &p) in probs.iter().enumerate() {
             self.weights[i] += self.lr * err * self.stretch_of(p);
+            self.pos_weights[i][b] += self.lr * err * self.stretch_of(p);
         }
     }
 }
@@ -114,7 +131,10 @@ impl BitModel for LogisticMixer {
     }
 
     fn reset(&mut self) {
-        self.weights.fill(0.0);
+        self.weights.fill(1.0);
+        for pw in &mut self.pos_weights {
+            pw.fill(0.0);
+        }
     }
 }
 
@@ -135,12 +155,13 @@ mod tests {
             let byte: u8 = if step % 4 != 0 { 0xFF } else { 0x00 };
             for bit_idx in (0..8).rev() {
                 let bit = (byte >> bit_idx) & 1 == 1;
+                let bit_pos = bit_idx as u8;
                 last_probs[0] = m0.predict();
                 last_probs[1] = m1.predict();
-                let fused = mixer.mix(&last_probs);
+                let fused = mixer.mix(&last_probs, bit_pos);
                 m0.update(bit);
                 m1.update(bit);
-                mixer.update(&last_probs, bit);
+                mixer.update(&last_probs, bit, bit_pos);
                 if step > 150 && bit {
                     assert!(i32::from(fused) > 2048, "mixer should learn the bias");
                 }
@@ -151,7 +172,7 @@ mod tests {
     #[test]
     fn mix_in_range() {
         let mixer = LogisticMixer::new(3);
-        let p = mixer.mix(&[1000, 2048, 3000]);
+        let p = mixer.mix(&[1000, 2048, 3000], 0);
         assert!((1..=4095).contains(&p));
     }
 }
