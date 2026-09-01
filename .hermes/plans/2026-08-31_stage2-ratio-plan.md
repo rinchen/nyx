@@ -19,7 +19,7 @@ slower than byte-level decoders).
 | file   | nyx ratio% | zstd -1 ratio% | zstd -19 ratio% | FSE ratio% | winner on ratio |
 |--------|-----------:|---------------:|---------------:|-----------:|:---------------:|
 | dickens | 56.4 | 41.7 | 28.0 | 57.0 | zstd -19 |
-| webster | 51.1 | 33.5 | 21.1 | 62.6 | zstd -19 |
+| webster | 51.0 | 33.5 | 21.1 | 62.6 | zstd -19 |
 | nci | 27.6 | 85.2 | 49.5 | 30.2 | **nyx** |
 | mr | 29.4 | 38.5 | 31.3 | 44.0 | **nyx** |
 | json | 5.6 | 0.3 | 0.1 | 52.8 | zstd -19 |
@@ -44,6 +44,10 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   Both regressed measured ratio; fully reverted.
 - **PPM order-4 as an extra mixer input** (2026-09 experiment). No measurable
   improvement on `dickens` (unchanged at 57.5%); reverted to order-3.
+- **Classifier-aware Text stack dropping Exec + PPM order-4** (2026-09 experiment).
+  Dropping Exec regressed `json` from 5.6% → 6.4%; PPM order-4 on Text was also a
+  regress. Reverted to full hybrid_ppm3 stack for both Text and Binary; only `Exec`
+  blocks drop the Exec model.
 
 ## 5. What we tried and did work
 
@@ -56,13 +60,18 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   history shifted, so predict and update disagreed. Fixing alone dropped `dickens`
   68.6% → 58.4% and `json` 38.9% → 13.6%.
 - **Heterogeneous model stack with single logistic mixer**: orders 0–2 + Sparse +
-  Lzp + Exec. Baseline for all further work.
+  LZP + Exec. Baseline for all further work.
 - **PPM/escape order-3 as an extra mixer input (hybrid_ppm3)**. Improved all five
   subset files (dickens 58.4 → 57.5, webster 54.7 → 51.8, nci 30.7 → 30.4,
   mr 30.6 → 30.5, json 13.6 → 7.8). This is the current default stack.
 - **Per-bit-position mixer context** (2026-09 experiment). Improved all five
   subset files: dickens 57.5 → 56.4, webster 54.7 → 51.1, nci 30.4 → 27.6,
   mr 30.5 → 29.4, json 7.8 → 5.6. This is now the default mixer config.
+- **Classifier-aware method bytes** (2026-09 experiment, current state). Added
+  `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
+  Both Text and Binary currently use the full hybrid_ppm3 stack; only Exec blocks
+  drop the Exec model (no signal on already-classified code). Measured as neutral
+  on the 5-file subset — preserves all wins, no regressions.
 - **README/BENCH rewrite** (2026-09): removed “honest” framing, added zstd-1/FSE
   comparison, added explicit ratio-win and speed-win columns.
 
@@ -81,6 +90,9 @@ specific file instance. Concretely:
 
 - The default stack is **orders 0–2 + Sparse + Lzp + Exec + PpmModel order 3**,
   direct-addressed `CtxTable`, **per-bit-position logistic mix**, causal predict/update.
+- The container method byte now distinguishes `Text`/`Binary`/`Exec` blocks, but
+  Text and Binary both use the full hybrid_ppm3 stack. Only `Exec` blocks drop the
+  Exec model.
 - The next step is continuing Option A (richer mixer context) or moving to Option B
   (classifier-aware model selection).
 
@@ -139,7 +151,7 @@ specific file instance. Concretely:
 
 ## 10. Definition of done (revised)
 
-- [x] `cargo test` green (27 passed); `cargo clippy --all-targets -- -D warnings` clean.
+- [x] `cargo test` green (31 passed); `cargo clippy --all-targets -- -D warnings` clean.
 - [x] `nyx compress`/`decompress` round-trips on ≥200 KB mixed fixture + real corpus files.
 - [x] `README.md` updated with measured numbers and zstd-1 + FSE target (no "honest" framing).
 - [x] `BENCH.md` written with zstd-1 / zstd-19 / FSE comparison (ratio and speed).

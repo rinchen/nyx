@@ -18,7 +18,6 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use nyx::codec;
-use nyx::stacks::{BaselineBuilder, HybridPpm3Builder, PpmBuilder};
 
 #[derive(Parser)]
 #[command(
@@ -100,7 +99,10 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
 
 fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
     if !corpus.is_dir() {
-        return Err(format!("corpus path {} is not a directory", corpus.display()));
+        return Err(format!(
+            "corpus path {} is not a directory",
+            corpus.display()
+        ));
     }
     println!(
         "{:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",
@@ -168,7 +170,9 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
 fn measure_buf(
     label: &str,
     data: &[u8],
-    mut build: impl FnMut() -> (
+    mut build: impl FnMut(
+        nyx::classify::BlockKind,
+    ) -> (
         Vec<Box<dyn nyx::model::BitModel>>,
         nyx::model::mixer::LogisticMixer,
     ),
@@ -179,7 +183,7 @@ fn measure_buf(
     };
     let enc_ms = enc_start.elapsed().as_secs_f64() * 1000.0;
     let dec_start = Instant::now();
-    let Ok(restored) = codec::decompress_with(&compressed, &mut build) else {
+    let Ok(restored) = codec::decompress(&compressed) else {
         return (compressed.len(), 0, 0.0, 0.0, 0.0);
     };
     let dec_ms = dec_start.elapsed().as_secs_f64() * 1000.0;
@@ -194,7 +198,10 @@ fn measure_buf(
 
 fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
     if !corpus.is_dir() {
-        return Err(format!("corpus path {} is not a directory", corpus.display()));
+        return Err(format!(
+            "corpus path {} is not a directory",
+            corpus.display()
+        ));
     }
 
     let mut entries: Vec<_> = fs::read_dir(corpus)
@@ -205,13 +212,7 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
 
     println!(
         "{:<20} {:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",
-        "config",
-        "name",
-        "orig_kb",
-        "comp_kb",
-        "ratio%",
-        "cmp_MBps",
-        "dec_MBps"
+        "config", "name", "orig_kb", "comp_kb", "ratio%", "cmp_MBps", "dec_MBps"
     );
     println!("{}", "-".repeat(102));
 
@@ -230,19 +231,21 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
             continue;
         }
 
-        let baseline_ratio = measure_buf("baseline", &data, BaselineBuilder::build).2;
+        let baseline_ratio =
+            measure_buf("baseline", &data, |_| nyx::stacks::BaselineBuilder::build()).2;
 
-        let mut cases: [(&str, &mut dyn FnMut() -> _); 4] = [
-            ("baseline", &mut || BaselineBuilder::build()),
-            ("ppm3", &mut || PpmBuilder::new(3).build()),
-            ("ppm4", &mut || PpmBuilder::new(4).build()),
-            ("hybrid_ppm3", &mut || HybridPpm3Builder::build()),
+        let mut cases: [(&str, &mut dyn FnMut(nyx::classify::BlockKind) -> _); 4] = [
+            ("baseline", &mut |_| nyx::stacks::BaselineBuilder::build()),
+            ("ppm3", &mut |_| nyx::stacks::PpmBuilder::new(3).build()),
+            ("ppm4", &mut |_| nyx::stacks::PpmBuilder::new(4).build()),
+            ("hybrid_ppm3", &mut |_| {
+                nyx::stacks::HybridPpm3Builder::build()
+            }),
         ];
 
         for (label, builder) in &mut cases {
-            let (orig, comp, ratio, enc_mbps, dec_mbps) =
-                measure_buf(label, &data, &mut *builder);
-            let marker = if *label != "baseline" && (ratio - baseline_ratio).abs() < 0.05 {
+            let (orig, comp, ratio, enc_mbps, dec_mbps) = measure_buf(label, &data, &mut *builder);
+            let marker = if label != &"baseline" && (ratio - baseline_ratio).abs() < 0.05 {
                 "="
             } else if ratio < baseline_ratio - 0.05 {
                 "↑"

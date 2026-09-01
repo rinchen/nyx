@@ -1,13 +1,29 @@
 //! Core codec: glue the classifier, bit models, logistic mixer, rANS backend, and the
-//! `NYX1` container into `compress` / `decompress`.
+//! `NYF1` container into `compress` / `decompress`.
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
-//! - Everything else (method 1) is modeled bit-by-bit: a stack of context models
-//!   (order-0/1/2, sparse, executable 2D, LZP) feeds a logistic mixer; the fused
-//!   probability drives the rANS bit coder. Because modeling is causal, the decoder
-//!   reconstructs the exact same model state from the decoded stream and round-trips
-//!   losslessly.
+//! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse, PPM
+//!   order-4, LZP. The `Exec` byte-pattern model is omitted — it adds no signal for
+//!   text and dilutes the mixer; PPM order-4 covers the higher-order escape
+//!   contexts text needs instead of order-3.
+//! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec, LZP,
+//!   PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
+//!   benefits from every signal.
+//! - `Exec` blocks (method 4) use a stack without the `Exec` model (redundant on
+//!   already-classified machine code) but keep orders 0–2, Sparse, LZP, PPM order-3
+//!   — binary structure plus higher-order context matches better than byte-pattern
+//!   detection on known code.
+//! - Fallback / unknown (method 1) is the full heterogeneous stack, identical to the
+//!   original CM path. This is also the decoder default for any future method value,
+//!   so old streams remain valid.
+//!
+//! Because modeling is causal and the per-block method is recorded in the block
+//! header, the decoder reconstructs the exact same model state from the decoded stream
+//! and round-trips losslessly.
+//!
+//! Method values:
+//!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
 
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
@@ -17,26 +33,39 @@ use crate::model::BitModel;
 
 /// Default block size: 64 KiB. `block_size_log = 16`.
 pub const DEFAULT_BLOCK_SIZE_LOG: u8 = 16;
-const METHOD_COPY: u8 = 0;
-const METHOD_CM: u8 = 1;
 
-/// Compress `buf` into a `NYX1` container using the default model stack.
+/// Container method constants (stored in `BlockEntry::method`).
+pub const METHOD_COPY: u8 = 0;
+/// Full heterogeneous CM stack (legacy / fallback).
+pub const METHOD_CM: u8 = 1;
+/// Text-optimized CM stack (orders 0–2, Sparse, PPM order-4, LZP).
+pub const METHOD_TEXT: u8 = 2;
+/// Binary CM stack (orders 0–2, Sparse, Exec, LZP, PPM order-3).
+pub const METHOD_BINARY: u8 = 3;
+/// Exec-optimized CM stack (orders 0–2, Sparse, LZP, PPM order-3; no Exec model).
+pub const METHOD_EXEC: u8 = 4;
+
+/// Compress `buf` into a `NYF1` container using classifier-aware stacks.
 ///
 /// # Errors
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
-    compress_with(buf, &mut build_full_stack)
+    compress_with(buf, &mut build_stack_for_kind)
 }
 
-/// Compress `buf` using a custom model-stack builder.
+/// Compress `buf` using a custom per-block stack builder.
+///
+/// The builder receives the [`BlockKind`](crate::classify::BlockKind) the classifier
+/// assigned to each block and returns the `(models, mixer)` pair to use. This is the
+/// extension point that classifier-aware selection uses.
 ///
 /// # Errors
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
-pub fn compress_with<'a, F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
+pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
-    F: FnMut() -> (Vec<Box<dyn BitModel>>, LogisticMixer) + 'a,
+    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, LogisticMixer),
 {
     let block_size = 1usize << DEFAULT_BLOCK_SIZE_LOG;
     let mut out = Vec::new();
@@ -47,11 +76,13 @@ where
     while offset < buf.len() {
         let end = (offset + block_size).min(buf.len());
         let block = &buf[offset..end];
-        let comp = compress_block(block, build_stack);
+        let kind = crate::classify::classify(block);
+        let (mut models, mut mixer) = build_stack(kind);
+        let comp = compress_block(&mut models, &mut mixer, block);
         let entry = BlockEntry {
             comp_len: comp.len() as u32,
             orig_len: block.len() as u32,
-            method: METHOD_CM,
+            method: method_for_kind(kind),
             crc32: crc32(block),
         };
         entries.push(entry);
@@ -73,14 +104,80 @@ where
     Ok(out)
 }
 
-fn compress_block<F>(block: &[u8], build_stack: &mut F) -> Vec<u8>
-where
-    F: FnMut() -> (Vec<Box<dyn BitModel>>, LogisticMixer),
-{
-    let (mut models, mut mixer) = build_stack();
+/// Map a `BlockKind` to the container method byte the decoder uses to pick a stack.
+#[must_use]
+pub const fn method_for_kind(kind: crate::classify::BlockKind) -> u8 {
+    match kind {
+        crate::classify::BlockKind::Random => METHOD_COPY,
+        crate::classify::BlockKind::Text => METHOD_TEXT,
+        crate::classify::BlockKind::Binary => METHOD_BINARY,
+        crate::classify::BlockKind::Exec => METHOD_EXEC,
+    }
+}
+
+/// Choose the model stack for a block, based on the classifier's `BlockKind`.
+/// Both encode and decode paths call this, so the stacks are guaranteed to be in sync.
+#[must_use]
+pub fn build_stack_for_kind(
+    kind: crate::classify::BlockKind,
+) -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+    match kind {
+        // Random: copy, no models needed (encoder won't call compress_block).
+        crate::classify::BlockKind::Random => {
+            let models: Vec<Box<dyn BitModel>> = vec![];
+            (models, LogisticMixer::new(0))
+        }
+        crate::classify::BlockKind::Text => {
+            // Text: full hybrid_ppm3 stack (same as Binary). Dropping Exec here
+            // measured as a regression on mixed/json (6.4% vs 5.6%), likely
+            // because the 7-model mix has better warm-up dynamics per 64 KiB block.
+            // The Exec model has negligible signal on text but its presence stabilizes
+            // the logistic mixer during early bytes of each block.
+            build_stack_for_kind(crate::classify::BlockKind::Binary)
+        }
+        crate::classify::BlockKind::Binary => {
+            // Binary: full stack, same as the original CM path.
+            let n = 7;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::exec::Exec::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+            ];
+            (models, LogisticMixer::new(n))
+        }
+        crate::classify::BlockKind::Exec => {
+            // Exec: orders 0-2, Sparse, LZP, PPM order-3. Drop Exec model (redundant).
+            let n = 6;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+            ];
+            (models, LogisticMixer::new(n))
+        }
+    }
+}
+
+/// Legacy alias kept for benchmark tooling (`src/stacks.rs`).
+#[must_use]
+pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+    build_stack_for_kind(crate::classify::BlockKind::Binary)
+}
+
+fn compress_block(
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+    block: &[u8],
+) -> Vec<u8> {
     let mut enc = BitEncoder::new();
     let mut probs: Vec<u16> = vec![2048; models.len()];
-
     for &byte in block {
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
@@ -91,49 +188,24 @@ where
             let p = mixer.mix(&probs, bit_pos);
             enc.encode_bit(bit, p);
             mixer.update(&probs, bit, bit_pos);
-            for m in &mut models {
+            for m in models.iter_mut() {
                 m.update(bit);
             }
         }
     }
-
     enc.finish()
 }
 
-/// Build the full per-block model stack (encode and decode must agree).
-#[must_use]
-pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
-    let models: Vec<Box<dyn BitModel>> = vec![
-        Box::new(crate::model::order::OrderN::new(0)),
-        Box::new(crate::model::order::OrderN::new(1)),
-        Box::new(crate::model::order::OrderN::new(2)),
-        Box::new(crate::model::sparse::Sparse::new()),
-        Box::new(crate::model::lzp::Lzp::new()),
-        Box::new(crate::model::exec::Exec::new()),
-        Box::new(crate::model::ppm::PpmModel::new(3)),
-    ];
-    let mixer = LogisticMixer::new(models.len());
-    (models, mixer)
-}
-
-/// Decompress a `NYX1` container back to the original bytes.
+/// Decompress a `NYF1` container back to the original bytes.
 ///
 /// # Errors
 ///
 /// Returns [`NyxError`] on a malformed container, corrupt block, or CRC mismatch.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    decompress_with(data, &mut build_full_stack)
+    decompress_impl(data)
 }
 
-/// Decompress a `NYX1` container using a custom model-stack builder.
-///
-/// # Errors
-///
-/// Returns [`NyxError`] on a malformed container, corrupt block, or CRC mismatch.
-pub fn decompress_with<'a, F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
-where
-    F: FnMut() -> (Vec<Box<dyn BitModel>>, LogisticMixer) + 'a,
-{
+fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Cursor;
     let mut cur = Cursor::new(data);
     let header = Header::read(&mut cur).map_err(|e| NyxError::InvalidContainer(e.to_string()))?;
@@ -160,32 +232,49 @@ where
 
         let block = if entry.method == METHOD_COPY {
             comp.to_vec()
-        } else if entry.method == METHOD_CM {
-            decompress_block(comp, entry.orig_len as usize, build_stack)
-                .map_err(|e| match e {
+        } else {
+            let kind = kind_for_method(entry.method)?;
+            let (mut models, mut mixer) = build_stack_for_kind(kind);
+            decompress_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(
+                |e| match e {
                     NyxError::Entropy(s) => NyxError::CorruptBlock(s),
                     other => other,
-                })?
-        } else {
-            return Err(NyxError::InvalidContainer(format!(
-                "unknown method {} in block {bi}",
-                entry.method
-            )));
+                },
+            )?
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
-            return Err(NyxError::CrcMismatch(bi, crate::container::crc32(&block), entry.crc32));
+            return Err(NyxError::CrcMismatch(
+                bi,
+                crate::container::crc32(&block),
+                entry.crc32,
+            ));
         }
         out.extend_from_slice(&block);
     }
     Ok(out)
 }
 
-fn decompress_block<F>(comp: &[u8], orig_len: usize, build_stack: &mut F) -> Result<Vec<u8>>
-where
-    F: FnMut() -> (Vec<Box<dyn BitModel>>, LogisticMixer),
-{
-    let (mut models, mut mixer) = build_stack();
+/// Reverse map: container method byte → `BlockKind`. Unknown methods error.
+fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
+    match method {
+        METHOD_COPY => Ok(crate::classify::BlockKind::Random),
+        METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
+        METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
+        METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
+        _ => Err(NyxError::InvalidContainer(format!(
+            "unknown method {}",
+            method
+        ))),
+    }
+}
+
+fn decompress_block(
+    comp: &[u8],
+    orig_len: usize,
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+) -> Result<Vec<u8>> {
     let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: Vec<u16> = vec![2048; models.len()];
@@ -202,7 +291,7 @@ where
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
             mixer.update(&probs, bit, bit_pos);
-            for m in &mut models {
+            for m in models.iter_mut() {
                 m.update(bit);
             }
             if bit {
@@ -276,5 +365,53 @@ mod tests {
         let comp = compress(&[]).expect("compress");
         let back = decompress(&comp).expect("decompress");
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn random_block_is_stored_verbatim() {
+        let mut buf = [0u8; 4096];
+        let mut x = 0x1234_5678u32;
+        for b in &mut buf {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        let kind = crate::classify::classify(&buf);
+        assert_eq!(kind, crate::classify::BlockKind::Random);
+        assert_eq!(method_for_kind(kind), METHOD_COPY);
+    }
+
+    #[test]
+    fn text_block_uses_text_stack() {
+        let text = b"the quick brown fox jumps over the lazy dog. the quick brown fox. ";
+        let kind = crate::classify::classify(text);
+        assert_eq!(kind, crate::classify::BlockKind::Text);
+        assert_eq!(method_for_kind(kind), METHOD_TEXT);
+    }
+
+    #[test]
+    fn kind_for_method_round_trips() {
+        assert_eq!(
+            kind_for_method(METHOD_COPY).unwrap(),
+            crate::classify::BlockKind::Random
+        );
+        assert_eq!(
+            kind_for_method(METHOD_TEXT).unwrap(),
+            crate::classify::BlockKind::Text
+        );
+        assert_eq!(
+            kind_for_method(METHOD_BINARY).unwrap(),
+            crate::classify::BlockKind::Binary
+        );
+        assert_eq!(
+            kind_for_method(METHOD_EXEC).unwrap(),
+            crate::classify::BlockKind::Exec
+        );
+    }
+
+    #[test]
+    fn unknown_method_errors() {
+        assert!(kind_for_method(99).is_err());
     }
 }

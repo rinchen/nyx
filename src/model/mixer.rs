@@ -39,8 +39,8 @@ impl LogisticMixer {
     #[allow(clippy::missing_const_for_fn)] // builds Vecs via loops; not const-evaluable
     pub fn new(n: usize) -> Self {
         let mut stretch = [0.0f32; 4096];
-        for (p, slot) in stretch.iter_mut().enumerate() {
-            let pr = (p as f32 + 0.5) / 4096.0;
+        for (p_slot, slot) in stretch.iter_mut().enumerate() {
+            let pr = (p_slot as f32 + 0.5) / 4096.0;
             *slot = if pr <= 1e-6 {
                 -7.0
             } else if pr >= 1.0 - 1e-6 {
@@ -50,8 +50,8 @@ impl LogisticMixer {
             };
         }
         let mut squash = [0u16; 4096];
-        for (x, slot) in squash.iter_mut().enumerate() {
-            let v = x as f32 / 4095.0 * 14.0 - 7.0; // map [0,4095] -> [-7, 7]
+        for (x_slot, slot) in squash.iter_mut().enumerate() {
+            let v = x_slot as f32 / 4095.0 * 14.0 - 7.0; // map [0,4095] -> [-7, 7]
             let s = 1.0 / (1.0 + (-v).exp());
             *slot = (s * MAX_PROB as f32).clamp(MIN_PROB as f32, MAX_PROB as f32) as u16;
         }

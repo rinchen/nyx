@@ -61,12 +61,12 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 > in MB/s (higher is better). See [BENCH.md](BENCH.md) for the full
 > zstd-1 / zstd-19 / FSE comparison and before/after optimization tables.
 
-### Current (post PPM/escape hybrid + per-bit-position mixer context; 27 tests, clippy clean)
+### Current (post PPM/escape hybrid + per-bit-position mixer context + classifier-aware stacks; 31 tests, clippy clean)
 
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | **ratio win** | **speed win** |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:-------------:|:--------------:|
 | dickens | 9953.6 | **56.4** | 0.8 | 0.5 | 41.7 | 496.1 | 2837.1 | **28.0** | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
-| webster | 40487.0 | **51.1** | 0.7 | 0.5 | 33.5 | 404.5 | 1219.8 | **21.1** | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
+| webster | 40487.0 | **51.0** | 0.7 | 0.5 | 33.5 | 404.5 | 1219.8 | **21.1** | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | **27.6** | 0.7 | 0.5 | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **nyx** | **zstd -19** |
 | mr | 9736.9 | **29.4** | 0.6 | 0.4 | 38.5 | 551.2 | 1008.8 | 31.3 | 5.1 | 772.5 | 44.0 | 233.2 | 229.3 | **nyx** | **zstd -19** |
 | json | 478.5 | **5.6** | 0.9 | 0.5 | 0.3 | 12173.7 | 35691.0 | **0.1** | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **zstd -19** | **zstd -19** |
