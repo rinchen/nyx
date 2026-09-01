@@ -22,3 +22,6 @@ target
 
 # Benchmark corpora (fetched via Silesia download; ~70MB, not committed)
 corpus/
+
+# Temporary local benchmark scratch
+.work/
