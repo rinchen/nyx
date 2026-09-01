@@ -13,9 +13,16 @@ use super::ByteAssembler;
 const MIN_MATCH: usize = 4; // minimum match length worth emitting
 const TABLE_BITS: usize = 18; // 1<<18 entries
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
+/// Cap the match-run-based prediction sharpening.
+const MAX_RUN_SHARP: u16 = 48;
 
 /// LZP matcher / pre-stage bit model.
+///
+/// The on-disk table format is unchanged: still 4-byte position records from
+/// `train()`. Match-run scaling in `predict()` is a local behavior that doesn't
+/// affect the container format or encoder/decoder contract.
 pub struct Lzp {
+    /// Position table: `table[hash] = last position for this 4-gram`.
     table: Vec<u32>,
     /// Assembled byte stream so we can key the hash on whole bytes, not bits.
     asm: ByteAssembler,
