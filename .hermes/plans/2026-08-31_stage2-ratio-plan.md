@@ -70,8 +70,11 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
 - **Classifier-aware method bytes** (2026-09 experiment, current state). Added
   `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
   Both Text and Binary currently use the full hybrid_ppm3 stack; only Exec blocks
-  drop the Exec model (no signal on already-classified code). Measured as neutral
-  on the 5-file subset — preserves all wins, no regressions.
+  drop the Exec model. Measured as neutral on the 5-file subset — preserves all
+  wins, no regressions. **Conclusion:** classifier-aware stacks are the right
+  architecture but don't move the needle at 64 KiB blocks with online learning;
+  the Exec model difference is lost in mixer warm-up. The actual ratio gains
+  must come from richer context within a single stack (Option A).
 - **README/BENCH rewrite** (2026-09): removed “honest” framing, added zstd-1/FSE
   comparison, added explicit ratio-win and speed-win columns.
 
