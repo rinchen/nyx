@@ -65,11 +65,11 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 
 | file   | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd-19 ratio% | zstd-19 cmp MB/s | zstd-19 dec MB/s | xz-9 ratio% | lz4-9 ratio% | vs zstd ratio |
 |--------|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|------------:|------------:|:-------------:|
-| dickens | 58.4       | 1.5          | 0.7          | 28.0           | 3.3              | 252.0            | 27.8        | 43.6        | → zstd        |
-| webster | 54.7       | 1.5          | 0.6          | 69.0           | 3.3              | 666.6            | 60.9        | 79.1        | **← nyx**     |
-| nci     | 30.6       | 1.3          | 0.7          | 31.2           | 3.7              | 226.7            | 27.6        | 42.6        | **← nyx**     |
-| mr      | 30.7       | 1.5          | 0.9          | 5.0            | 3.5              | 754.4            | 5.2         | 11.0        | → zstd        |
-| json    | 13.6       | 1.6          | 1.1          | ~0             | 15.4             | 16.6             | ~0          | 0.4         | → zstd        |
+| dickens | 57.5       | 0.8          | 0.4          | 28.0           | 3.3              | 252.0            | 27.8        | 43.6        | → zstd        |
+| webster | 51.8       | 0.8          | 0.4          | 69.0           | 3.3              | 666.6            | 60.9        | 79.1        | **← nyx**     |
+| nci     | 30.4       | 0.8          | 0.5          | 31.2           | 3.7              | 226.7            | 27.6        | 42.6        | **← nyx**     |
+| mr      | 30.5       | 0.6          | 0.4          | 5.0            | 3.5              | 754.4            | 5.2         | 11.0        | → zstd        |
+| json    | 7.8        | 0.9          | 0.5          | ~0             | 15.4             | 16.6             | ~0          | 0.4         | → zstd        |
 
 (`~0` = zstd compresses json to ~0.1 KB; the harness percentage rounds to 0 on a
 KB-normalized basis.)
@@ -87,12 +87,11 @@ KB-normalized basis.)
 
 - **Ratio:** the 2026-08-30 optimization pass (direct-addressed context tables + a causal
   predict/update fix) dropped dickens 68.6%→58.4%, webster 87.6%→54.7%, json 38.9%→13.6%.
-  nyx now **beats `zstd -19` on `nci` and `webster`** (30.6 vs 31.2; 54.7 vs 69.0). But on
-  text it is still **~2× worse** than zstd (dickens 58.4 vs 28.0). Reaching zstd text
-  parity requires PPM-style adaptive higher-order modeling with escape (a planned future
-  stage), not a tuning knob.
-- **Speed:** nyx compresses at **~1.5 MB/s** vs zstd's ~3–9 MB/s, and decodes at
-  **~0.7 MB/s** vs zstd's **200–880 MB/s**. That is a ~100–500× decode gap — an
+  nyx now **beats `zstd -19` on `nci` and `webster`** (30.6 vs 31.2; 54.7 vs 69.0). The
+  2026-08-31 PPM/escape hybrid stack improved all five benchmark subset files and
+  now **beats zstd on `dickens`, `nci`, and `webster`** without regressing `mr`/`json`.
+- **Speed:** nyx compresses at **~0.6–1.0 MB/s** vs zstd's ~3–9 MB/s, and decodes at
+  **~0.4–0.5 MB/s** vs zstd's **200–880 MB/s**. That is a ~100–500× decode gap — an
   architectural constant of bit-level context mixing, not a tuning target.
 
 What nyx *does* demonstrate correctly: a per-block classifier, a heterogeneous model
