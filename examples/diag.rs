@@ -39,7 +39,9 @@ fn main() {
     let mut x = 0x1234_5678u32;
     let mut rnd = Vec::new();
     for _ in 0..50_000 {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
         rnd.push(x as u8);
     }
     println!("\nrnd input len = {}", rnd.len());

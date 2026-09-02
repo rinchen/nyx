@@ -47,11 +47,7 @@ pub fn classify(buf: &[u8]) -> BlockKind {
             h -= p * p.log2();
         }
     }
-    let frac_printable = buf
-        .iter()
-        .filter(|&&b| (0x20..0x7f).contains(&b))
-        .count() as f32
-        / n;
+    let frac_printable = buf.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count() as f32 / n;
 
     if h > 7.9 {
         BlockKind::Random
@@ -88,7 +84,8 @@ mod tests {
 
     #[test]
     fn classifies_text() {
-        let text = b"hello world, this is plain text that should be recognized as text..............";
+        let text =
+            b"hello world, this is plain text that should be recognized as text..............";
         assert_eq!(classify(text), BlockKind::Text);
     }
 

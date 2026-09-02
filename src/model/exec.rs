@@ -5,9 +5,9 @@
 //! `(prev_byte, delta = cur - prev)` using the **assembled byte** stream, which plain
 //! bit-context models cannot see.
 
+use super::ctable::CtxTable;
 use super::BitModel;
 use super::ByteAssembler;
-use super::ctable::CtxTable;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
@@ -46,8 +46,8 @@ impl BitModel for Exec {
         }
         let [c0, c1] = self.ctab.get(self.key());
         let tot = f64::from(c0 + c1);
-        (f64::from(c1) / tot * f64::from(MAX_PROB))
-            .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
+        (f64::from(c1) / tot * f64::from(MAX_PROB)).clamp(f64::from(MIN_PROB), f64::from(MAX_PROB))
+            as u16
     }
 
     fn update(&mut self, bit: bool) {

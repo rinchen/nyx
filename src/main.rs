@@ -15,7 +15,11 @@ use clap::{Parser, Subcommand};
 use nyx::codec::{compress, decompress};
 
 #[derive(Parser)]
-#[command(name = "nyx", version, about = "Nyx: adaptive staged context-mixing compressor")]
+#[command(
+    name = "nyx",
+    version,
+    about = "Nyx: adaptive staged context-mixing compressor"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -32,10 +36,7 @@ enum Cmd {
         backend: String,
     },
     /// Decompress a .nyx (NYX1) container back to a file.
-    Decompress {
-        input: PathBuf,
-        output: PathBuf,
-    },
+    Decompress { input: PathBuf, output: PathBuf },
     /// Benchmark nyx over every file in a corpus directory.
     Bench {
         corpus: PathBuf,
@@ -103,7 +104,10 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
 
 fn cmd_bench(corpus: &PathBuf, vs: Option<&str>) -> Result<(), String> {
     if !corpus.is_dir() {
-        return Err(format!("corpus path {} is not a directory", corpus.display()));
+        return Err(format!(
+            "corpus path {} is not a directory",
+            corpus.display()
+        ));
     }
     println!(
         "{:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",

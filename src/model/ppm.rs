@@ -13,9 +13,9 @@
 //! Causal and round-trip safe: the decoder mirrors the encoder because predict/update
 //! order is deterministic.
 
+use super::ctable::CtxTable;
 use super::BitModel;
 use super::ByteAssembler;
-use super::ctable::CtxTable;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
@@ -34,9 +34,7 @@ impl PpmModel {
     /// Create a PPM model. `max_order` must be ≥ 0.
     #[must_use]
     pub fn new(max_order: usize) -> Self {
-        let orders = (0..=max_order)
-            .map(|_| CtxTable::new(CTX_BITS))
-            .collect();
+        let orders = (0..=max_order).map(|_| CtxTable::new(CTX_BITS)).collect();
         Self {
             orders,
             asm: ByteAssembler::new(max_order.max(1)),
