@@ -46,8 +46,7 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   improvement on `dickens` (unchanged at 57.5%); reverted to order-3.
 - **Per-model reliability dampening** (2026-09 experiment). Used the mixer's
   previous per-model direction correctness as a dampening factor in both mix and
-  update. Regressed both `dickens` (56.4% → 58.1%) and `json` (5.6% → 6.2%),
-  which means the logistic weights already encode per-model reliability; adding
+  update. Regressed both `dickens` (56.4% → 58.1%) and `json` (5.6% → 6.2%),\n  which means the logistic weights already encode per-model reliability; adding
   an explicit dampening term over-constrains the mix. Reverted.
 - **Classifier-aware Text stack dropping Exec + PPM order-4** (2026-09 experiment).
   Dropping Exec regressed `json` from 5.6% → 6.4%; PPM order-4 on Text was also a
@@ -74,7 +73,7 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   subset files (dickens 58.4 → 57.5, webster 54.7 → 51.8, nci 30.7 → 30.4,
   mr 30.6 → 30.5, json 13.6 → 7.8). This is the current default stack.
 - **Per-bit-position mixer context** (2026-09 experiment). Improved all five
-  subset files: dickens 57.5 → 56.4, webster 54.7 → 51.1, nci 30.4 → 27.6,
+  subset files: dickens 57.5 → 56.4, webster 54.7 → 51.0, nci 30.4 → 27.6,
   mr 30.5 → 29.4, json 7.8 → 5.6. This is now the default mixer config.
 - **Classifier-aware method bytes** (2026-09 experiment, current state). Added
   `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
@@ -109,7 +108,8 @@ specific file instance. Concretely:
 - **Current hypothesis:** the ~14–17 point text gap to zstd-1 comes from
   **long-range repetition**, not token prediction. A match-copy path using the
   existing LZP hash table but emitting explicit `(distance, length)` records could
-  close that gap.
+  close that gap. First attempt failed due to overhead + state divergence; a refined
+  implementation with smaller records / tighter coupling is the next candidate.
 
 ## 8. Research summary (2026-09)
 
@@ -150,6 +150,8 @@ explicit `(distance, length)` records.
   decoder must reconstruct the same LZP state to resolve references — possible
   because LZP prediction is causal and deterministic.
 - **Reward:** highest single-axis gain available. Could close 5–10 points on text.
+- **Status:** first prototype regressed all files; needs smaller record format / tighter
+  state coupling.
 
 ### B. Hybrid PPM + match records (old idea, new container)
 - **What:** PPMD-style: when PPM's high-order context is sparse, fall back to
@@ -172,6 +174,7 @@ explicit `(distance, length)` records.
   colons, etc.) without polluting the table on variable data.
 - **Risk:** low-medium. Small change to Sparse/OrderN, no container change.
 - **Reward:** modest. Could recover 1–3 points on structured text.
+- **Status:** first prototype neutral; gain ceiling <1pt at 64 KiB.
 
 ### D. State-space mixer (long-shot, cutting-edge)
 - **What:** Replace the logistic linear mix with a tiny Mamba-style SSM
@@ -198,14 +201,15 @@ explicit `(distance, length)` records.
 
 ## 10. Recommendation
 
-Pursue **A** (explicit match-copy records) first. It's the highest-ROI path that
+Pursue **A** (explicit match-copy records) first, with a refined design that reduces
+record overhead and keeps model state tighter. It's the highest-ROI path that
 fits nyx's existing architecture: reuse the LZP hash table, add a new symbol type
 to the rANS stream, and let the CM stack handle the non-match bytes. This directly
 attacks the structural gap zstd-1 exploits on text.
 
-If A stalls, try **C** (run-length-limited sparse contexts) as a low-risk side
-experiment. It's a few lines of code and might recover 1–3 points on structured
-text without container changes.
+If A stalls again, try **C** (run-length-limited sparse contexts) as a low-risk side
+experiment — already tested at one cap value, but other cap values / combinations
+remain unexplored.
 
 Save **B** (PPM + match) and **D** (SSM mixer) for later phases once A/C are
 exhausted.
@@ -219,6 +223,8 @@ exhausted.
 - [x] Committed and pushed to `origin/main`.
 - [x] Classifier-aware method bytes evaluated — architecturally sound, neutral on
       current subset. Documented in plan.
-- [ ] **Explicit match-copy records** — prototype, measure on 5-file subset.
+- [x] Explicit match-copy records — first prototype, measured, reverted (regressed).
+- [x] Run-length-limited sparse contexts — prototype, measured, reverted (neutral).
+- [ ] Refined match-copy records — reduced overhead / tighter state coupling.
 - [ ] Beat `zstd -1` on ratio for text + mixed corpora.
 - [ ] Update stage2 measurements file and this plan after each stage.

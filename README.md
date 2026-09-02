@@ -92,6 +92,23 @@ Beat `zstd -1` on ratio for text + mixed corpora while keeping the existing
 `nci`/`mr` wins. `FSE` is tracked as a secondary reference. Speed remains
 secondary.
 
+## Experiments log (2026-09)
+
+| experiment | files tested | result | action |
+|---|---|---|---|
+| Adaptive LZP confidence scaling | mr, dickens | neutral | reverted |
+| Per-model / prev-byte mixer bias | mr, json | regressed | reverted |
+| PPM order-4 extra mixer input | dickens | neutral | reverted |
+| Per-model reliability dampening | dickens, json | regressed | reverted |
+| Classifier-aware Text stack dropping Exec + PPM order-4 | json | regressed | reverted to full hybrid_ppm3 |
+| Explicit match-copy records | mr, dickens, json, webster, nci | **regressed all** | reverted |
+| Run-length-limited sparse contexts | mr, dickens, json, webster, nci | neutral (<1 byte diff) | reverted |
+| **Per-bit-position mixer context** | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
+| **Classifier-aware method bytes** | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
+
+Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes**.
+Round-trip verified on all 5 files; build and tests green.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
