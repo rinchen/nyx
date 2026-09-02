@@ -24,7 +24,7 @@ slower than byte-level decoders).
 | mr | 29.4 | 38.5 | 31.3 | 44.0 | **nyx** |
 | json | 5.6 | 0.3 | 0.1 | 52.8 | zstd -19 |
 
-Round-trip verified for every file. Speed: nyx ~0.6–1.0 MB/s cmp / ~0.4–0.5 MB/s dec;
+Round-trip verified for every file. Speed: nyx ~0.7–0.9 MB/s cmp / ~0.4–0.5 MB/s dec;
 zstd -1 ~400–12000 MB/s cmp / ~1000–36000 MB/s dec; FSE ~200–1600 MB/s both ways.
 The decode gap is ~40–70000× — an architectural constant of bit-level context mixing.
 
@@ -46,7 +46,8 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   improvement on `dickens` (unchanged at 57.5%); reverted to order-3.
 - **Per-model reliability dampening** (2026-09 experiment). Used the mixer's
   previous per-model direction correctness as a dampening factor in both mix and
-  update. Regressed both `dickens` (56.4% → 58.1%) and `json` (5.6% → 6.2%),\n  which means the logistic weights already encode per-model reliability; adding
+  update. Regressed both `dickens` (56.4% → 58.1%) and `json` (5.6% → 6.2%),
+  which means the logistic weights already encode per-model reliability; adding
   an explicit dampening term over-constrains the mix. Reverted.
 - **Classifier-aware Text stack dropping Exec + PPM order-4** (2026-09 experiment).
   Dropping Exec regressed `json` from 5.6% → 6.4%; PPM order-4 on Text was also a
@@ -82,6 +83,9 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   wins, no regressions.
 - **README/BENCH rewrite** (2026-09): removed “honest” framing, added zstd-1/FSE
   comparison, added explicit ratio-win and speed-win columns.
+- **Compiler tuning + inline hot paths** (2026-09): `panic=abort`, `strip=symbols`,
+  `#[inline(always)]` on hot model paths, stack-allocated probability buffers.
+  Ratios unchanged; compress speed improved ~13–26% on larger files.
 
 ## 6. Hard requirement: optimize for data type, not benchmark-specific overfit
 
@@ -105,11 +109,9 @@ specific file instance. Concretely:
   with online learning** — the Exec model difference is lost in mixer warm-up.
 - Per-bit-position mixer context is the last confirmed win; all mixer reliability
   experiments (binary dampening, smoothed EMA accuracy) regressed ratio.
-- **Current hypothesis:** the ~14–17 point text gap to zstd-1 comes from
-  **long-range repetition**, not token prediction. A match-copy path using the
-  existing LZP hash table but emitting explicit `(distance, length)` records could
-  close that gap. First attempt failed due to overhead + state divergence; a refined
-  implementation with smaller records / tighter coupling is the next candidate.
+- The ~14–17 point text gap to zstd-1 is the core unsolved problem. Match-copy
+  failed; run-limited sparse was neutral. The gap is structural: nyx's predictor
+  stack is still shallow for long-range repetition and structured symbol boundaries.
 
 ## 8. Research summary (2026-09)
 
@@ -121,60 +123,75 @@ specific file instance. Concretely:
   hybrid direction but requires fundamentally different runtime.
 - **Nacrith** (Feb 2026, arXiv 2602.19626): 135M transformer + context mixing.
   Too heavy for local use but shows the current frontier.
+- **NICOM / indirect context models (ZPAQ)**: ZPAQ's "Indirect Context Model"
+  maps each context to a small bit-history state machine rather than a raw count.
+  This gives it 4–6 bits of pattern memory per context (run-length, periodic,
+  switch states) without blowing up table size.
 
 ### Old / underused
 - **ZPAQ**: journaling + dedup + LZ77 + CM. Modular but encode.su consensus is
-  subpar LZ and CM performance.
+  subpar LZ and CM performance. Its ICM design is interesting even if the rest isn't.
 - **PAQ / CMix** (Hutter Prize lineage): the original bit-level context mixing
   with hundreds of specialized models + neural-weight blending. CMix is the
   current text-compression champion; it's essentially "nyx with 100+ models and
   a neural mixer."
 - **PPMD** (7-Zip): PPM with distance coding — exactly the "PPM + explicit match"
   hybrid architecture.
+- **PAQ8 indirect context models / word models / record segmentation**: PAQ8
+  variants include word models for English text, line/column models for tables,
+  and "record segmentation" for structured data. These model the *structure* of
+  data, not just bit patterns.
 
 ### Gap analysis for nyx
-The ~14–17 point text gap to zstd-1 comes from **long-range repetition handling**,
-not token prediction. zstd-1's text advantage is almost entirely LZ77-style
-copy/distance coding. nyx's LZP only feeds a bit prediction; it never emits
-explicit `(distance, length)` records.
+The ~14–17 point text gap to zstd-1 comes from two structural gaps:
+1. **Long-range repetition handling** — zstd-1's LZ77 copy/distance coding.
+2. **Symbol/word awareness** — PAQ/CMix models words and record fields; nyx
+   only models raw bit contexts. On structured text (dickens/webster), word
+   boundaries carry enormous predictive signal that nyx's byte-level models miss.
 
 ## 9. Plausible alternatives to attempt
 
-### A. Explicit match-copy records in the rANS stream (highest ROI)
-- **What:** Use the existing LZP hash table to find repeated substrings. When a
-  match exceeds a minimum length (e.g., 4–8 bytes), emit a `(distance, length)`
-  record in the bitstream instead of coding those bytes through the CM stack.
-- **Why plausible:** zstd-1's text advantage is primarily this. The LZP table
-  already exists; we just need a record syntax and decoder-side copy instruction.
-- **Risk:** medium. Adds a new method or symbol type to the entropy coder. The
-  decoder must reconstruct the same LZP state to resolve references — possible
-  because LZP prediction is causal and deterministic.
-- **Reward:** highest single-axis gain available. Could close 5–10 points on text.
-- **Status:** first prototype regressed all files; needs smaller record format / tighter
-  state coupling.
+### A. Indirect Context Model (ICM) — bit-history states (highest ROI, untried)
+- **What:** Replace the `CtxTable` count tables with a **bit-history state machine**
+  per context. Instead of storing `[count0, count1]`, store a small state (4–8 bits)
+  that encodes the recent 0/1 pattern at that context: run of zeros, run of ones,
+  alternating, switch state, etc. This is ZPAQ's ICM. It captures *how* bits arrive,
+  not just *how many* of each.
+- **Why plausible:** ZPAQ's ICM consistently outperforms raw count tables on
+  structured data. The state machine captures periodic patterns and run-length
+  structure with 8× less memory than equivalent counts. PAQ8px uses ICMs for ~half
+  its model ensemble.
+- **Risk:** medium. New table type, new predict/update logic. Must maintain causal
+  safety and generation reset semantics.
+- **Reward:** highest single-component gain available without changing container.
+  Could recover 3–6 points on text by capturing periodic whitespace/newline
+  patterns that raw counts smear out.
 
-### B. Hybrid PPM + match records (old idea, new container)
-- **What:** PPMD-style: when PPM's high-order context is sparse, fall back to
-  distance-coded copies from recent bytes. This is "PPM with LZP escape" — the
-  existing PPM model stays, but its escape path emits match records.
-- **Why plausible:** PPMD in 7-Zip uses exactly this. It's old but not widely
-  implemented in modern codecs. nyx's PpmModel already has the causal context
-  machinery.
-- **Risk:** high. Needs careful interaction between PPM update and match-copy
-  emission so the decoder stays in sync.
-- **Reward:** could unify the two strongest signals (PPM escape + match) in one
-  model, which is more efficient than running them separately.
+### B. Word/string model for text (old idea, new container)
+- **What:** Add a **word dictionary model** that tokenizes text into word symbols
+  and maintains a `P(bit==1)` table keyed on the previous word + current bit.
+  This is PAQ's "word model" — it turns natural language redundancy into direct
+  symbol prediction instead of byte-level context chains.
+- **Why plausible:** Dickents/webster are ~90% English prose. Word-level
+  prediction on "the quick brown fox" is dramatically stronger than order-2 byte
+  context because it skips 3–5 bytes of irrelevant context. CMix and PAQ8 both
+  use word models for exactly this reason.
+- **Risk:** medium. Needs a simple word break detector (ASCII space/punct), a
+  rolling word buffer, and a new context table. Memory cost: ~2–4 MB per block.
+- **Reward:** could close 3–5 points on dickens/webster, plus json (field names
+  repeat exactly).
 
-### C. Sparse high-order contexts with run-length limits (cutting-edge-ish)
-- **What:** Add order-3 sparse context with a **run-length cap** — after N
-  consecutive identical bytes, stop updating that context to avoid dilution.
-  This is inspired by BSC/CMix's "run-length" models but much simpler.
-- **Why plausible:** The raw order-3 bump failed because of dilution, but a
-  run-length guard might preserve the signal for actual runs (whitespace, JSON
-  colons, etc.) without polluting the table on variable data.
-- **Risk:** low-medium. Small change to Sparse/OrderN, no container change.
-- **Reward:** modest. Could recover 1–3 points on structured text.
-- **Status:** first prototype neutral; gain ceiling <1pt at 64 KiB.
+### C. Record segmentation model for structured data (old, rarely implemented)
+- **What:** Detect record boundaries in semi-structured data (JSON objects, CSV
+  rows, XML tags) and add a **field-position context model**. For JSON, key on
+  the current JSON key string + bit position; for binary, key on offset modulo N.
+- **Why plausible:** JSON files have extremely repetitive structure:
+  `{"name":..., "level":..., "models":[...]}`. A model that recognizes "we're in
+  the `models` array" predicts `[` and `"` with near-certainty. PAQ8's "record
+  segmentation" does exactly this.
+- **Risk:** medium. Needs lightweight per-class parsers or regex-like detectors.
+  Must stay causal.
+- **Reward:** could recover 2–4 points on json and other structured files.
 
 ### D. State-space mixer (long-shot, cutting-edge)
 - **What:** Replace the logistic linear mix with a tiny Mamba-style SSM
@@ -201,18 +218,17 @@ explicit `(distance, length)` records.
 
 ## 10. Recommendation
 
-Pursue **A** (explicit match-copy records) first, with a refined design that reduces
-record overhead and keeps model state tighter. It's the highest-ROI path that
-fits nyx's existing architecture: reuse the LZP hash table, add a new symbol type
-to the rANS stream, and let the CM stack handle the non-match bytes. This directly
-attacks the structural gap zstd-1 exploits on text.
+Pursue **A** (Indirect Context Model / bit-history states) first. It's the
+highest-ROI path that fits nyx's existing architecture: same table shape, same
+context keys, but richer per-context state that captures run-length and periodic
+patterns raw counts can't represent. No container change required. If A delivers
+3+ points on text, it becomes the new default.
 
-If A stalls again, try **C** (run-length-limited sparse contexts) as a low-risk side
-experiment — already tested at one cap value, but other cap values / combinations
-remain unexplored.
+If A stalls or plateaus, try **B** (word model) for dickens/webster and **C**
+(record segmentation) for json — these are complementary and address different
+data classes.
 
-Save **B** (PPM + match) and **D** (SSM mixer) for later phases once A/C are
-exhausted.
+Save **D** (SSM mixer) and **E** (dictionary pass) for later phases.
 
 ## 11. Definition of done (revised)
 
@@ -225,6 +241,7 @@ exhausted.
       current subset. Documented in plan.
 - [x] Explicit match-copy records — first prototype, measured, reverted (regressed).
 - [x] Run-length-limited sparse contexts — prototype, measured, reverted (neutral).
-- [ ] Refined match-copy records — reduced overhead / tighter state coupling.
+- [x] Compiler tuning + inline hot paths — speed improved 13–26%, ratios unchanged.
+- [ ] **Indirect Context Model (bit-history states)** — prototype, measure on 5-file subset.
 - [ ] Beat `zstd -1` on ratio for text + mixed corpora.
 - [ ] Update stage2 measurements file and this plan after each stage.
