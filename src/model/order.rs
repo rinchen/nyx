@@ -5,9 +5,9 @@
 //! prediction is `count1 / (count0+count1)`, quantized to 12-bit and clamped away from
 //! the extremes so the entropy coder never sees a probability of exactly 0 or 1.
 
+use super::ctable::CtxTable;
 use super::BitModel;
 use super::ByteAssembler;
-use super::ctable::CtxTable;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
@@ -52,17 +52,16 @@ impl OrderN {
 }
 
 impl BitModel for OrderN {
+    #[inline(always)]
     fn predict(&self) -> u16 {
         let [c0, c1] = self.ctab.get(self.ctx());
         let tot = f64::from(c0 + c1);
-        (f64::from(c1) / tot * f64::from(MAX_PROB))
-            .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
+        (f64::from(c1) / tot * f64::from(MAX_PROB)).clamp(f64::from(MIN_PROB), f64::from(MAX_PROB))
+            as u16
     }
 
+    #[inline(always)]
     fn update(&mut self, bit: bool) {
-        // File the tally under the SAME context `predict()` used (the pre-push state), so
-        // the model learns causally and correctly. Predict keys on the assembler's current
-        // bytes + current bit position; compute that here *before* advancing the assembler.
         let mut k = 0u64;
         for &b in self.asm.last(self.order) {
             k = (k << 8) | u64::from(b);
@@ -72,6 +71,7 @@ impl BitModel for OrderN {
         self.ctab.update(ctx, bit);
     }
 
+    #[inline]
     fn reset(&mut self) {
         self.asm.reset();
         self.ctab.reset();
@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn predicts_uniform_when_fresh() {
         let m = OrderN::new(2);
-        assert!((i32::from(m.predict()) - 2048).abs() <= 1, "fresh model ~50/50");
+        assert!(
+            (i32::from(m.predict()) - 2048).abs() <= 1,
+            "fresh model ~50/50"
+        );
     }
 
     #[test]

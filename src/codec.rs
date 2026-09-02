@@ -177,7 +177,9 @@ fn compress_block(
     block: &[u8],
 ) -> Vec<u8> {
     let mut enc = BitEncoder::new();
-    let mut probs: Vec<u16> = vec![2048; models.len()];
+    // Stack-allocate probability buffer (max 7 models in any stack).
+    let mut probs: [u16; 7] = [2048; 7];
+    let n = models.len();
     for &byte in block {
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
@@ -185,9 +187,9 @@ fn compress_block(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs, bit_pos);
+            let p = mixer.mix(&probs[..n], bit_pos);
             enc.encode_bit(bit, p);
-            mixer.update(&probs, bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -277,7 +279,9 @@ fn decompress_block(
 ) -> Result<Vec<u8>> {
     let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
-    let mut probs: Vec<u16> = vec![2048; models.len()];
+    // Stack-allocate probability buffer (max 7 models in any stack).
+    let mut probs: [u16; 7] = [2048; 7];
+    let n = models.len();
 
     while out.len() < orig_len {
         let mut byte = 0u8;
@@ -286,11 +290,11 @@ fn decompress_block(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs, bit_pos);
+            let p = mixer.mix(&probs[..n], bit_pos);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs, bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }

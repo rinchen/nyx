@@ -92,6 +92,7 @@ impl LogisticMixer {
     /// Mix `probs` (one P(bit==1) per model, each in `[1,4095]`) → fused P in `[1,4095]`.
     /// `bit_pos` is the 0-based MSB-first bit position within the current byte.
     #[must_use]
+    #[inline(always)]
     pub fn mix(&self, probs: &[u16], bit_pos: u8) -> u16 {
         let b = usize::from(bit_pos.min(7));
         let mut acc = 0.0f32;

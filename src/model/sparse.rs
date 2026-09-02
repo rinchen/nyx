@@ -5,9 +5,9 @@
 //! contexts capture long-range regularities that dense order-N models miss at modest
 //! memory cost.
 
+use super::ctable::CtxTable;
 use super::BitModel;
 use super::ByteAssembler;
-use super::ctable::CtxTable;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
@@ -43,13 +43,15 @@ impl Sparse {
 }
 
 impl BitModel for Sparse {
+    #[inline(always)]
     fn predict(&self) -> u16 {
         let [c0, c1] = self.ctab.get(self.key());
         let tot = f64::from(c0 + c1);
-        (f64::from(c1) / tot * f64::from(MAX_PROB))
-            .clamp(f64::from(MIN_PROB), f64::from(MAX_PROB)) as u16
+        (f64::from(c1) / tot * f64::from(MAX_PROB)).clamp(f64::from(MIN_PROB), f64::from(MAX_PROB))
+            as u16
     }
 
+    #[inline(always)]
     fn update(&mut self, bit: bool) {
         // Use the pre-push context (matches predict), then advance the assembler.
         let k = self.key();
@@ -57,6 +59,7 @@ impl BitModel for Sparse {
         self.ctab.update(k, bit);
     }
 
+    #[inline]
     fn reset(&mut self) {
         self.asm.reset();
         self.ctab.reset();
