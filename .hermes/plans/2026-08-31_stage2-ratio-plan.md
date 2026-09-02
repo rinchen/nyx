@@ -44,10 +44,23 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   Both regressed measured ratio; fully reverted.
 - **PPM order-4 as an extra mixer input** (2026-09 experiment). No measurable
   improvement on `dickens` (unchanged at 57.5%); reverted to order-3.
+- **Per-model reliability dampening** (2026-09 experiment). Used the mixer's
+  previous per-model direction correctness as a dampening factor in both mix and
+  update. Regressed both `dickens` (56.4% → 58.1%) and `json` (5.6% → 6.2%),
+  which means the logistic weights already encode per-model reliability; adding
+  an explicit dampening term over-constrains the mix. Reverted.
 - **Classifier-aware Text stack dropping Exec + PPM order-4** (2026-09 experiment).
   Dropping Exec regressed `json` from 5.6% → 6.4%; PPM order-4 on Text was also a
   regress. Reverted to full hybrid_ppm3 stack for both Text and Binary; only `Exec`
   blocks drop the Exec model.
+- **Classifier-aware stacks (broader evaluation)** (2026-09 experiment, current state).
+  Added `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
+  Both Text and Binary use the full hybrid_ppm3 stack; only Exec blocks drop the
+  Exec model. Measured as neutral on the 5-file subset — preserves all wins, no
+  regressions. **Conclusion:** classifier-aware stacks are the right architecture
+  but don't move the needle at 64 KiB blocks with online learning; the Exec model
+  difference is lost in mixer warm-up. The actual ratio gains must come from richer
+  context within a single stack.
 
 ## 5. What we tried and did work
 
@@ -71,10 +84,7 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
   Both Text and Binary currently use the full hybrid_ppm3 stack; only Exec blocks
   drop the Exec model. Measured as neutral on the 5-file subset — preserves all
-  wins, no regressions. **Conclusion:** classifier-aware stacks are the right
-  architecture but don't move the needle at 64 KiB blocks with online learning;
-  the Exec model difference is lost in mixer warm-up. The actual ratio gains
-  must come from richer context within a single stack (Option A).
+  wins, no regressions.
 - **README/BENCH rewrite** (2026-09): removed “honest” framing, added zstd-1/FSE
   comparison, added explicit ratio-win and speed-win columns.
 
@@ -96,69 +106,123 @@ specific file instance. Concretely:
 - The container method byte now distinguishes `Text`/`Binary`/`Exec` blocks, but
   Text and Binary both use the full hybrid_ppm3 stack. Only `Exec` blocks drop the
   Exec model.
-- The next step is continuing Option A (richer mixer context) or moving to Option B
-  (classifier-aware model selection).
+- Classifier-aware stacks are architecturally sound but **neutral at 64 KiB blocks
+  with online learning** — the Exec model difference is lost in mixer warm-up.
+- Per-bit-position mixer context is the last confirmed win; all mixer reliability
+  experiments (binary dampening, smoothed EMA accuracy) regressed ratio.
+- **Current hypothesis:** the ~14–17 point text gap to zstd-1 comes from
+  **long-range repetition**, not token prediction. A match-copy path using the
+  existing LZP hash table but emitting explicit `(distance, length)` records could
+  close that gap.
 
-## 8. Two remaining options
+## 8. Research summary (2026-09)
 
-### Option A — Richer mixer context (in progress / preferred)
+### Cutting-edge
+- **StateSMix** (May 2025, arXiv 2605.02904): online-trained Mamba-style SSM +
+  sparse n-gram context mixing + arithmetic coding. Trained from scratch per-file,
+  no pre-trained weights, ~120K params. Directly comparable to nyx's architecture
+  but replaces the logistic mixer with a state-space model. This validates the
+  hybrid direction but requires fundamentally different runtime.
+- **Nacrith** (Feb 2026, arXiv 2602.19626): 135M transformer + context mixing.
+  Too heavy for local use but shows the current frontier.
 
-- Add a small amount of per-bit or per-byte context inside the mixer itself,
-  without changing the container format.
-- Candidate: **per-model probability deltas + previous-byte bucket**, using the
-  existing `bit_pos`/`prev_byte` signals already available in the codec loop.
-- Risk: medium. This touches the mixer interface and all call sites, but stays
-  decoder-safe because both sides compute the same extra context from the same
-  decoded prefix.
-- Reward: higher if the bottleneck is mixer specialization rather than missing
-  contexts.
+### Old / underused
+- **ZPAQ**: journaling + dedup + LZ77 + CM. Modular but encode.su consensus is
+  subpar LZ and CM performance.
+- **PAQ / CMix** (Hutter Prize lineage): the original bit-level context mixing
+  with hundreds of specialized models + neural-weight blending. CMix is the
+  current text-compression champion; it's essentially "nyx with 100+ models and
+  a neural mixer."
+- **PPMD** (7-Zip): PPM with distance coding — exactly the "PPM + explicit match"
+  hybrid architecture.
 
-### Option B — Classifier-aware model selection (higher risk, higher reward)
+### Gap analysis for nyx
+The ~14–17 point text gap to zstd-1 comes from **long-range repetition handling**,
+not token prediction. zstd-1's text advantage is almost entirely LZ77-style
+copy/distance coding. nyx's LZP only feeds a bit prediction; it never emits
+explicit `(distance, length)` records.
 
-- Use `BlockKind` to choose different model stacks:
-  - `Text` drops `Exec`, adds higher-order escape context;
-  - `Binary`/`Exec` keep the current stack;
-  - `Random` unchanged.
-- Risk: higher because the current `NYX1` container only stores `METHOD_COPY` /
-  `METHOD_CM`. To make this decoder-safe without extra metadata, we need either
-  a reversible heuristic stack selection or a container version bump with an
-  explicit method byte.
-- Reward: highest if text parity with `zstd -1` requires fundamentally different
-  context sets per class.
+## 9. Plausible alternatives to attempt
 
-## 9. Ideas and things left to be done
+### A. Explicit match-copy records in the rANS stream (highest ROI)
+- **What:** Use the existing LZP hash table to find repeated substrings. When a
+  match exceeds a minimum length (e.g., 4–8 bytes), emit a `(distance, length)`
+  record in the bitstream instead of coding those bytes through the CM stack.
+- **Why plausible:** zstd-1's text advantage is primarily this. The LZP table
+  already exists; we just need a record syntax and decoder-side copy instruction.
+- **Risk:** medium. Adds a new method or symbol type to the entropy coder. The
+  decoder must reconstruct the same LZP state to resolve references — possible
+  because LZP prediction is causal and deterministic.
+- **Reward:** highest single-axis gain available. Could close 5–10 points on text.
 
-### Near-term experiments
+### B. Hybrid PPM + match records (old idea, new container)
+- **What:** PPMD-style: when PPM's high-order context is sparse, fall back to
+  distance-coded copies from recent bytes. This is "PPM with LZP escape" — the
+  existing PPM model stays, but its escape path emits match records.
+- **Why plausible:** PPMD in 7-Zip uses exactly this. It's old but not widely
+  implemented in modern codecs. nyx's PpmModel already has the causal context
+  machinery.
+- **Risk:** high. Needs careful interaction between PPM update and match-copy
+  emission so the decoder stays in sync.
+- **Reward:** could unify the two strongest signals (PPM escape + match) in one
+  model, which is more efficient than running them separately.
 
-1. **PPM/escape order-4** — evaluated as extra mixer input; no gain on `dickens`
-   at current implementation. Deprioritized unless Option A changes context.
+### C. Sparse high-order contexts with run-length limits (cutting-edge-ish)
+- **What:** Add order-3 sparse context with a **run-length cap** — after N
+  consecutive identical bytes, stop updating that context to avoid dilution.
+  This is inspired by BSC/CMix's "run-length" models but much simpler.
+- **Why plausible:** The raw order-3 bump failed because of dilution, but a
+  run-length guard might preserve the signal for actual runs (whitespace, JSON
+  colons, etc.) without polluting the table on variable data.
+- **Risk:** low-medium. Small change to Sparse/OrderN, no container change.
+- **Reward:** modest. Could recover 1–3 points on structured text.
 
-2. **Adaptive LZP** — postponed after Option A.
+### D. State-space mixer (long-shot, cutting-edge)
+- **What:** Replace the logistic linear mix with a tiny Mamba-style SSM
+  (StateSMix architecture). Train online per-block, no pre-trained weights.
+- **Why plausible:** StateSMix published May 2025 shows this works with ~120K
+  params. nyx's architecture is already close — swap the logistic mix for an SSM.
+- **Risk:** very high. New runtime, new tuning, larger state per block, unknown
+  behavior on small files.
+- **Reward:** could be transformative if the SSM learns long-range dependencies
+  the logistic mix can't represent. But this is multi-month research, not a
+  weekend experiment.
 
-3. **Classifier-aware model selection** — Option B path; needs container/method
-   design before implementation.
+### E. Dedicated dictionary / preprocessing pass (old, rarely used in modern codecs)
+- **What:** Before CM coding, run a single-pass LZ77-style dictionary extraction
+  that identifies all matches > L bytes, emits them as literals or copy records,
+  and codes the rest with CM. This is what Brotli/Zstd do internally.
+- **Why plausible:** It's the standard approach in production codecs. nyx lacks
+  it entirely.
+- **Risk:** high because it changes the fundamental "bit-by-bit" architecture
+  that makes nyx decoder-safe. You'd need a new method in the container and
+  careful state reconstruction.
+- **Reward:** high but incremental — you'd be catching up to zstd-1's baseline
+  rather than leapfrogging it.
 
-4. **Richer mixer context** — Option A path; next concrete attempt.
+## 10. Recommendation
 
-### Measurement protocol
+Pursue **A** (explicit match-copy records) first. It's the highest-ROI path that
+fits nyx's existing architecture: reuse the LZP hash table, add a new symbol type
+to the rANS stream, and let the CM stack handle the non-match bytes. This directly
+attacks the structural gap zstd-1 exploits on text.
 
-- Use the 5-file subset with a deterministic harness. Record before/after in
-  `BENCH.md` with exact subset, command, and run metadata.
-- Do not update README claims until numbers are reproducible.
+If A stalls, try **C** (run-length-limited sparse contexts) as a low-risk side
+experiment. It's a few lines of code and might recover 1–3 points on structured
+text without container changes.
 
-### Guardrails
+Save **B** (PPM + match) and **D** (SSM mixer) for later phases once A/C are
+exhausted.
 
-- Do not break `cargo test` or `cargo clippy --all-targets -- -D warnings`.
-- Keep round-trip exact for all benchmark files.
-- Stop after the first measured win; do not bundle multiple changes in one benchmark.
-
-## 10. Definition of done (revised)
+## 11. Definition of done (revised)
 
 - [x] `cargo test` green (31 passed); `cargo clippy --all-targets -- -D warnings` clean.
 - [x] `nyx compress`/`decompress` round-trips on ≥200 KB mixed fixture + real corpus files.
 - [x] `README.md` updated with measured numbers and zstd-1 + FSE target (no "honest" framing).
 - [x] `BENCH.md` written with zstd-1 / zstd-19 / FSE comparison (ratio and speed).
 - [x] Committed and pushed to `origin/main`.
-- [ ] **Beat `zstd -1` on ratio** for text + mixed corpora — next step: Option A
-      or Option B from §8.
+- [x] Classifier-aware method bytes evaluated — architecturally sound, neutral on
+      current subset. Documented in plan.
+- [ ] **Explicit match-copy records** — prototype, measure on 5-file subset.
+- [ ] Beat `zstd -1` on ratio for text + mixed corpora.
 - [ ] Update stage2 measurements file and this plan after each stage.
