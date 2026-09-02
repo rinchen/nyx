@@ -29,6 +29,13 @@
 - Likely cause: match overhead + model state divergence + extra control bits.
 - Action: fully reverted to baseline hybrid_ppm3 + per-bit-position mixer.
 
+### Run-length-limited sparse contexts (REVERTED)
+- Files tested: mr, dickens, json, webster, nci
+- Result: neutral (all files within 1 byte; measurement noise). mr 29.4%, dickens 56.4%, json 5.6%, webster 51.0%, nci 27.6%.
+- Round-trip: verified via md5 (all files match).
+- Likely ceiling: <1pt at 64 KiB blocks; not worth added code path.
+- Action: reverted to baseline Sparse implementation without RunTracker.
+
 ### Per-bit-position mixer context
 - Files tested: mr, dickens, json, webster, nci
 - Result: improved all 5 files. mr 30.5% → 29.4%, dickens 57.5% → 56.4%, json 7.8% → 5.6%, webster 54.7% → 51.0%, nci 30.4% → 27.6%.
@@ -62,5 +69,5 @@
 ## Next candidates
 
 1. Refined match-copy (learn from revert — reduce overhead, fix state divergence)
-2. Sparse high-order contexts with run-length limits (low-risk, ~1–3pt gain)
-3. Dedicated dictionary / preprocessing pass (high effort, high reward)
+2. Dedicated dictionary / preprocessing pass (high effort, high reward)
+3. State-space mixer (long-shot)

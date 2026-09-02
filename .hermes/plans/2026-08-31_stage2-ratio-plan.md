@@ -56,6 +56,7 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
 - **Explicit match-copy records** (2026-09 experiment, REVERTED). Prototyped interleaved match/literal stream using existing LZP hash table. Control bit selects match vs literal; matches emit raw `(distance, length)` bits after control. Round-trips correctly, but regressed all 5 files:
   mr 29.4% → 37.2%, dickens 56.4% → 62.5%, json 5.6% → 9.2%, webster 51.0% → 59.8%, nci 27.6% → 32.3%.
   Likely cause: match overhead + model state divergence. Reverted.
+- **Run-length-limited sparse contexts** (2026-09 experiment, REVERTED). Added `RunTracker` to `ByteAssembler`; `Sparse` stops updating after 8 identical bytes. Round-trips correctly; neutral on the 5-file subset (all within 1 byte, measurement noise). Likely gain ceiling is <1pt at 64 KiB; reverted to keep code path simple.
 
 ## 5. What we tried and did work
 
