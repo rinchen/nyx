@@ -53,14 +53,9 @@ The decode gap is ~40–70000× — an architectural constant of bit-level conte
   Dropping Exec regressed `json` from 5.6% → 6.4%; PPM order-4 on Text was also a
   regress. Reverted to full hybrid_ppm3 stack for both Text and Binary; only `Exec`
   blocks drop the Exec model.
-- **Classifier-aware stacks (broader evaluation)** (2026-09 experiment, current state).
-  Added `METHOD_TEXT=2`, `METHOD_BINARY=3`, `METHOD_EXEC=4` to the `NYX1` container.
-  Both Text and Binary use the full hybrid_ppm3 stack; only Exec blocks drop the
-  Exec model. Measured as neutral on the 5-file subset — preserves all wins, no
-  regressions. **Conclusion:** classifier-aware stacks are the right architecture
-  but don't move the needle at 64 KiB blocks with online learning; the Exec model
-  difference is lost in mixer warm-up. The actual ratio gains must come from richer
-  context within a single stack.
+- **Explicit match-copy records** (2026-09 experiment, REVERTED). Prototyped interleaved match/literal stream using existing LZP hash table. Control bit selects match vs literal; matches emit raw `(distance, length)` bits after control. Round-trips correctly, but regressed all 5 files:
+  mr 29.4% → 37.2%, dickens 56.4% → 62.5%, json 5.6% → 9.2%, webster 51.0% → 59.8%, nci 27.6% → 32.3%.
+  Likely cause: match overhead + model state divergence. Reverted.
 
 ## 5. What we tried and did work
 
