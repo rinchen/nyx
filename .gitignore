@@ -25,3 +25,4 @@ corpus/
 
 # Temporary local benchmark scratch
 .work/
+.hermes/
