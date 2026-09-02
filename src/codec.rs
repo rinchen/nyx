@@ -137,7 +137,7 @@ pub fn build_stack_for_kind(
         }
         crate::classify::BlockKind::Binary => {
             // Binary: full stack, same as the original CM path.
-            let n = 7;
+            let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -146,6 +146,7 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::icm::IcmModel::default()),
             ];
             (models, LogisticMixer::new(n))
         }
@@ -177,8 +178,8 @@ fn compress_block(
     block: &[u8],
 ) -> Vec<u8> {
     let mut enc = BitEncoder::new();
-    // Stack-allocate probability buffer (max 7 models in any stack).
-    let mut probs: [u16; 7] = [2048; 7];
+    // Stack-allocate probability buffer (max 8 models in any stack).
+    let mut probs: [u16; 8] = [2048; 8];
     let n = models.len();
     for &byte in block {
         for bit_idx in (0..8).rev() {
@@ -279,8 +280,8 @@ fn decompress_block(
 ) -> Result<Vec<u8>> {
     let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
-    // Stack-allocate probability buffer (max 7 models in any stack).
-    let mut probs: [u16; 7] = [2048; 7];
+    // Stack-allocate probability buffer (max 8 models in any stack).
+    let mut probs: [u16; 8] = [2048; 8];
     let n = models.len();
 
     while out.len() < orig_len {
