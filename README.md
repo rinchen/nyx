@@ -112,6 +112,7 @@ secondary.
 || Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
 || Literal bypass hint model (high-entropy byte bypass) | mr, dickens, json, webster, nci | regressed dickens 56.3%→57.1% | reverted |
 || **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | **kept as default** |
+|| Context-selected mixer banks (4k mixers, byte-class + context hash) | mr, dickens, json, webster, nci | in progress | WIP commit; blocked on mixer reset not clearing weights |
 
 Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware
 method bytes + word model (text blocks only) + SSE/APM/APM2 cascade + LazyLzp (neutral)**.
