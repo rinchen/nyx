@@ -102,8 +102,11 @@ secondary.
 | Run-length-limited sparse contexts | mr, dickens, json, webster, nci | neutral (<1 byte diff) | reverted |
 | **Per-bit-position mixer context** | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
 | **Classifier-aware method bytes** | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
+| **Word/string model** (case-folded, bigram prefix) | dickens, json, webster, nci | +0.1pt on 4/5 | kept as default (text blocks) |
+| ICM (22-state PAQ8) | mr, dickens, json, webster, nci | regressed on 4/5 | reverted |
+| ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
 
-Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes**.
+Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes + word model (text blocks only)**.
 Round-trip verified on all 5 files; build and tests green.
 
 ## License
