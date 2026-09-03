@@ -6,7 +6,6 @@
 
 pub mod ctable;
 pub mod exec;
-pub mod icm;
 pub mod lzp;
 pub mod mixer;
 pub mod order;
@@ -111,9 +110,9 @@ impl ByteAssembler {
 
 /// A bit-level predictor.
 ///
-/// `predict` returns the model's estimate of P(bit==1) in `[1, 4095]` (12-bit).
-/// `update` is called **after** the true bit is known so the model can adapt.
-/// `reset` clears per-block state at the start of each new block.
+/// `predict` returns the model's estimate of P(bit==1) in `[1, 4095]`. `update` is
+/// called **after** the true bit is known so the model can adapt. `reset` clears
+/// per-block state at the start of each new block.
 pub trait BitModel {
     /// Predicted probability of bit==1, in `[1, 4095]`.
     fn predict(&self) -> u16;

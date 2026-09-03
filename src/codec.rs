@@ -128,15 +128,13 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text: full hybrid_ppm3 stack (same as Binary). Dropping Exec here
-            // measured as a regression on mixed/json (6.4% vs 5.6%), likely
-            // because the 7-model mix has better warm-up dynamics per 64 KiB block.
-            // The Exec model has negligible signal on text but its presence stabilizes
-            // the logistic mixer during early bytes of each block.
+            // Text: same full hybrid stack as Binary. Dropping Exec or adding
+            // PPM order-4 here regressed json in earlier experiments; the
+            // 7-model mix has better warm-up dynamics in 64 KiB blocks.
             build_stack_for_kind(crate::classify::BlockKind::Binary)
         }
         crate::classify::BlockKind::Binary => {
-            // Binary: full stack, same as the original CM path.
+            // Binary: full stack.
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
@@ -146,7 +144,6 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
-                Box::new(crate::model::icm::IcmModel::default()),
             ];
             (models, LogisticMixer::new(n))
         }
