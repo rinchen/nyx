@@ -108,8 +108,9 @@ secondary.
 | ICM (22-state PAQ8) | mr, dickens, json, webster, nci | regressed on 4/5 | reverted |
 | ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
 | Order-4 PPM with word-boundary-aware context masking | mr, dickens, json, webster, nci | regressed dickens +0.1pt, webster +0.5pt, nci +0.1pt, json +3.6pt | reverted |
-| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (-0.1pt on dickens/json) | kept in place, not adopted |
-|Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes + word model (text blocks only)**.
+|| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (-0.1pt on dickens/json) | kept in place, not adopted |
+|| Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
+|Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes + word model (text blocks only) + LazyLzp (neutral)**.
 Round-trip verified on all 5 files; build and tests green.
 
 ## License
