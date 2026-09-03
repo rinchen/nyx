@@ -77,6 +77,15 @@ impl LogisticMixer {
         self.lr = lr;
     }
 
+    /// Reset weights to initial state (called at block boundaries).
+    pub fn reset(&mut self) {
+        self.weights.fill(1.0);
+        for pw in &mut self.pos_weights {
+            pw.fill(0.0);
+        }
+        self.lr = 0.02;
+    }
+
     #[inline]
     fn stretch_of(&self, p: u16) -> f32 {
         self.stretch[(p as usize).clamp(1, 4095)]

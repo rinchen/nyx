@@ -12,6 +12,7 @@ pub mod mixer;
 pub mod order;
 pub mod ppm;
 pub mod sparse;
+pub mod sse_apm;
 pub mod word;
 
 /// Assembles whole bytes from the per-bit [`BitModel::update`] stream so context
@@ -93,6 +94,33 @@ impl ByteAssembler {
             self.bytes[self.bytes.len() - 2]
         } else {
             0
+        }
+    }
+
+    /// Hash of the most-recent completed byte as a soft word-context signal.
+    /// Non-breaking bytes contribute their value; word breaks map to 0.
+    #[must_use]
+    pub fn word_hash(&self) -> usize {
+        match self.bytes.last() {
+            Some(b)
+                if !matches!(
+                    b,
+                    b' ' | b'\t'
+                        | b'\n'
+                        | b'\r'
+                        | b','
+                        | b'.'
+                        | b';'
+                        | b':'
+                        | b'!'
+                        | b'?'
+                        | b'"'
+                        | b'\''
+                ) =>
+            {
+                usize::from(*b)
+            }
+            _ => 0,
         }
     }
 

@@ -186,6 +186,9 @@ fn compress_block(
     // Stack-allocate probability buffer (max 9 models in Text stack).
     let mut probs: [u16; 10] = [2048; 10];
     let n = models.len();
+    let mut cascade = crate::model::sse_apm::SseApmCascade::new();
+    cascade.set_lr(0.02);
+
     for &byte in block {
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
@@ -193,13 +196,16 @@ fn compress_block(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let p_mixer = mixer.mix(&probs[..n], bit_pos);
+            let p = cascade.refine(p_mixer, bit_pos);
             enc.encode_bit(bit, p);
             mixer.update(&probs[..n], bit, bit_pos);
+            cascade.update(bit, p_mixer, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
+        cascade.set_context(byte);
     }
     enc.finish()
 }
@@ -288,6 +294,8 @@ fn decompress_block(
     // Stack-allocate probability buffer (max 9 models in Text stack).
     let mut probs: [u16; 10] = [2048; 10];
     let n = models.len();
+    let mut cascade = crate::model::sse_apm::SseApmCascade::new();
+    cascade.set_lr(0.02);
 
     while out.len() < orig_len {
         let mut byte = 0u8;
@@ -296,11 +304,13 @@ fn decompress_block(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let p_mixer = mixer.mix(&probs[..n], bit_pos);
+            let p = cascade.refine(p_mixer, bit_pos);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
             mixer.update(&probs[..n], bit, bit_pos);
+            cascade.update(bit, p_mixer, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -309,6 +319,10 @@ fn decompress_block(
             }
         }
         out.push(byte);
+        // Mirror encoder: update cascade context AFTER this byte completes,
+        // so the next byte's SSE/APM/APM2 uses the same prev/order1/order2
+        // as the encoder did.
+        cascade.set_context(byte);
     }
     Ok(out)
 }
