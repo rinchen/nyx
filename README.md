@@ -106,8 +106,9 @@ secondary.
 | Refined word model (trigram + char-class + 21-bit table) | json | regressed 5.6%→5.8% | reverted to simple word model |
 | Record segmentation model (JSON key/value parser) | dickens, json, webster, nci | neutral on json/dickens/mr; regressed webster/nci | reverted |
 | ICM (22-state PAQ8) | mr, dickens, json, webster, nci | regressed on 4/5 | reverted |
-|| ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
-|| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (-0.1pt on dickens/json) | kept in place, not adopted |
+| ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
+| Order-4 PPM with word-boundary-aware context masking | mr, dickens, json, webster, nci | regressed dickens +0.1pt, webster +0.5pt, nci +0.1pt, json +3.6pt | reverted |
+| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (-0.1pt on dickens/json) | kept in place, not adopted |
 |Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware method bytes + word model (text blocks only)**.
 Round-trip verified on all 5 files; build and tests green.
 
