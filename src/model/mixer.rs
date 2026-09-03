@@ -6,15 +6,48 @@
 //! "context mixing" step that lets heterogeneous models (order, sparse, exec, LZP) cover
 //! for each other per bit, rather than picking a single best model.
 //!
-//! Note: a secondary SSE refinement stage was prototyped but measured as neutral on the
-//! Silesia/Mixed subset (the 2-bit history context was too weak to pay off), so the
-//! production mixer is the single linear logistic mix. See the plan (§10) for the
-//! higher-order / indirect-context redesign that is the actual path to zstd ratio parity.
+//! For higher compression, see [`super::sse_apm::SseApmCascade`] which adds SSE/APM/APM2
+//! refinement stages after the mixer, and [`super::mixer_bank::MixerBank`] which selects
+//! from 4096 context-specific mixer instances.
 
 use super::BitModel;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
+
+/// Shared stretch/squash tables (12-bit probability ↔ logit).
+/// These are identical for every mixer instance, so we allocate once globally.
+static STRETCH: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+static SQUASH: std::sync::OnceLock<[u16; 4096]> = std::sync::OnceLock::new();
+
+fn stretch_table() -> &'static [f32; 4096] {
+    STRETCH.get_or_init(|| {
+        let mut t = [0.0f32; 4096];
+        for (p_slot, slot) in t.iter_mut().enumerate() {
+            let pr = (p_slot as f32 + 0.5) / 4096.0;
+            *slot = if pr <= 1e-6 {
+                -7.0
+            } else if pr >= 1.0 - 1e-6 {
+                7.0
+            } else {
+                (pr / (1.0 - pr)).ln()
+            };
+        }
+        t
+    })
+}
+
+fn squash_table() -> &'static [u16; 4096] {
+    SQUASH.get_or_init(|| {
+        let mut t = [0u16; 4096];
+        for (x_slot, slot) in t.iter_mut().enumerate() {
+            let v = x_slot as f32 / 4095.0 * 14.0 - 7.0; // map [0,4095] -> [-7, 7]
+            let s = 1.0 / (1.0 + (-v).exp());
+            *slot = (s * MAX_PROB as f32).clamp(MIN_PROB as f32, MAX_PROB as f32) as u16;
+        }
+        t
+    })
+}
 
 /// Logistic mixer over `n` model probabilities, with per-bit-position context.
 ///
@@ -28,9 +61,6 @@ pub struct LogisticMixer {
     // Per (model, bit_position) weight deltas. `bit_pos` ∈ [0,7].
     // The effective weight for model `i` at bit position `b` is `base[i] + pos_weights[i][b]`.
     pos_weights: Vec<[f32; 8]>,
-    // Precomputed stretch/squash tables (12-bit probability in, logit out / prob out).
-    stretch: [f32; 4096],
-    squash: [u16; 4096],
 }
 
 impl LogisticMixer {
@@ -38,23 +68,6 @@ impl LogisticMixer {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // builds Vecs via loops; not const-evaluable
     pub fn new(n: usize) -> Self {
-        let mut stretch = [0.0f32; 4096];
-        for (p_slot, slot) in stretch.iter_mut().enumerate() {
-            let pr = (p_slot as f32 + 0.5) / 4096.0;
-            *slot = if pr <= 1e-6 {
-                -7.0
-            } else if pr >= 1.0 - 1e-6 {
-                7.0
-            } else {
-                (pr / (1.0 - pr)).ln()
-            };
-        }
-        let mut squash = [0u16; 4096];
-        for (x_slot, slot) in squash.iter_mut().enumerate() {
-            let v = x_slot as f32 / 4095.0 * 14.0 - 7.0; // map [0,4095] -> [-7, 7]
-            let s = 1.0 / (1.0 + (-v).exp());
-            *slot = (s * MAX_PROB as f32).clamp(MIN_PROB as f32, MAX_PROB as f32) as u16;
-        }
         Self {
             // Start each weight at 1.0 so the mix is a sensible average of the
             // (stretched) model probabilities from the first bit. A zero
@@ -67,8 +80,6 @@ impl LogisticMixer {
             // non-context-aware version (pure 1.0 base weights).
             pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
             lr: 0.02,
-            stretch,
-            squash,
         }
     }
 
@@ -88,14 +99,14 @@ impl LogisticMixer {
 
     #[inline]
     fn stretch_of(&self, p: u16) -> f32 {
-        self.stretch[(p as usize).clamp(1, 4095)]
+        stretch_table()[(p as usize).clamp(1, 4095)]
     }
 
     #[inline]
     fn squash_of(&self, acc: f32) -> u16 {
         // map logistic accumulator to a table index in [0,4095]
         let idx = ((acc + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize;
-        self.squash[idx]
+        squash_table()[idx]
     }
 
     /// Mix `probs` (one P(bit==1) per model, each in `[1,4095]`) → fused P in `[1,4095]`.

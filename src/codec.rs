@@ -27,6 +27,7 @@ use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
 use crate::model::mixer::LogisticMixer;
+use crate::model::mixer_bank::{ByteClass, MixerBank, NUM_MIXERS};
 use crate::model::BitModel;
 
 /// Default block size: 64 KiB. `block_size_log = 16`.
@@ -179,33 +180,35 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
 
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    _mixer: &mut LogisticMixer,
     block: &[u8],
 ) -> Vec<u8> {
     let mut enc = BitEncoder::new();
     // Stack-allocate probability buffer (max 9 models in Text stack).
     let mut probs: [u16; 10] = [2048; 10];
     let n = models.len();
-    let mut cascade = crate::model::sse_apm::SseApmCascade::new();
-    cascade.set_lr(0.02);
+    let mut bank = MixerBank::new(n, NUM_MIXERS);
+    let mut prev_byte: u8 = 0;
+    let mut order1: u8 = 0;
 
     for &byte in block {
+        let cls = ByteClass::classify(byte);
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
             let bit_pos = bit_idx as u8;
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p_mixer = mixer.mix(&probs[..n], bit_pos);
-            let p = cascade.refine(p_mixer, bit_pos);
+            let mixer_id = MixerBank::mixer_id(cls, bit_pos, order1, prev_byte, 0);
+            let p = bank.mix(&probs[..n], mixer_id);
             enc.encode_bit(bit, p);
-            mixer.update(&probs[..n], bit, bit_pos);
-            cascade.update(bit, p_mixer, bit_pos);
+            bank.update(&probs[..n], bit, mixer_id);
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
-        cascade.set_context(byte);
+        order1 = prev_byte;
+        prev_byte = byte;
     }
     enc.finish()
 }

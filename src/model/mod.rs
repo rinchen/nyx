@@ -9,6 +9,7 @@ pub mod exec;
 pub mod lazy_lzp;
 pub mod lzp;
 pub mod mixer;
+pub mod mixer_bank;
 pub mod order;
 pub mod ppm;
 pub mod sparse;
