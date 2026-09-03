@@ -234,7 +234,7 @@ Save **D** (SSM mixer) and **E** (dictionary pass) for later phases.
 
 ## 11. Definition of done (revised)
 
-- [x] `cargo test` green (36 passed); `cargo clippy --all-targets -- -D warnings` clean.
+- [x] `cargo test` green (31 passed); `cargo clippy --all-targets -- -D warnings` clean.
 - [x] `nyx compress`/`decompress` round-trips on ≥200 KB mixed fixture + real corpus files.
 - [x] `README.md` updated with measured numbers and zstd-1 + FSE target (no "honest" framing).
 - [x] `BENCH.md` written with zstd-1 / zstd-19 / FSE comparison (ratio and speed).
