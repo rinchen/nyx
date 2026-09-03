@@ -128,14 +128,24 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text: same full hybrid stack as Binary. Dropping Exec or adding
-            // PPM order-4 here regressed json in earlier experiments; the
-            // 7-model mix has better warm-up dynamics in 64 KiB blocks.
-            build_stack_for_kind(crate::classify::BlockKind::Binary)
+            // Text-optimized stack: full hybrid + WordModel.
+            // Word boundaries carry strong predictive signal for prose / JSON keys.
+            let n = 8;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::exec::Exec::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::word::WordModel::new()),
+            ];
+            (models, LogisticMixer::new(n))
         }
         crate::classify::BlockKind::Binary => {
             // Binary: full stack.
-            let n = 8;
+            let n = 7;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),

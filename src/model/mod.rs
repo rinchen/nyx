@@ -11,6 +11,7 @@ pub mod mixer;
 pub mod order;
 pub mod ppm;
 pub mod sparse;
+pub mod word;
 
 /// Assembles whole bytes from the per-bit [`BitModel::update`] stream so context
 /// models can key on *byte* history instead of individual bits.
