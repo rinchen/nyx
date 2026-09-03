@@ -100,9 +100,10 @@ secondary.
 | Classifier-aware Text stack dropping Exec + PPM order-4 | json | regressed | reverted to full hybrid_ppm3 |
 | Explicit match-copy records | mr, dickens, json, webster, nci | **regressed all** | reverted |
 | Run-length-limited sparse contexts | mr, dickens, json, webster, nci | neutral (<1 byte diff) | reverted |
-|| **Per-bit-position mixer context** | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
-|| **Classifier-aware method bytes** | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
+| **Per-bit-position mixer context** | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
+| **Classifier-aware method bytes** | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
 | **Word/string model** (case-folded, bigram prefix) | dickens, json, webster, nci | +0.1pt on 4/5 | kept as default (text blocks) |
+| Refined word model (trigram + char-class + 21-bit table) | json | regressed 5.6%→5.8% | reverted to simple word model |
 | Record segmentation model (JSON key/value parser) | dickens, json, webster, nci | neutral on json/dickens/mr; regressed webster/nci | reverted |
 | ICM (22-state PAQ8) | mr, dickens, json, webster, nci | regressed on 4/5 | reverted |
 | ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
