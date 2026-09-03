@@ -66,23 +66,38 @@ pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, LogisticMixer),
 {
-    let block_size = 1usize << DEFAULT_BLOCK_SIZE_LOG;
     let mut out = Vec::new();
     let mut entries: Vec<BlockEntry> = Vec::new();
     let mut payloads: Vec<u8> = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0usize;
+
+    // Cross-block persisted state: mixer weight decay + LZP table survive across blocks.
+    let mut global_mixer_weights: Option<Vec<f32>> = None;
+    let mut lzp_table: Option<Vec<u32>> = None;
+    let mut lzp_next: Option<Vec<u32>> = None;
+    let mut lzp_current_pos: usize = 0;
+    let mut lzp_history: Option<Vec<u8>> = None;
 
     while offset < buf.len() {
-        let end = (offset + block_size).min(buf.len());
-        let block = &buf[offset..end];
+        let block = &buf[offset..];
         let kind = crate::classify::classify(block);
+        let block_size = block_size_for_kind(kind, block, offset, buf.len());
+        let end = (offset + block_size).min(buf.len());
+        let block_data = &buf[offset..end];
+
         let (mut models, mut mixer) = build_stack(kind);
-        let comp = compress_block(&mut models, &mut mixer, block);
+        hydrate_lzp(&mut models, &lzp_table, &lzp_next, lzp_current_pos, &lzp_history);
+        hydrate_mixer_weights(&mut mixer, &global_mixer_weights);
+
+        let comp = compress_block(&mut models, &mut mixer, block_data);
+
+        persist_state(&mut global_mixer_weights, &mixer, &mut models, &mut lzp_table, &mut lzp_next, &mut lzp_current_pos, &mut lzp_history);
+
         let entry = BlockEntry {
             comp_len: comp.len() as u32,
-            orig_len: block.len() as u32,
+            orig_len: block_data.len() as u32,
             method: method_for_kind(kind),
-            crc32: crc32(block),
+            crc32: crc32(block_data),
         };
         entries.push(entry);
         payloads.extend_from_slice(&comp);
@@ -92,7 +107,7 @@ where
     let header = Header {
         version: VERSION,
         flags: 0,
-        block_size_log: DEFAULT_BLOCK_SIZE_LOG,
+        block_size_log: 0, // variable block sizes, not a power-of-two global
         num_blocks: entries.len() as u32,
     };
     header.write(&mut out);
@@ -101,6 +116,98 @@ where
     }
     out.extend_from_slice(&payloads);
     Ok(out)
+}
+
+fn block_size_for_kind(
+    kind: crate::classify::BlockKind,
+    block: &[u8],
+    offset: usize,
+    total: usize,
+) -> usize {
+    match kind {
+        crate::classify::BlockKind::Text => {
+            // Text blocks get larger windows for long-range repetition.
+            // Scale with remaining data, capped at 4 MB.
+            let max_text = 4 * 1024 * 1024;
+            let size = (total - offset).min(max_text);
+            size.max(64 * 1024)
+        }
+        crate::classify::BlockKind::Binary
+        | crate::classify::BlockKind::Exec
+        | crate::classify::BlockKind::Random => 64 * 1024,
+    }
+}
+
+fn hydrate_lzp(
+    models: &mut [Box<dyn BitModel>],
+    lzp_table: &Option<Vec<u32>>,
+    lzp_next: &Option<Vec<u32>>,
+    current_pos: usize,
+    history: &Option<Vec<u8>>,
+) {
+    if let (Some(table), Some(nxt), Some(hist)) = (lzp_table, lzp_next, history) {
+        for m in models.iter_mut() {
+            if let Some(lzp) = m.as_any_mut().downcast_mut::<crate::model::lzp::Lzp>() {
+                lzp.set_state(table.clone(), nxt.clone(), current_pos, hist.clone());
+            }
+        }
+    }
+}
+
+fn hydrate_mixer_weights(
+    mixer: &mut LogisticMixer,
+    saved: &Option<Vec<f32>>,
+) {
+    if let Some(weights) = saved {
+        mixer.set_weights(weights.clone());
+    }
+}
+
+fn persist_state(
+    global_mixer_weights: &mut Option<Vec<f32>>,
+    mixer: &LogisticMixer,
+    models: &[Box<dyn BitModel>],
+    lzp_table: &mut Option<Vec<u32>>,
+    lzp_next: &mut Option<Vec<u32>>,
+    lzp_current_pos: &mut usize,
+    lzp_history: &mut Option<Vec<u8>>,
+) {
+    // Decay mixer weights instead of clearing them (EWC-style).
+    if let Some(weights) = global_mixer_weights {
+        for w in weights.iter_mut() {
+            *w *= 0.995;
+        }
+    } else {
+        *global_mixer_weights = Some(mixer.weights().to_vec());
+    }
+    let decayed = global_mixer_weights
+        .as_mut()
+        .expect("global_mixer_weights is set");
+    for (d, s) in decayed.iter_mut().zip(mixer.weights()) {
+        *d = *d * 0.995 + s * (1.0 - 0.995);
+    }
+
+    for m in models.iter() {
+        if let Some(lzp) = m.as_any().downcast_ref::<crate::model::lzp::Lzp>() {
+            // retain only positions within the sliding window
+            let mut table = lzp.heads().to_vec();
+            let mut nxt = lzp.nexts().to_vec();
+            let pos = lzp.current_pos();
+            let limit = pos.saturating_sub(lzp.window());
+            for h in &mut table {
+                let mut cur = *h;
+                while cur != 0 && (cur >= pos as u32 || cur < limit as u32) {
+                    cur = nxt[cur as usize];
+                }
+                *h = cur;
+            }
+            *lzp_table = Some(table);
+            *lzp_next = Some(nxt);
+            *lzp_current_pos = pos;
+            *lzp_history = Some(lzp.history().to_vec());
+            break;
+        }
+    }
 }
 
 /// Map a `BlockKind` to the container method byte the decoder uses to pick a stack.
@@ -190,6 +297,8 @@ fn compress_block(
     let mut bank = MixerBank::new(n, NUM_MIXERS);
     let mut prev_byte: u8 = 0;
     let mut order1: u8 = 0;
+    let mut cascade = crate::model::sse_apm::SseApmCascade::new();
+    cascade.set_lr(0.02);
 
     for &byte in block {
         let cls = ByteClass::classify(byte);
@@ -200,13 +309,16 @@ fn compress_block(
                 probs[i] = m.predict();
             }
             let mixer_id = MixerBank::mixer_id(cls, bit_pos, order1, prev_byte, 0);
-            let p = bank.mix(&probs[..n], mixer_id);
+            let p_mixer = bank.mix(&probs[..n], mixer_id);
+            let p = cascade.refine(p_mixer, bit_pos);
             enc.encode_bit(bit, p);
             bank.update(&probs[..n], bit, mixer_id);
+            cascade.update(bit, p_mixer, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
+        cascade.set_context(byte);
         order1 = prev_byte;
         prev_byte = byte;
     }

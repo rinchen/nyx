@@ -88,6 +88,17 @@ impl LogisticMixer {
         self.lr = lr;
     }
 
+    /// Replace base weights. Keeps per-bit-position deltas unchanged.
+    pub fn set_weights(&mut self, weights: Vec<f32>) {
+        self.weights = weights;
+    }
+
+    /// Return a copy of the base weights.
+    #[must_use]
+    pub fn weights(&self) -> Vec<f32> {
+        self.weights.clone()
+    }
+
     /// Reset weights to initial state (called at block boundaries).
     pub fn reset(&mut self) {
         self.weights.fill(1.0);
@@ -156,6 +167,14 @@ impl BitModel for LogisticMixer {
         for pw in &mut self.pos_weights {
             pw.fill(0.0);
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

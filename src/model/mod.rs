@@ -153,4 +153,9 @@ pub trait BitModel {
 
     /// Reset per-block state (called at the start of each block).
     fn reset(&mut self);
+
+    /// Downcast to `&dyn Any` for persistence-specific plumbing.
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// Downcast to `&mut dyn Any` for persistence-specific plumbing.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
