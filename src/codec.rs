@@ -128,8 +128,9 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text-optimized stack: full hybrid + WordModel.
-            // Word boundaries carry strong predictive signal for prose / JSON keys.
+            // Text-optimized stack: full hybrid + WordModel + LazyLzp.
+            // LazyLzp adds multi-context hash chains + longest-match selection,
+            // borrowing zstd's lazy parsing insight for the bit-level mixer.
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
@@ -137,7 +138,7 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::order::OrderN::new(2)),
                 Box::new(crate::model::sparse::Sparse::new()),
                 Box::new(crate::model::exec::Exec::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::lazy_lzp::LazyLzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
                 Box::new(crate::model::word::WordModel::new()),
             ];
