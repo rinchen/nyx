@@ -3,10 +3,8 @@
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
-//! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse, PPM
-//!   order-4, LZP. The `Exec` byte-pattern model is omitted — it adds no signal for
-//!   text and dilutes the mixer; PPM order-4 covers the higher-order escape
-//!   contexts text needs instead of order-3.
+//! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
+//!   Exec, LazyLzp, PpmModel order-3, WordModel.
 //! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec, LZP,
 //!   PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
 //!   benefits from every signal.
@@ -129,8 +127,7 @@ pub fn build_stack_for_kind(
         }
         crate::classify::BlockKind::Text => {
             // Text-optimized stack: full hybrid + WordModel + LazyLzp.
-            // LazyLzp adds multi-context hash chains + longest-match selection,
-            // borrowing zstd's lazy parsing insight for the bit-level mixer.
+            // LazyLzp adds multi-context hash chains + longest-match selection.
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),

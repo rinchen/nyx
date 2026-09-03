@@ -13,8 +13,6 @@ use super::ByteAssembler;
 const MIN_MATCH: usize = 4; // minimum match length worth emitting
 const TABLE_BITS: usize = 18; // 1<<18 entries
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
-/// Cap the match-run-based prediction sharpening.
-
 
 /// LZP matcher / pre-stage bit model.
 ///
