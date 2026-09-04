@@ -153,6 +153,14 @@ impl BitModel for WordModel {
         self.words.reset();
         self.cur_word.clear();
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 impl Default for WordModel {
