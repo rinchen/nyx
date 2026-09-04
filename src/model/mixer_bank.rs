@@ -112,6 +112,22 @@ impl MixerBank {
     pub fn memory_bytes(&self) -> usize {
         self.mixers.len() * std::mem::size_of::<LogisticMixer>()
     }
+
+    /// Hydrate all mixers in the bank from a saved weight vector.
+    pub fn set_weights_from(&mut self, weights: &[f32]) {
+        if weights.is_empty() {
+            return;
+        }
+        for mixer in &mut self.mixers {
+            mixer.set_weights(weights.to_vec());
+        }
+    }
+
+    /// Read weights back from the first mixer in the bank.
+    #[must_use]
+    pub fn sync_weights_to(&self) -> Vec<f32> {
+        self.mixers.first().map(|m| m.weights()).unwrap_or_default()
+    }
 }
 
 impl Default for MixerBank {
@@ -163,13 +179,11 @@ mod tests {
         for _ in 0..100 {
             bank.update(&probs, true, 1);
         }
+        let before = bank.mix(&probs, 1);
         bank.reset();
-        let p = bank.mix(&probs, 1);
-        // After reset, weights are neutral again.
-        assert!(
-            (p as i32 - 2048i32).abs() < 100,
-            "post-reset prob should be near-neutral: {}",
-            p
-        );
+        let after = bank.mix(&probs, 1);
+        let fresh = MixerBank::new(2, NUM_MIXERS);
+        let expected = fresh.mix(&probs, 1);
+        assert!(after == expected, "post-reset mixer should match fresh mixer: got {after}, expected {expected} (before={before})");
     }
 }
