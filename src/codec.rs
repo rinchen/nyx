@@ -258,8 +258,7 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     let mut runs: Vec<MatchRun> = Vec::new();
     let mut i = 0usize;
     while i + 1 < block.len() {
-        // train_at stores the actual byte position so longest_match's chain
-        // positions match data indices (unlike train_byte's offset current_pos).
+        // Train LZP on the current source byte (not on any matched copy).
         lzp.train_at(block, i);
         if i + 1 >= 4 {
             if let Some(raw_len) = lzp.longest_match(block, i + 1) {
@@ -267,11 +266,9 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
                 let dist = find_match_distance(block, i + 1, len);
                 if dist > 0 && dist <= 4 * 1024 * 1024 && len >= MATCH_MIN_LEN {
                     runs.push(MatchRun { len, dist });
-                    for j in 1..=len {
-                        if i + j < block.len() {
-                            lzp.train_at(block, i + j);
-                        }
-                    }
+                    // Do NOT train LZP on the matched bytes — they're copies
+                    // from earlier in the block, and training on them would
+                    // pollute the hash chains with self-referential matches.
                     i += len;
                     continue;
                 }
@@ -306,8 +303,10 @@ fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
 ///   - match records: `u8 len` (raw, ≥8) + `u32 LE dist` (5 bytes each)
 ///   - rANS bit stream: CM-encoded bits for the block bytes
 ///
-/// Stage 1: the rANS stream covers ALL bytes (matches recorded but not yet
-/// used to skip CM encoding). Stage 2 (future): skip matched bytes from rANS.
+/// Stage 1 (current): the rANS stream covers ALL bytes (matches recorded but
+///  not yet used to skip CM encoding). This keeps round-trip correct while
+///  validating the scaffolding.
+/// Stage 2 (future): skip matched bytes from rANS, only encode residuals.
 fn encode_block_with_matches(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
@@ -349,13 +348,10 @@ fn encode_block_with_matches(
 
 /// Decode a block encoded with `encode_block_with_matches`.
 ///
-/// Stage 1: the encoder CM-encodes ALL bytes (residual = full block), so the
-/// decoder does the same. Match records are present in the side-stream but
-/// not yet used to skip CM — this keeps round-trip correct while validating
-/// the scaffolding.
-///
-/// Stage 2 (future): skip residual decoding for matched positions, instead
-/// copy-matching from the output buffer using the side-stream records.
+/// Stage 1: reads the match side-stream (validates record count/length) then
+/// rANS-decodes ALL bytes — the encoder CM-encodes all bytes, so we do too.
+/// Stage 2 (future): skip rANS decoding for matched positions, copy-matching
+/// from the output buffer instead.
 fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
@@ -367,7 +363,7 @@ fn decode_block_with_matches(
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
-    // Skip past match records (consumed but not yet applied in stage 1).
+    // Validate and skip match records.
     for _ in 0..num_runs {
         if offset + 5 > comp.len() {
             return Err(NyxError::InvalidContainer("truncated match record".into()));
