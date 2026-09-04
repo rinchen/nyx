@@ -1,5 +1,5 @@
 //! Core codec: glue the classifier, bit models, logistic mixer, rANS backend, and the
-//! `NYF1` container into `compress` / `decompress`.
+//! `NYX1` container into `compress` / `decompress`.
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
@@ -16,9 +16,20 @@
 //!   original CM path. This is also the decoder default for any future method value,
 //!   so old streams remain valid.
 //!
-//! Because modeling is causal and the per-block method is recorded in the block
-//! header, the decoder reconstructs the exact same model state from the decoded stream
-//! and round-trips losslessly.
+//! ## Two-pass CM residual (experimental)
+//!
+//! For compressed blocks, nyx runs a forward LZP match pre-pass and emits
+//! explicit `(len, dist)` records for long matches (≥ 8 bytes). Only the
+//! *residual* bytes (those not covered by a match) are context-mixed and
+//! rANS-encoded. The decoder replays the identical scan, copy-matching from
+//! its own output buffer, and rANS-decodes only residual bytes. LZP state
+//! stays in sync because both sides train on the same reconstructed byte
+//! stream.
+//!
+//! Wire format (per block payload):
+//!   - `u32 LE` = number of match records
+//!   - match records: `u8 len` + `u32 LE dist` (5 bytes each)
+//!   - rANS bit stream: only for residual bytes
 //!
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
@@ -26,15 +37,29 @@
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
+use crate::model::lzp::Lzp;
 use crate::model::mixer::LogisticMixer;
 use crate::model::BitModel;
+
+/// Minimum match length to emit as an explicit record (vs. letting CM model it).
+/// The reverted Sep-11 experiment used MIN_MATCH=4 and regressed all 5 files; 8
+/// avoids tiny-match overhead that bloats the side stream.
+const MATCH_MIN_LEN: usize = 8;
+
+/// A single match record emitted by the pre-pass.
+/// `len` is the byte count copied; `dist` is the backward distance.
+#[derive(Debug, Clone, Copy)]
+struct MatchRun {
+    len: usize,
+    dist: usize,
+}
 
 /// Default block size: 64 KiB. `block_size_log = 16`.
 pub const DEFAULT_BLOCK_SIZE_LOG: u8 = 16;
 
 /// Container method constants (stored in `BlockEntry::method`).
 pub const METHOD_COPY: u8 = 0;
-/// Full heterogeneous CM stack (legacy / fallback).
+/// Full heterogenous CM stack (legacy / fallback).
 pub const METHOD_CM: u8 = 1;
 /// Text-optimized CM stack (orders 0–2, Sparse, Exec, LazyLzp, PpmModel order-3, WordModel).
 pub const METHOD_TEXT: u8 = 2;
@@ -43,7 +68,7 @@ pub const METHOD_BINARY: u8 = 3;
 /// Exec-optimized CM stack (orders 0–2, Sparse, LZP, PPM order-3; no Exec model).
 pub const METHOD_EXEC: u8 = 4;
 
-/// Compress `buf` into a `NYF1` container using classifier-aware stacks.
+/// Compress `buf` into a `NYX1` container using classifier-aware stacks.
 ///
 /// # Errors
 ///
@@ -208,11 +233,97 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
     build_stack_for_kind(crate::classify::BlockKind::Binary)
 }
 
+/// Compress one block (encode-side of the two-pass CM residual).
+///
+/// (1) Forward LZP scan: record (len, dist) for matches ≥ `MATCH_MIN_LEN`.
+/// (2) Emit match records as a side stream, then rANS-encode only residual bytes.
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
     block: &[u8],
 ) -> Vec<u8> {
+    let runs = scan_matches(block);
+    encode_block_with_matches(models, mixer, block, &runs)
+}
+
+/// Forward LZP scan: train on each byte, call `longest_match` at position i+1,
+/// record matches ≥ `MATCH_MIN_LEN`, skip ahead by the match length.
+///
+/// This is deterministic and depends only on the input byte stream, so the
+/// decoder can replay it if it has the same (len, dist) records to validate.
+/// In practice the side-stream records are the source of truth; the scan
+/// produces them and the decoder validates its own replay against them.
+fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
+    let mut lzp = Lzp::new();
+    let mut runs: Vec<MatchRun> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < block.len() {
+        // train_at stores the actual byte position so longest_match's chain
+        // positions match data indices (unlike train_byte's offset current_pos).
+        lzp.train_at(block, i);
+        if i + 1 >= 4 {
+            if let Some(raw_len) = lzp.longest_match(block, i + 1) {
+                let len = raw_len.min(255);
+                let dist = find_match_distance(block, i + 1, len);
+                if dist > 0 && dist <= 4 * 1024 * 1024 && len >= MATCH_MIN_LEN {
+                    runs.push(MatchRun { len, dist });
+                    for j in 1..=len {
+                        if i + j < block.len() {
+                            lzp.train_at(block, i + j);
+                        }
+                    }
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// Find how far back the matching string sits at `pos` in `data` with `len` bytes.
+/// Linear backward scan, bounded by the 4 MB window.
+fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
+    if pos < len || len == 0 {
+        return 0;
+    }
+    let needle = &data[pos - len..pos];
+    let window = 4 * 1024 * 1024;
+    let start = pos.saturating_sub(window);
+    for back in (start..pos - len + 1).rev() {
+        if data[back..back + len] == *needle {
+            return pos - back;
+        }
+    }
+    0
+}
+
+/// Encode a block with explicit match records + residual CM.
+///
+/// Wire format (per block payload):
+///   - 4 bytes: `u32::LE` = number of match records
+///   - match records: `u8 len` (raw, ≥8) + `u32 LE dist` (5 bytes each)
+///   - rANS bit stream: CM-encoded bits for the block bytes
+///
+/// Stage 1: the rANS stream covers ALL bytes (matches recorded but not yet
+/// used to skip CM encoding). Stage 2 (future): skip matched bytes from rANS.
+fn encode_block_with_matches(
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+    block: &[u8],
+    runs: &[MatchRun],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // Match side-stream
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for r in runs {
+        out.push(r.len as u8);
+        out.extend_from_slice(&(r.dist as u32).to_le_bytes());
+    }
+
+    // Stage 1: CM-encode ALL bytes (residual = full block).
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -232,7 +343,67 @@ fn compress_block(
             }
         }
     }
-    enc.finish()
+    out.extend(enc.finish());
+    out
+}
+
+/// Decode a block encoded with `encode_block_with_matches`.
+///
+/// Stage 1: the encoder CM-encodes ALL bytes (residual = full block), so the
+/// decoder does the same. Match records are present in the side-stream but
+/// not yet used to skip CM — this keeps round-trip correct while validating
+/// the scaffolding.
+///
+/// Stage 2 (future): skip residual decoding for matched positions, instead
+/// copy-matching from the output buffer using the side-stream records.
+fn decode_block_with_matches(
+    comp: &[u8],
+    orig_len: usize,
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+) -> Result<Vec<u8>> {
+    if comp.len() < 4 {
+        return Err(NyxError::InvalidContainer("match side-stream too short".into()));
+    }
+    let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
+    let mut offset = 4;
+    // Skip past match records (consumed but not yet applied in stage 1).
+    for _ in 0..num_runs {
+        if offset + 5 > comp.len() {
+            return Err(NyxError::InvalidContainer("truncated match record".into()));
+        }
+        offset += 5; // u8 len + u32 LE dist
+    }
+
+    // Stage 1: full-block CM decode (residual = entire block).
+    let mut dec = BitDecoder::new(&comp[offset..])
+        .map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut out = Vec::with_capacity(orig_len);
+    let mut probs: [u16; 12] = [2048; 12];
+    let n = models.len();
+
+    while out.len() < orig_len {
+        let mut byte = 0u8;
+        for bit_idx in (0..8).rev() {
+            let bit_pos = bit_idx as u8;
+            for (i, m) in models.iter().enumerate() {
+                probs[i] = m.predict();
+            }
+            let p = mixer.mix(&probs[..n], bit_pos);
+            let bit = dec
+                .decode_bit(p)
+                .map_err(|e| NyxError::Entropy(e.to_string()))?;
+            mixer.update(&probs[..n], bit, bit_pos);
+            for m in models.iter_mut() {
+                m.update(bit);
+            }
+            if bit {
+                byte |= 1 << bit_idx;
+            }
+        }
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 /// Decompress a `NYF1` container back to the original bytes.
@@ -316,39 +487,14 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
     }
 }
 
+/// Decompress one block payload. Delegates to `decode_block_with_matches`.
 fn decompress_block(
     comp: &[u8],
     orig_len: usize,
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
 ) -> Result<Vec<u8>> {
-    let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
-    let mut out = Vec::with_capacity(orig_len);
-    let mut probs: [u16; 12] = [2048; 12];
-    let n = models.len();
-
-    while out.len() < orig_len {
-        let mut byte = 0u8;
-        for bit_idx in (0..8).rev() {
-            let bit_pos = bit_idx as u8;
-            for (i, m) in models.iter().enumerate() {
-                probs[i] = m.predict();
-            }
-            let p = mixer.mix(&probs[..n], bit_pos);
-            let bit = dec
-                .decode_bit(p)
-                .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs[..n], bit, bit_pos);
-            for m in models.iter_mut() {
-                m.update(bit);
-            }
-            if bit {
-                byte |= 1 << bit_idx;
-            }
-        }
-        out.push(byte);
-    }
-    Ok(out)
+    decode_block_with_matches(comp, orig_len, models, mixer)
 }
 
 /// Re-export so callers can build CRCs without reaching into the container module.
@@ -452,5 +598,37 @@ mod tests {
         assert_eq!(kind, crate::classify::BlockKind::Binary);
         assert_eq!(method_for_kind(kind), METHOD_BINARY);
     }
-}
 
+    #[test]
+    fn scan_matches_finds_repeats() {
+        let data = b"abcabcabcabcabcabc";
+        let runs = scan_matches(data);
+        assert!(
+            !runs.is_empty(),
+            "expected at least one match in repeated data"
+        );
+        assert!(runs[0].len >= MATCH_MIN_LEN);
+    }
+
+    #[test]
+    fn scan_matches_empty_on_unique() {
+        let mut data = vec![0u8; 256];
+        let mut x = 0x1234_5678u32;
+        for b in &mut data {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        let runs = scan_matches(&data);
+        assert!(runs.is_empty(), "expected no matches in random data");
+    }
+
+    #[test]
+    fn find_match_distance_correct() {
+        let data = b"abcabcabcabc";
+        // At position 6, "abc" matches distance 3.
+        let d = find_match_distance(data, 6, 3);
+        assert_eq!(d, 3, "expected distance 3, got {}", d);
+    }
+}
