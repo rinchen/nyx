@@ -157,8 +157,8 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text-optimized stack: full hybrid + WordModel + LazyLzp + new hash-chain LZP.
-            let n = 9;
+            // Text-optimized stack: full hybrid + WordModel + LazyLzp + DMC + indirect contexts.
+            let n = 11;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -169,6 +169,8 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
                 Box::new(crate::model::word::WordModel::new()),
+                Box::new(crate::model::indirect_dmc::IndirectModel::new(3)),
+                Box::new(crate::model::indirect_dmc::DmcModel::new(5)),
             ];
             (models, LogisticMixer::new(n))
         }
@@ -214,7 +216,7 @@ fn compress_block(
     block: &[u8],
 ) -> Vec<u8> {
     let mut enc = BitEncoder::new();
-    let mut probs: [u16; 10] = [2048; 10];
+    let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
 
     for &byte in block {
@@ -324,7 +326,7 @@ fn decompress_block(
 ) -> Result<Vec<u8>> {
     let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
-    let mut probs: [u16; 10] = [2048; 10];
+    let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
 
     while out.len() < orig_len {

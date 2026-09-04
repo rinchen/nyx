@@ -16,15 +16,16 @@
 //! - Text blocks: 1–4 MB (longer window for repeated phrases, quotes, boilerplate).
 //! - Binary/Exec/Random: 64 KiB.
 
-use super::ByteAssembler;
 use super::BitModel;
+use super::ByteAssembler;
 
 const MIN_MATCH: usize = 4;
-const TABLE_BITS: usize = 20; // 1<<20 entries
+const TABLE_BITS: u32 = 19; // 512K entries (down from 1M to reduce memory)
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
-const MAX_CHAIN: usize = 8;   // walk at most 8 candidates per lookup
+const MAX_CHAIN: usize = 8; // walk at most 8 candidates per lookup
 const DEFAULT_WINDOW: usize = 4 * 1024 * 1024; // 4MB sliding window
-const DEFAULT_HISTORY_CAP: usize = 1 << 24; // 16 MiB history ring
+const DEFAULT_HISTORY_CAP: usize = 4 * 1024 * 1024; // 4MiB history ring (matches window)
+const NEXT_SIZE: usize = 1 << 21; // 2M entry chain-link table
 
 /// LZP matcher with hash chains and cross-block persistence.
 ///
@@ -34,7 +35,7 @@ const DEFAULT_HISTORY_CAP: usize = 1 << 24; // 16 MiB history ring
 pub struct Lzp {
     /// Hash chain heads: `heads[hash]` = newest position for this 4-gram.
     heads: Vec<u32>,
-    /// Hash chain links: `next[i]` = older position in the same bucket.
+    /// Hash chain links: indexed by `position % NEXT_SIZE`.
     next: Vec<u32>,
     /// Current absolute position in the decoded stream.
     current_pos: usize,
@@ -53,7 +54,7 @@ impl Lzp {
     pub fn new() -> Self {
         Self {
             heads: vec![0u32; TABLE_SIZE],
-            next: vec![0u32; DEFAULT_HISTORY_CAP],
+            next: vec![0u32; NEXT_SIZE],
             current_pos: 0,
             window: DEFAULT_WINDOW,
             asm: ByteAssembler::new(8),
@@ -82,6 +83,40 @@ impl Lzp {
         (h as usize) & (TABLE_SIZE - 1)
     }
 
+    /// Record that the stream has advanced to `pos`. Inserts the new 4-gram
+    /// ending at `pos` at the head of its chain.
+    pub fn train_at(&mut self, data: &[u8], pos: usize) {
+        if pos < 4 {
+            return;
+        }
+        let idx = Self::hash(&data[..pos]);
+        let p = pos as u32;
+        let old = self.heads[idx];
+        self.heads[idx] = p;
+        let ni = (p as usize) % NEXT_SIZE;
+        self.next[ni] = old;
+        self.current_pos = pos;
+    }
+
+    /// Record that the stream has advanced by one completed byte.
+    pub fn train_byte(&mut self, byte: u8) {
+        self.history.push(byte);
+        if self.history.len() > DEFAULT_HISTORY_CAP {
+            let drop = self.history.len() - DEFAULT_HISTORY_CAP;
+            self.history.drain(0..drop);
+        }
+        let hlen = self.history.len();
+        if hlen >= 4 {
+            let idx = Self::hash(&self.history[..hlen]);
+            let p = hlen as u32;
+            let old = self.heads[idx];
+            self.heads[idx] = p;
+            let ni = hlen % NEXT_SIZE;
+            self.next[ni] = old;
+            self.current_pos = hlen;
+        }
+    }
+
     /// Walk at most `MAX_CHAIN` candidates and return the longest match length,
     /// or `None` if no match reaches `MIN_MATCH`.
     pub fn longest_match(&self, data: &[u8], pos: usize) -> Option<usize> {
@@ -95,8 +130,9 @@ impl Lzp {
         let limit = self.current_pos.saturating_sub(self.window);
         while cur != 0 && walked < MAX_CHAIN {
             let p = cur as usize;
+            let ni = p % NEXT_SIZE;
             if p >= pos || p < limit {
-                cur = self.next[p];
+                cur = self.next[ni];
                 walked += 1;
                 continue;
             }
@@ -116,7 +152,7 @@ impl Lzp {
                     break;
                 }
             }
-            cur = self.next[p];
+            cur = self.next[ni];
             walked += 1;
         }
         if best >= MIN_MATCH {
@@ -124,71 +160,6 @@ impl Lzp {
         } else {
             None
         }
-    }
-
-    /// Record that the stream has advanced to `pos`. Inserts the new 4-gram
-    /// ending at `pos` at the head of its chain.
-    pub fn train_at(&mut self, data: &[u8], pos: usize) {
-        if pos < 4 {
-            return;
-        }
-        let idx = Self::hash(&data[..pos]);
-        let p = pos as u32;
-        let old = self.heads[idx];
-        self.heads[idx] = p;
-        self.next[p as usize] = old;
-        self.current_pos = pos;
-    }
-
-    /// Record that the stream has advanced by one completed byte.
-    pub fn train_byte(&mut self, byte: u8) {
-        self.history.push(byte);
-        if self.history.len() > DEFAULT_HISTORY_CAP {
-            let drop = self.history.len() - DEFAULT_HISTORY_CAP;
-            self.history.drain(0..drop);
-        }
-        let hlen = self.history.len();
-        if hlen >= 4 {
-            let idx = Self::hash(&self.history[..hlen]);
-            let p = hlen as u32;
-            let old = self.heads[idx];
-            self.heads[idx] = p;
-            self.next[p as usize] = old;
-            self.current_pos = hlen;
-        }
-    }
-
-    /// Replace all persisted LZP state. Used for cross-block hydration.
-    pub fn set_state(&mut self, heads: Vec<u32>, next: Vec<u32>, current_pos: usize, history: Vec<u8>) {
-        self.heads = heads;
-        self.next = next;
-        self.current_pos = current_pos;
-        self.history = history;
-    }
-
-    /// Access the hash heads table.
-    pub fn heads(&self) -> &Vec<u32> {
-        &self.heads
-    }
-
-    /// Access the next-link table.
-    pub fn nexts(&self) -> &Vec<u32> {
-        &self.next
-    }
-
-    /// Current absolute stream position.
-    pub fn current_pos(&self) -> usize {
-        self.current_pos
-    }
-
-    /// Sliding window size.
-    pub fn window(&self) -> usize {
-        self.window
-    }
-
-    /// Byte history slice.
-    pub fn history(&self) -> &Vec<u8> {
-        &self.history
     }
 
     /// Return the byte at the best matched position, for bit prediction.
@@ -205,8 +176,9 @@ impl Lzp {
         let mut walked = 0usize;
         while cur != 0 && walked < MAX_CHAIN {
             let p = cur as usize;
+            let ni = p % NEXT_SIZE;
             if p >= hlen || p < limit {
-                cur = self.next[p];
+                cur = self.next[ni];
                 walked += 1;
                 continue;
             }
@@ -217,7 +189,7 @@ impl Lzp {
                     break;
                 }
             }
-            cur = self.next[p];
+            cur = self.next[ni];
             walked += 1;
         }
         if best >= MIN_MATCH {
@@ -232,7 +204,11 @@ impl BitModel for Lzp {
     fn predict(&self) -> u16 {
         self.matched_byte().map_or(2048, |b| {
             let bit = (b >> (7 - self.bit_pos)) & 1 == 1;
-            if bit { 3584 } else { 512 }
+            if bit {
+                3584
+            } else {
+                512
+            }
         })
     }
 

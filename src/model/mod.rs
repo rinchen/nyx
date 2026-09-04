@@ -6,6 +6,7 @@
 
 pub mod ctable;
 pub mod exec;
+pub mod indirect_dmc;
 pub mod lazy_lzp;
 pub mod lzp;
 pub mod mixer;
