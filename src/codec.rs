@@ -70,6 +70,10 @@ where
     let mut payloads: Vec<u8> = Vec::new();
     let mut offset = 0usize;
 
+    let mut last_kind: Option<crate::classify::BlockKind> = None;
+    let mut models: Vec<Box<dyn BitModel>> = Vec::new();
+    let mut mixer = LogisticMixer::new(0);
+
     while offset < buf.len() {
         let block = &buf[offset..];
         let kind = crate::classify::classify(block);
@@ -77,8 +81,15 @@ where
         let end = (offset + block_size).min(buf.len());
         let block_data = &buf[offset..end];
 
-        let (mut models, mut mixer) = build_stack(kind);
+        if last_kind != Some(kind) {
+            let (new_models, new_mixer) = build_stack(kind);
+            models = new_models;
+            mixer = new_mixer;
+            last_kind = Some(kind);
+        }
+
         let comp = compress_block(&mut models, &mut mixer, block_data);
+
         let entry = BlockEntry {
             comp_len: comp.len() as u32,
             orig_len: block_data.len() as u32,
@@ -147,7 +158,7 @@ pub fn build_stack_for_kind(
         }
         crate::classify::BlockKind::Text => {
             // Text-optimized stack: full hybrid + WordModel + LazyLzp + new hash-chain LZP.
-            let n = 8;
+            let n = 9;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -155,6 +166,7 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::sparse::Sparse::new()),
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lazy_lzp::LazyLzp::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
                 Box::new(crate::model::word::WordModel::new()),
             ];
@@ -253,6 +265,9 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
 
     let mut out = Vec::new();
     let mut pos = 0usize;
+    let mut last_kind: Option<crate::classify::BlockKind> = None;
+    let mut models: Vec<Box<dyn BitModel>> = Vec::new();
+    let mut mixer = LogisticMixer::new(0);
     for (bi, entry) in entries.iter().enumerate() {
         let comp = &payloads[pos..pos + entry.comp_len as usize];
         pos += entry.comp_len as usize;
@@ -261,7 +276,12 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
             comp.to_vec()
         } else {
             let kind = kind_for_method(entry.method)?;
-            let (mut models, mut mixer) = build_stack_for_kind(kind);
+            if last_kind != Some(kind) {
+                let (new_models, new_mixer) = build_stack_for_kind(kind);
+                models = new_models;
+                mixer = new_mixer;
+                last_kind = Some(kind);
+            }
             decompress_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(
                 |e| match e {
                     NyxError::Entropy(s) => NyxError::CorruptBlock(s),

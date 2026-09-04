@@ -53,7 +53,7 @@ impl Lzp {
     pub fn new() -> Self {
         Self {
             heads: vec![0u32; TABLE_SIZE],
-            next: vec![0u32; TABLE_SIZE],
+            next: vec![0u32; DEFAULT_HISTORY_CAP],
             current_pos: 0,
             window: DEFAULT_WINDOW,
             asm: ByteAssembler::new(8),
