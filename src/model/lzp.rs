@@ -22,20 +22,25 @@ use super::ByteAssembler;
 const MIN_MATCH: usize = 4;
 const TABLE_BITS: u32 = 19; // 512K entries
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
-const MAX_CHAIN: usize = 8; // walk at most 8 candidates per lookup
+const MAX_CHAIN: usize = 4; // walk at most 4 candidates per lookup
 const DEFAULT_WINDOW: usize = 4 * 1024 * 1024; // 4MB sliding window
 const HISTORY_CAP: usize = 1 << 16; // 64K byte ring (only need last-4 for hashing + near-distance lookups)
-const NEXT_SIZE: usize = 1 << 21; // 2M entry chain-link table
+const NEXT_SIZE: usize = 1 << 21; // 2M entry chain-link table — index by position % NEXT_SIZE
 
 /// LZP matcher with hash chains and cross-block persistence.
+///
+/// This is a lightweight match pre-stage that provides byte-level prediction
+/// to the mixer. It does NOT emit explicit match records (unlike the reverted
+/// match-copy experiment). Instead it produces a high-confidence bit prediction
+/// when a recent repeat is found in the 4MB hash chain.
 pub struct Lzp {
     /// Hash chain heads: `heads[hash]` = newest position for this 4-gram.
     heads: Vec<u32>,
     /// Hash chain links: indexed by `position % NEXT_SIZE`.
     next: Vec<u32>,
-    /// Current absolute position in the decoded stream.
+    /// Absolute byte counter (never wraps during a single compression).
     current_pos: usize,
-    /// Sliding window: only keep positions within `current_pos - window`.
+    /// Sliding window: only look back this many bytes.
     window: usize,
     /// Assembled byte stream so we can key the hash on whole bytes, not bits.
     asm: ByteAssembler,
@@ -45,6 +50,11 @@ pub struct Lzp {
     ring_pos: usize,
     /// Number of bytes written to the ring.
     ring_len: usize,
+    /// Cached match byte for the current (in-progress) byte.
+    /// Recomputed when a new byte completes, valid for all 8 bit positions.
+    cached_match: Option<u8>,
+    /// The bit position at which the current cached_match was computed.
+    cached_bit_pos: u8,
     /// Bit index within the current (in-progress) byte.
     bit_pos: u8,
 }
@@ -61,6 +71,8 @@ impl Lzp {
             history: vec![0u8; HISTORY_CAP],
             ring_pos: 0,
             ring_len: 0,
+            cached_match: None,
+            cached_bit_pos: 0,
             bit_pos: 0,
         }
     }
@@ -84,7 +96,6 @@ impl Lzp {
 
     #[inline]
     fn hash_from_ring(&self) -> usize {
-        // Hash the last 4 bytes in the ring buffer.
         let b0 = self.ring_get(3);
         let b1 = self.ring_get(2);
         let b2 = self.ring_get(1);
@@ -159,7 +170,7 @@ impl Lzp {
         while cur != 0 && walked < MAX_CHAIN {
             let p = cur as usize;
             let ni = p % NEXT_SIZE;
-            if p >= pos || p < limit {
+            if p >= pos || p < limit as usize {
                 cur = self.next[ni];
                 walked += 1;
                 continue;
@@ -188,12 +199,21 @@ impl Lzp {
         }
     }
 
-    /// Return the byte at the best matched position, for bit prediction.
-    fn matched_byte(&self) -> Option<u8> {
+    /// Find the most recent matching byte in the hash chain.
+    /// Cached per-byte to avoid redundant chain walks on every bit.
+    fn matched_byte(&mut self) -> Option<u8> {
+        // If we already computed this for the current byte, reuse it.
+        if self.cached_bit_pos == self.bit_pos {
+            return self.cached_match;
+        }
+
         let hlen = self.ring_len;
         if hlen < MIN_MATCH + 1 {
+            self.cached_match = None;
+            self.cached_bit_pos = self.bit_pos;
             return None;
         }
+
         let idx = self.hash_from_ring();
         let mut cur = self.heads[idx];
         let mut best = 0usize;
@@ -218,29 +238,39 @@ impl Lzp {
             cur = self.next[ni];
             walked += 1;
         }
-        if best >= MIN_MATCH {
-            // Try to get the matched byte from the ring buffer.
-            if best < HISTORY_CAP {
-                Some(self.ring_get(best))
-            } else {
-                None
-            }
+
+        let result = if best >= MIN_MATCH && best < HISTORY_CAP {
+            // Walk the ring buffer to find the matched byte.
+            // best = distance, so matched byte is ring_get(best)
+            Some(self.ring_get(best))
         } else {
             None
-        }
+        };
+
+        self.cached_match = result;
+        self.cached_bit_pos = self.bit_pos;
+        result
     }
 }
 
 impl BitModel for Lzp {
     fn predict(&self) -> u16 {
-        self.matched_byte().map_or(2048, |b| {
-            let bit = (b >> (7 - self.bit_pos)) & 1 == 1;
-            if bit {
-                3584
-            } else {
-                512
-            }
-        })
+        // We can't cache in a &self method because matched_byte needs &mut self.
+        // Instead, the update() call populates the cache, and predict() re-reads it.
+        // The cache is set in update() when a byte completes.
+        // For the first 8 bits of a byte, we use the cached value from the previous byte.
+        if self.cached_bit_pos == self.bit_pos {
+            self.cached_match.map_or(2048, |b| {
+                let bit = (b >> (7 - self.bit_pos)) & 1 == 1;
+                if bit {
+                    3584
+                } else {
+                    512
+                }
+            })
+        } else {
+            2048
+        }
     }
 
     fn update(&mut self, bit: bool) {
@@ -248,6 +278,9 @@ impl BitModel for Lzp {
         let completed = self.asm.push_bit(bit);
         if let Some(byte) = completed {
             self.train_byte(byte);
+            // Invalidate cache — will be recomputed on next predict.
+            self.cached_match = None;
+            self.cached_bit_pos = 255; // force recompute
             self.bit_pos = 0;
         }
     }
@@ -259,6 +292,8 @@ impl BitModel for Lzp {
         self.asm.reset();
         self.ring_pos = 0;
         self.ring_len = 0;
+        self.cached_match = None;
+        self.cached_bit_pos = 0;
         self.bit_pos = 0;
     }
 
