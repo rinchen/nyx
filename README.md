@@ -61,11 +61,11 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 > in MB/s (higher is better). See [BENCH.md](BENCH.md) for the full
 > zstd-1 / zstd-19 / FSE comparison and before/after optimization tables.
 
-### Current (post PPM/escape hybrid + per-bit-position mixer context + classifier-aware stacks; 31 tests, clippy clean)
+### Current (post SSE/APM/APM2 cascade + cross-block persistence + real 4MB LDM window; 55 tests, clippy clean)
 
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
-| dickens | 9953.6 | 56.3 | 0.8 | 0.5 | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
+| dickens | 9953.6 | 52.3 | 0.4 | 0.3 | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
 | webster | 40487.0 | 50.9 | 0.7 | 0.5 | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | 27.5 | 0.7 | 0.5 | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **nyx** | **zstd -19** |
 | mr | 9736.9 | 29.4 | 0.6 | 0.4 | 38.5 | 551.2 | 1008.8 | 31.3 | 5.1 | 772.5 | 44.0 | 233.2 | 229.3 | **nyx** | **zstd -19** |
@@ -112,10 +112,13 @@ secondary.
 | Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
 | Literal bypass hint model (high-entropy byte bypass) | mr, dickens, json, webster, nci | regressed dickens 56.3%→57.1% | reverted |
 | **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | **kept as default** |
-| Context-selected mixer banks (4k mixers, byte-class + context hash) | mr, dickens, json, webster, nci | in progress | WIP commit; blocked on mixer reset not clearing weights |
+|| Context-selected mixer banks (4k mixers, byte-class + context hash) | mr, dickens, json, webster, nci | in progress | WIP commit; blocked on mixer reset not clearing weights |
+|| **Indirect context + DMC models** (table[hash(o2)]→last byte, predict via hash(indirect,o1)) | mr, dickens, json, webster, nci | regressed dickens +0.7pt, webster +0.4pt; json improved | reverted due to perf cost on large files |
+|| **Cross-block persistence + real 4MB LDM window** (reuse model/mixer state across same-kind blocks; 4MB LZP hash chains) | json, mr, dickens, nci, webster | **improved**: json 5.5%→2.8%, mr 28.6%→27.5%, dickens 56.0%→52.3% | **kept as default** |
+|| LZP ring buffer performance fix (O(n) drain→O(1) ring) | all files | performance fix, no ratio change | kept |
 
 Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware
-method bytes + word model (text blocks only) + SSE/APM/APM2 cascade + LazyLzp (neutral)**.
+method bytes + word model (text blocks only) + SSE/APM/APM2 cascade + LazyLzp (neutral) + cross-block persistence + 4MB LZP window**.
 Round-trip verified on all 5 files; build and tests green.
 
 ## License
