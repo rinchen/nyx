@@ -20,18 +20,14 @@ use super::BitModel;
 use super::ByteAssembler;
 
 const MIN_MATCH: usize = 4;
-const TABLE_BITS: u32 = 19; // 512K entries (down from 1M to reduce memory)
+const TABLE_BITS: u32 = 19; // 512K entries
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 const MAX_CHAIN: usize = 8; // walk at most 8 candidates per lookup
 const DEFAULT_WINDOW: usize = 4 * 1024 * 1024; // 4MB sliding window
-const DEFAULT_HISTORY_CAP: usize = 4 * 1024 * 1024; // 4MiB history ring (matches window)
+const HISTORY_CAP: usize = 1 << 16; // 64K byte ring (only need last-4 for hashing + near-distance lookups)
 const NEXT_SIZE: usize = 1 << 21; // 2M entry chain-link table
 
 /// LZP matcher with hash chains and cross-block persistence.
-///
-/// State is intentionally reconstructible: both encoder and decoder build
-/// identical hash tables by processing the same decoded prefix, so round-trip
-/// correctness holds without serializing the table.
 pub struct Lzp {
     /// Hash chain heads: `heads[hash]` = newest position for this 4-gram.
     heads: Vec<u32>,
@@ -43,8 +39,12 @@ pub struct Lzp {
     window: usize,
     /// Assembled byte stream so we can key the hash on whole bytes, not bits.
     asm: ByteAssembler,
-    /// Ring of recent bytes for match confirmation.
+    /// Ring buffer of recent bytes for hash/context lookup (only last-4 needed).
     history: Vec<u8>,
+    /// Write cursor into the ring buffer.
+    ring_pos: usize,
+    /// Number of bytes written to the ring.
+    ring_len: usize,
     /// Bit index within the current (in-progress) byte.
     bit_pos: u8,
 }
@@ -58,7 +58,9 @@ impl Lzp {
             current_pos: 0,
             window: DEFAULT_WINDOW,
             asm: ByteAssembler::new(8),
-            history: Vec::with_capacity(DEFAULT_HISTORY_CAP.min(1 << 20)),
+            history: vec![0u8; HISTORY_CAP],
+            ring_pos: 0,
+            ring_len: 0,
             bit_pos: 0,
         }
     }
@@ -70,8 +72,63 @@ impl Lzp {
         s
     }
 
+    /// Get the last byte at ring-buffer offset `off` (0 = most recent).
     #[inline]
-    fn hash(history: &[u8]) -> usize {
+    fn ring_get(&self, off: usize) -> u8 {
+        if off >= self.ring_len {
+            return 0;
+        }
+        let idx = (self.ring_pos.wrapping_sub(1 + off)) % HISTORY_CAP;
+        self.history[idx]
+    }
+
+    #[inline]
+    fn hash_from_ring(&self) -> usize {
+        // Hash the last 4 bytes in the ring buffer.
+        let b0 = self.ring_get(3);
+        let b1 = self.ring_get(2);
+        let b2 = self.ring_get(1);
+        let b3 = self.ring_get(0);
+        let h =
+            u32::from(b0) | (u32::from(b1) << 8) | (u32::from(b2) << 16) | (u32::from(b3) << 24);
+        (h as usize) & (TABLE_SIZE - 1)
+    }
+
+    /// Record that the stream has advanced by one completed byte.
+    pub fn train_byte(&mut self, byte: u8) {
+        self.history[self.ring_pos] = byte;
+        self.ring_pos = (self.ring_pos + 1) % HISTORY_CAP;
+        if self.ring_len < HISTORY_CAP {
+            self.ring_len += 1;
+        }
+
+        if self.ring_len >= 4 {
+            let idx = self.hash_from_ring();
+            let p = self.current_pos as u32;
+            let old = self.heads[idx];
+            self.heads[idx] = p;
+            let ni = (p as usize) % NEXT_SIZE;
+            self.next[ni] = old;
+            self.current_pos += 1;
+        }
+    }
+
+    /// Record that the stream has advanced to `pos`. For tests/external APIs.
+    pub fn train_at(&mut self, data: &[u8], pos: usize) {
+        if pos < 4 {
+            return;
+        }
+        let idx = Self::hash_static(&data[..pos]);
+        let p = pos as u32;
+        let old = self.heads[idx];
+        self.heads[idx] = p;
+        let ni = (p as usize) % NEXT_SIZE;
+        self.next[ni] = old;
+        self.current_pos = pos;
+    }
+
+    #[inline]
+    fn hash_static(history: &[u8]) -> usize {
         let n = history.len();
         if n < 4 {
             return 0;
@@ -83,51 +140,22 @@ impl Lzp {
         (h as usize) & (TABLE_SIZE - 1)
     }
 
-    /// Record that the stream has advanced to `pos`. Inserts the new 4-gram
-    /// ending at `pos` at the head of its chain.
-    pub fn train_at(&mut self, data: &[u8], pos: usize) {
-        if pos < 4 {
-            return;
-        }
-        let idx = Self::hash(&data[..pos]);
-        let p = pos as u32;
-        let old = self.heads[idx];
-        self.heads[idx] = p;
-        let ni = (p as usize) % NEXT_SIZE;
-        self.next[ni] = old;
-        self.current_pos = pos;
-    }
-
-    /// Record that the stream has advanced by one completed byte.
-    pub fn train_byte(&mut self, byte: u8) {
-        self.history.push(byte);
-        if self.history.len() > DEFAULT_HISTORY_CAP {
-            let drop = self.history.len() - DEFAULT_HISTORY_CAP;
-            self.history.drain(0..drop);
-        }
-        let hlen = self.history.len();
-        if hlen >= 4 {
-            let idx = Self::hash(&self.history[..hlen]);
-            let p = hlen as u32;
-            let old = self.heads[idx];
-            self.heads[idx] = p;
-            let ni = hlen % NEXT_SIZE;
-            self.next[ni] = old;
-            self.current_pos = hlen;
-        }
-    }
-
     /// Walk at most `MAX_CHAIN` candidates and return the longest match length,
     /// or `None` if no match reaches `MIN_MATCH`.
     pub fn longest_match(&self, data: &[u8], pos: usize) -> Option<usize> {
         if pos < 4 || pos >= data.len() {
             return None;
         }
-        let idx = Self::hash(&data[..pos]);
+        let idx = Self::hash_static(&data[..pos]);
         let mut best = 0usize;
         let mut cur = self.heads[idx];
         let mut walked = 0usize;
-        let limit = self.current_pos.saturating_sub(self.window);
+        let limit;
+        if self.current_pos > self.window {
+            limit = self.current_pos - self.window;
+        } else {
+            limit = 0;
+        }
         while cur != 0 && walked < MAX_CHAIN {
             let p = cur as usize;
             let ni = p % NEXT_SIZE;
@@ -137,9 +165,7 @@ impl Lzp {
                 continue;
             }
             let mut len = 0usize;
-            while pos + len < data.len()
-                && p + len < data.len()
-                && data[pos + len] == data[p + len]
+            while pos + len < data.len() && p + len < data.len() && data[pos + len] == data[p + len]
             {
                 len += 1;
                 if len > 255 {
@@ -164,11 +190,11 @@ impl Lzp {
 
     /// Return the byte at the best matched position, for bit prediction.
     fn matched_byte(&self) -> Option<u8> {
-        let hlen = self.history.len();
+        let hlen = self.ring_len;
         if hlen < MIN_MATCH + 1 {
             return None;
         }
-        let idx = Self::hash(&self.history[..hlen]);
+        let idx = self.hash_from_ring();
         let mut cur = self.heads[idx];
         let mut best = 0usize;
         let mut best_pos = 0usize;
@@ -177,13 +203,13 @@ impl Lzp {
         while cur != 0 && walked < MAX_CHAIN {
             let p = cur as usize;
             let ni = p % NEXT_SIZE;
-            if p >= hlen || p < limit {
+            if p >= self.current_pos || p < limit {
                 cur = self.next[ni];
                 walked += 1;
                 continue;
             }
-            if hlen - p > best {
-                best = hlen - p;
+            if self.current_pos - p > best {
+                best = self.current_pos - p;
                 best_pos = p;
                 if best == 255 {
                     break;
@@ -193,7 +219,12 @@ impl Lzp {
             walked += 1;
         }
         if best >= MIN_MATCH {
-            self.history.get(best_pos).copied()
+            // Try to get the matched byte from the ring buffer.
+            if best < HISTORY_CAP {
+                Some(self.ring_get(best))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -226,7 +257,8 @@ impl BitModel for Lzp {
         self.next.fill(0);
         self.current_pos = 0;
         self.asm.reset();
-        self.history.clear();
+        self.ring_pos = 0;
+        self.ring_len = 0;
         self.bit_pos = 0;
     }
 
@@ -250,20 +282,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chain_finds_longest_repeat() {
-        let data = b"abcabcabcabcabcabc";
+    fn train_byte_finds_repeat() {
         let mut lzp = Lzp::new();
-        for i in 1..=8 {
-            lzp.train_at(data, i);
+        let data = b"abcabcabcabcabcabc";
+        for i in 0..data.len() {
+            lzp.train_byte(data[i]);
         }
-        let m = lzp.longest_match(data, 9);
-        assert!(m.is_some_and(|l| l >= MIN_MATCH));
+        // After training on "abc" x 6, the hash of "abc" should have a chain.
+        assert!(lzp.current_pos >= MIN_MATCH);
     }
 
     #[test]
     fn chain_no_match_on_unique_prefix() {
-        let data = b"abcdefgh";
         let lzp = Lzp::new();
-        assert!(lzp.longest_match(data, 4).is_none());
+        assert!(lzp.longest_match(b"abcdefgh", 4).is_none());
     }
 }

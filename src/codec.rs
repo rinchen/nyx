@@ -157,8 +157,8 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text-optimized stack: full hybrid + WordModel + LazyLzp + DMC + indirect contexts.
-            let n = 11;
+            // Text-optimized stack: full hybrid + WordModel + LazyLzp + new 4MB LZP.
+            let n = 9;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -169,8 +169,6 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
                 Box::new(crate::model::word::WordModel::new()),
-                Box::new(crate::model::indirect_dmc::IndirectModel::new(3)),
-                Box::new(crate::model::indirect_dmc::DmcModel::new(5)),
             ];
             (models, LogisticMixer::new(n))
         }
