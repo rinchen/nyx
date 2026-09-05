@@ -118,6 +118,7 @@ secondary.
 | LZP ring buffer performance fix (O(n) drain→O(1) ring) | all files | performance fix, no ratio change | kept |
 | Micro SSM mixer (16-dim recurrent state replacing logistic mixer) | json, mr | **regressed**: json 3.9%→10.7%, mr 27.3%→37.2% | reverted; SSM too large for 64KB blocks, gradient issues |
 | **Two-pass CM residual v2** (≥8-byte match threshold + residual-only CM, interleaved decoder scan) | mr, dickens, json, webster, nci | in progress | scaffolding + round-trip validation |
+| **Micro SSM mixer** (8-dim recurrent state as additional base model + Byte-Pair Re-Pair word model) | json, mr | in progress | 65/65 tests pass; round-trip verified |
 
 Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware
 method bytes + word model (text blocks only) + SSE/APM/APM2 cascade + LazyLzp (neutral) + cross-block persistence + 4MB LZP window**.

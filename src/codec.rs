@@ -182,8 +182,8 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text-optimized stack: full hybrid + WordModel + LazyLzp + new 4MB LZP.
-            let n = 9;
+            // Text-optimized stack: full hybrid + WordModel + LazyLzp + new 4MB LZP + SSM.
+            let n = 10;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -194,12 +194,13 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
                 Box::new(crate::model::word::WordModel::new()),
+                Box::new(crate::model::ssm::SsmMixer::new()),
             ];
             (models, LogisticMixer::new(n))
         }
         crate::classify::BlockKind::Binary => {
-            // Binary: full stack.
-            let n = 7;
+            // Binary: full stack + SSM.
+            let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -208,12 +209,13 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::ssm::SsmMixer::new()),
             ];
             (models, LogisticMixer::new(n))
         }
         crate::classify::BlockKind::Exec => {
-            // Exec: orders 0-2, Sparse, LZP, PPM order-3. Drop Exec model (redundant).
-            let n = 6;
+            // Exec: orders 0-2, Sparse, LZP, PPM order-3, SSM. Drop Exec model (redundant).
+            let n = 7;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
                 Box::new(crate::model::order::OrderN::new(1)),
@@ -221,6 +223,7 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::sparse::Sparse::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
                 Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::ssm::SsmMixer::new()),
             ];
             (models, LogisticMixer::new(n))
         }
@@ -323,6 +326,12 @@ fn encode_block_with_matches(
     }
 
     // Stage 1: CM-encode ALL bytes (residual = full block).
+    // Pre-build per-block dictionaries (e.g. Byte-Pair Re-Pair) for models
+    // that override `prepare_block`.
+    for m in models.iter_mut() {
+        m.prepare_block(block);
+    }
+
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -626,5 +635,20 @@ mod tests {
         // At position 6, "abc" matches distance 3.
         let d = find_match_distance(data, 6, 3);
         assert_eq!(d, 3, "expected distance 3, got {}", d);
+    }
+
+    #[test]
+    fn json_round_trips_with_ssm_and_repar() {
+        // Verify the new SSM model + Byte-Pair Re-Pair word model produce
+        // correct round-trips on structured text (JSON).
+        let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
+        let original: Vec<u8> = std::iter::repeat(json.as_ref())
+            .take(4000)
+            .flatten()
+            .copied()
+            .collect();
+        let comp = compress(&original).expect("compress");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "JSON round-trip mismatch with SSM + Re-Pair");
     }
 }

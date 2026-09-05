@@ -13,6 +13,7 @@ pub mod mixer;
 pub mod mixer_bank;
 pub mod order;
 pub mod ppm;
+pub mod ssm;
 pub mod sparse;
 pub mod sse_apm;
 pub mod word;
@@ -154,6 +155,12 @@ pub trait BitModel {
 
     /// Reset per-block state (called at the start of each block).
     fn reset(&mut self);
+
+    /// Prepare for a new block.  Called with the full block bytes before any
+    /// bits are encoded/decoded.  Models that need block-level context (e.g. a
+    /// dictionary built from the full block) override this to pre-compute it.
+    /// The default is a no-op.
+    fn prepare_block(&mut self, _block: &[u8]) {}
 
     /// Downcast to `&dyn Any` for persistence-specific plumbing.
     fn as_any(&self) -> &dyn std::any::Any;

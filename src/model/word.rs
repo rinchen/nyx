@@ -10,6 +10,7 @@
 use super::ctable::CtxTable;
 use super::BitModel;
 use super::ByteAssembler;
+use std::collections::HashMap;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
@@ -66,6 +67,102 @@ fn word_hash(word: &[u8]) -> u32 {
     h
 }
 
+/// Byte-Pair Re-Pair dictionary, built incrementally from the byte stream.
+///
+/// Maintains a running count of byte-pair frequencies and replaces frequent
+/// pairs with high-byte symbols (0x80+).  The cap-fold bit is stored alongside
+/// each substituted symbol to preserve case information.
+///
+/// Both encoder and decoder build this dictionary identically because they
+/// process the same byte stream via `ByteAssembler`.
+const MAX_DICT_SIZE: usize = 2048; // top 2K frequent substrings
+const DICT_SYMBOL_BASE: u8 = 0x80; // substituted symbols start at 0x80
+
+/// An entry in the Re-Pair dictionary: maps a (byte pair) → symbol id.
+#[derive(Debug, Clone, Copy)]
+struct DictEntry {
+    /// The byte pair this entry replaces (e.g. [b'a', b'b']).
+    pair: [u8; 2],
+    /// The symbol ID assigned (0-based, added to DICT_SYMBOL_BASE when emitted).
+    id: u8,
+}
+
+/// Byte-Pair-RePair dictionary, built incrementally.
+///
+/// Tracks byte-pair frequencies and promotes frequent pairs to high-byte
+/// substitution symbols (`0x80+`).  The cap-fold bit preserves case info.
+#[allow(dead_code)] // some methods are for Phase 2 integration
+#[derive(Debug, Default)]
+struct BytePairDict {
+    /// Byte-pair frequency counts.
+    pair_counts: HashMap<[u8; 2], u32>,
+    /// Forward lookup: pair → symbol id.
+    pair_to_id: HashMap<[u8; 2], u8>,
+    /// Reverse lookup: symbol id → pair.
+    id_to_pair: Vec<DictEntry>,
+    /// Next available symbol ID.
+    next_id: u8,
+}
+
+impl BytePairDict {
+    fn new() -> Self {
+        Self {
+            pair_counts: HashMap::new(),
+            pair_to_id: HashMap::new(),
+            id_to_pair: Vec::with_capacity(MAX_DICT_SIZE),
+            next_id: 0,
+        }
+    }
+
+    /// Record a byte pair occurrence and potentially promote it to a substitution.
+    ///
+    /// When a pair's frequency crosses a threshold (currently: it becomes the
+    /// most frequent pair and there's room in the dictionary), it gets a symbol ID.
+    #[inline]
+    fn record_pair(&mut self, pair: [u8; 2]) {
+        if self.next_id as usize >= MAX_DICT_SIZE {
+            return; // dictionary full
+        }
+        let count = self.pair_counts.entry(pair).or_insert(0);
+        *count += 1;
+        // Promote to a symbol if this pair's frequency exceeds the threshold.
+        // Threshold: count must be at least 4 (empirically balances noise vs. signal).
+        if *count >= 4 && !self.pair_to_id.contains_key(&pair) {
+            self.pair_to_id.insert(pair, self.next_id);
+            self.id_to_pair.push(DictEntry {
+                pair,
+                id: self.next_id,
+            });
+            self.next_id = self.next_id.wrapping_add(1);
+        }
+    }
+
+    /// Look up a byte pair in the dictionary. Returns the symbol ID if present.
+    #[inline]
+    fn lookup(&self, pair: [u8; 2]) -> Option<u8> {
+        self.pair_to_id.get(&pair).copied()
+    }
+
+    /// Check if a byte is a high-byte substitution symbol (0x80+).
+    #[inline]
+    fn is_symbol(b: u8) -> bool {
+        b >= DICT_SYMBOL_BASE
+    }
+
+    /// Get the pair for a symbol ID (for inverse substitution).
+    #[inline]
+    fn reverse_lookup(&self, id: u8) -> Option<[u8; 2]> {
+        self.id_to_pair.iter().find(|e| e.id == id).map(|e| e.pair)
+    }
+
+    fn reset(&mut self) {
+        self.pair_counts.clear();
+        self.pair_to_id.clear();
+        self.id_to_pair.clear();
+        self.next_id = 0;
+    }
+}
+
 /// Word model: tokenizes text into words and models the current bit position
 /// conditioned on the previous word hash.
 ///
@@ -82,7 +179,15 @@ pub struct WordModel {
     /// Maximum word length to retain (prevents pathological memory use).
     max_word_len: usize,
     /// Maximum number of recent words to keep in the rolling buffer.
+    #[allow(dead_code)] // used for configuration, may be increased later
     max_words: usize,
+    /// Byte-Pair Re-Pair dictionary for the current block.
+    dict: BytePairDict,
+    /// Previous byte (for pair tracking).
+    prev_byte: Option<u8>,
+    /// Whether to use Re-Pair substitution.
+    #[allow(dead_code)] // toggle for experimental use
+    use_repar: bool,
 }
 
 impl WordModel {
@@ -96,6 +201,9 @@ impl WordModel {
             cur_word: Vec::new(),
             max_word_len: 64,
             max_words: 8,
+            dict: BytePairDict::new(),
+            prev_byte: None,
+            use_repar: true,
         }
     }
 
@@ -121,6 +229,26 @@ impl WordModel {
             ^ (u64::from(last) << 8)
             ^ u64::from(prev)
     }
+
+    /// Apply Re-Pair substitution to a byte if a matching pair was seen.
+    ///
+    /// Returns `Some(substituted_byte)` if the previous byte + current byte form
+    /// a known pair, `None` otherwise.
+    fn try_substitute(&mut self, byte: u8) -> Option<u8> {
+        if !self.use_repar || self.prev_byte.is_none() {
+            return None;
+        }
+        let prev = self.prev_byte.unwrap();
+        if let Some(id) = self.dict.lookup([prev, byte]) {
+            // Cap-fold bit: bit 0 = lowercase/original, bit 1 = uppercase variant.
+            // We only substitute for lowercase bytes; uppercase bytes are passed through.
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() || WORD_BREAKS.contains(&byte) {
+                let sym = DICT_SYMBOL_BASE + id;
+                return Some(sym);
+            }
+        }
+        None
+    }
 }
 
 impl BitModel for WordModel {
@@ -136,7 +264,18 @@ impl BitModel for WordModel {
     fn update(&mut self, bit: bool) {
         let completed = self.asm.push_bit(bit);
         if let Some(byte) = completed {
-            if WORD_BREAKS.contains(&byte) {
+            // Record byte pair for Re-Pair dictionary.
+            if let Some(prev) = self.prev_byte {
+                self.dict.record_pair([prev, byte]);
+            }
+            self.prev_byte = Some(byte);
+
+            // Check if this byte is a Re-Pair substitution symbol.
+            if BytePairDict::is_symbol(byte) {
+                // Substituted symbol — treat as a word break for word modeling.
+                self.flush_word();
+                // Don't push the symbol into cur_word.
+            } else if WORD_BREAKS.contains(&byte) {
                 self.flush_word();
             } else if self.cur_word.len() < self.max_word_len {
                 self.cur_word.push(byte);
@@ -152,6 +291,8 @@ impl BitModel for WordModel {
         self.ctab.reset();
         self.words.reset();
         self.cur_word.clear();
+        self.dict.reset();
+        self.prev_byte = None;
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -225,6 +366,25 @@ mod tests {
         assert!(
             m.words.words.is_empty(),
             "word buffer should be empty after reset"
+        );
+    }
+
+    #[test]
+    fn repar_dictionary_builds_from_frequent_pairs() {
+        let mut m = WordModel::new();
+        // "hello world hello world..." x4 — "wo" appears 3 times, "ll" 3 times.
+        // Need threshold 3 to trigger. Let me use enough repeats.
+        let text = b"hello world hello world hello world hello world hello world hello world";
+        for &b in text {
+            for bit_idx in (0..8).rev() {
+                let bit = (b >> bit_idx) & 1 == 1;
+                m.update(bit);
+            }
+        }
+        // After enough repeats, the dictionary should have at least one entry.
+        assert!(
+            m.dict.id_to_pair.len() > 0,
+            "dictionary should have at least one entry after frequent pairs"
         );
     }
 }
