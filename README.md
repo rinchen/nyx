@@ -60,8 +60,7 @@ nyx bench path/to/corpus
 nyx self-test
 ```
 
-There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
-`zstd -19`, `xz -9`, `brotli -11`, and `lz4 -9` on the same files.
+There is also `nyx bench <corpus_dir>` which benchmarks nyx over every file in the given corpus.
 
 ## Benchmarks
 
@@ -70,10 +69,9 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 > at ~1.5 MB/s, so the headline table below is a representative **5-file subset**
 > (dickens, webster, nci, mr, json — text, mixed-binary, structured). `ratio%` is
 > the compressed size as a percentage of the original (lower is better); speed is
-> in MB/s (higher is better). See [BENCH.md](BENCH.md) for the full
-> zstd-1 / zstd-19 / FSE comparison and before/after optimization tables.
+> in MB/s (higher is better). Full benchmark data is in the README table above.
 
-### Current (two-level 4k bank mixer hierarchy + cross-block decay + real 4MB LDM window + BWT text trial; 87 tests, clippy clean)
+### Current (two-level 4k bank mixer hierarchy + cross-block decay + real 4MB LDM window + BWT text trial; 93 tests, all pass)
 
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -137,7 +135,7 @@ secondary.
 | **Two-pass CM residual v2** (≥8-byte match threshold + residual-only CM, interleaved decoder scan) | mr, dickens, json, webster, nci | **scaffold complete (Stage 1)**, Stage 2 blocked on decoder state synchronization | match side-stream (5-byte len+dist records) committed; full-block CM passthrough validates on all 5 files (65/65 tests) — residual-skip decode reverts to Stage 1 after round-trip failure (see commit 217a5d2). NOTE: Stage 1 scaffolding with live match pre-pass causes **regression** on nci (+12.4pt) and webster (+12.5pt) — match overhead exceeds CM benefit at 64 KiB block size. **Feature-gated** behind `cargo test --features two_pass`; off by default |
 | **Micro SSM mixer** (8-dim recurrent state as additional base model + Byte-Pair Re-Pair word model) | mr, dickens, json, webster, nci | **complete** → **reverted (net regression)** | 65/65 tests pass; round-trip verified; BUT measured on 5-file subset: nci 20.9%→33.3%, webster 45.1%→57.6%, mr 27.3%→29.2%, dickens 51.7%→54.9%, json 3.9%→5.7%. SSM/Byte-Pair models add prediction overhead without ratio gain on these corpora. **Feature-gated** behind `cargo test --features two_pass`; off by default |
 | **Second-order mixer training** (Adam + per-model lr_scale; LZP learns 10× faster) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | Adam tested at lr=0.01: dickens 51.7%→51.4%, mr 27.3%→27.6%, json 3.9%→4.1%. SGD + lr_scale identical to baseline. Neither improves the default SGD path; `LogisticMixer::new_adam()` kept in-tree for future use. | kept as default |
-||| **BWT text trial** (per-block trial between RawCm, BWT→MTF→RLE0→CM, and LZP→BWT→MTF→CM using divsufsort; 1-byte method selector; trial only for Text blocks > 256KB) | dickens, json | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%; mr/nci unchanged (classified as Binary); webster unverified (too large for single-run benchmark) | **kept as default** — rotation-based BWT (doubled string, filter SA to positions 0..n) avoids sentinel collision with 0x00 bytes; primary index stored as 4-byte LE; RLE0 escapes all 0xFF literals as 0xFF 0x00; LZP uses hash chains for O(n) match-finding |
+|**BWT text trial** (per-block trial between RawCm, BWT→MTF→RLE0→CM, and LZP→BWT→MTF→CM using divsufsort; 1-byte method selector; trial only for Text blocks ≥ 256KB) | dickens, json | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%; mr/nci unchanged (classified as Binary); webster unverified (too large for single-run benchmark) | **kept as default** — rotation-based BWT (doubled string, filter SA to positions 0..n) avoids sentinel collision with 0x00 bytes; primary index stored as 4-byte LE; RLE0 escapes all 0xFF literals as 0xFF 0x00; LZP uses hash chains for O(n) match-finding |
 
 Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
 method bytes + word model (text blocks only) + LazyLzp (neutral) + cross-block decay persistence + 4MB LZP
