@@ -8,6 +8,7 @@ use crate::model::lzp::Lzp;
 use crate::model::mixer_bank::MixerBank;
 use crate::model::order::OrderN;
 use crate::model::ppm::PpmModel;
+use crate::model::ppmd_ssm::PpmdSsm;
 use crate::model::sparse::Sparse;
 use crate::model::BitModel;
 
@@ -16,6 +17,7 @@ pub struct PpmBuilder {
     pub max_order: usize,
 }
 pub struct HybridPpm3Builder;
+pub struct PpmdSsmBuilder;
 
 impl BaselineBuilder {
     #[must_use]
@@ -49,6 +51,25 @@ impl HybridPpm3Builder {
             Box::new(Exec::new()),
             Box::new(Lzp::new()),
             Box::new(PpmModel::new(3)),
+        ];
+        let mixer = MixerBank::new(models.len());
+        (models, mixer, Some(5))
+    }
+}
+
+/// Stack using the PpmdSsm model (orders 0-8 + SEE + sparse de Bruijn contexts)
+/// instead of PpmModel(3). Useful for comparing PPMd vs vanilla PPM on text.
+impl PpmdSsmBuilder {
+    #[must_use]
+    pub fn build() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
+        let models: Vec<Box<dyn BitModel>> = vec![
+            Box::new(OrderN::new(0)),
+            Box::new(OrderN::new(1)),
+            Box::new(OrderN::new(2)),
+            Box::new(Sparse::new()),
+            Box::new(Exec::new()),
+            Box::new(Lzp::new()),
+            Box::new(PpmdSsm::new()),
         ];
         let mixer = MixerBank::new(models.len());
         (models, mixer, Some(5))

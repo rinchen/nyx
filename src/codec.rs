@@ -609,10 +609,25 @@ fn decode_block_with_matches(
 ///
 /// Returns [`NyxError`] on a malformed container, corrupt block, or CRC mismatch.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    decompress_impl(data)
+    decompress_impl(data, &mut build_stack_for_kind)
 }
 
-fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
+/// Decompress a `NYX1` container using a custom model-stack builder.
+///
+/// This mirrors [`compress_with`] on the decode side: the `build_stack` closure
+/// must match the one used for compression, otherwise rANS decoding will produce
+/// garbage and the CRC check will fail.
+pub fn decompress_with<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
+where
+    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+{
+    decompress_impl(data, build_stack)
+}
+
+fn decompress_impl<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
+where
+    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+{
     use std::io::Cursor;
     let mut cur = Cursor::new(data);
     let header = Header::read(&mut cur).map_err(|e| NyxError::InvalidContainer(e.to_string()))?;
@@ -646,7 +661,7 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
         } else {
             let kind = kind_for_method(entry.method)?;
             if last_kind != Some(kind) {
-                let (new_models, new_mixer, new_lzp_idx) = build_stack_for_kind(kind);
+                let (new_models, new_mixer, new_lzp_idx) = build_stack(kind);
                 models = new_models;
                 mixer = new_mixer;
                 lzp_idx = new_lzp_idx;

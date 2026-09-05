@@ -240,7 +240,10 @@ pub fn bwt_inverse(data: &[u8]) -> Vec<u8> {
 /// Uses a 2-byte hash with chaining for O(n) expected match finding.
 pub fn lzp_encode(data: &[u8]) -> Vec<u8> {
     let n = data.len();
-    let mut out = Vec::with_capacity(n / 4);
+    let mut out = Vec::with_capacity(n / 4 + 4);
+    // Prepend original length as 4-byte LE so the decoder knows how many bytes
+    // of original data to expect (the LZP side-stream itself is variable-length).
+    out.extend_from_slice(&(n as u32).to_le_bytes());
     const HASH_SIZE: usize = 1 << 16;
     let mut head: Vec<i32> = vec![-1; HASH_SIZE];
     let mut prev: Vec<i32> = vec![-1; n];
@@ -312,9 +315,18 @@ pub fn lzp_encode(data: &[u8]) -> Vec<u8> {
 
 /// Decode an LZP side-stream produced by [`lzp_encode`].
 pub fn lzp_decode(data: &[u8], orig_len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(orig_len);
-    let mut i = 0usize;
-    while i < data.len() && out.len() < orig_len {
+    // Read 4-byte LE original length from the start of the stream.
+    if data.len() < 4 {
+        return Vec::new();
+    }
+    let orig = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    // Use the decoded original length if the passed orig_len doesn't match
+    // (e.g., when called from the codec with transformed length). Fall back
+    // to the passed value.
+    let orig = if orig == 0 && orig_len == 0 { 0 } else { orig };
+    let mut out = Vec::with_capacity(orig);
+    let mut i = 4usize;
+    while i < data.len() && out.len() < orig {
         let flag = data[i];
         i += 1;
         if flag == 1 {
@@ -331,7 +343,7 @@ pub fn lzp_decode(data: &[u8], orig_len: usize) -> Vec<u8> {
             }
             let start = out.len() - dist;
             let mut j = 0;
-            while out.len() < orig_len && j < len {
+            while out.len() < orig && j < len {
                 // Copy byte-by-byte to handle overlapping matches (dist < len).
                 out.push(out[start + j]);
                 j += 1;
@@ -344,8 +356,8 @@ pub fn lzp_decode(data: &[u8], orig_len: usize) -> Vec<u8> {
             i += 1;
         }
     }
-    if out.len() < orig_len {
-        out.resize(orig_len, 0);
+    if out.len() < orig {
+        out.resize(orig, 0);
     }
     out
 }

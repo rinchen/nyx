@@ -170,7 +170,7 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
 fn measure_buf(
     label: &str,
     data: &[u8],
-    mut build: impl FnMut(
+    build: impl Fn(
         nyx::classify::BlockKind,
     ) -> (
         Vec<Box<dyn nyx::model::BitModel>>,
@@ -179,12 +179,13 @@ fn measure_buf(
     ),
 ) -> (usize, usize, f64, f64, f64) {
     let enc_start = Instant::now();
-    let Ok(compressed) = codec::compress_with(data, &mut build) else {
+    let compress_build = &mut |kind| build(kind);
+    let Ok(compressed) = codec::compress_with(data, compress_build) else {
         return (0, 0, 0.0, 0.0, 0.0);
     };
     let enc_ms = enc_start.elapsed().as_secs_f64() * 1000.0;
     let dec_start = Instant::now();
-    let Ok(restored) = codec::decompress(&compressed) else {
+    let Ok(restored) = codec::decompress_with(&compressed, &mut |kind| build(kind)) else {
         return (compressed.len(), 0, 0.0, 0.0, 0.0);
     };
     let dec_ms = dec_start.elapsed().as_secs_f64() * 1000.0;
@@ -235,13 +236,14 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
         let baseline_ratio =
             measure_buf("baseline", &data, |_| nyx::stacks::BaselineBuilder::build()).2;
 
-        let mut cases: [(&str, &mut dyn FnMut(nyx::classify::BlockKind) -> _); 4] = [
+        let mut cases: [(&str, &mut dyn FnMut(nyx::classify::BlockKind) -> _); 5] = [
             ("baseline", &mut |_| nyx::stacks::BaselineBuilder::build()),
             ("ppm3", &mut |_| nyx::stacks::PpmBuilder::new(3).build()),
             ("ppm4", &mut |_| nyx::stacks::PpmBuilder::new(4).build()),
             ("hybrid_ppm3", &mut |_| {
                 nyx::stacks::HybridPpm3Builder::build()
             }),
+            ("ppmd_ssm", &mut |_| nyx::stacks::PpmdSsmBuilder::build()),
         ];
 
         for (label, builder) in &mut cases {
