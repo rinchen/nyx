@@ -13,10 +13,12 @@ It is a self-contained CLI with its own `NYX1` container format.
 
 ## The method
 
-Input is split into 64 KiB blocks. Each block is classified by a cheap order-0
+Input is split into variable-size blocks depending on data type. Each block is classified by a cheap order-0
 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 
 - `Random` blocks are stored verbatim (a copy record) — no prediction cost.
+- `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range word repeats into local runs)
+- `Binary`, `Exec`, and `Random` blocks use the default 64 KiB chunk size.
 - Everything else runs a **bit-level predictor stack**: order-0 / order-1 / order-2
   byte-context models, a sparse/stride context model, an executable 2D-context
   model, and an LZP match pre-stage. The predictions are fused by a **two-level
@@ -76,7 +78,7 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
 | dickens | 9953.6 | 46.2 | 0.5 | 0.4 | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
-| webster | 40487.0 | 44.8 | 0.6 | 0.5 | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
+| webster | 40487.0 | 45.1 | 0.7 | 0.5 | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | 20.9 | 0.7 | 0.5 | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **nyx** | **zstd -19** |
 | mr | 9736.9 | 27.5 | 0.5 | 0.5 | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **nyx** | **zstd -19** |
 | json | 478.5 | 0.1 | 0.5 | 0.5 | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **nyx** | **zstd -19** |
@@ -135,7 +137,7 @@ secondary.
 | **Two-pass CM residual v2** (≥8-byte match threshold + residual-only CM, interleaved decoder scan) | mr, dickens, json, webster, nci | **scaffold complete (Stage 1)**, Stage 2 blocked on decoder state synchronization | match side-stream (5-byte len+dist records) committed; full-block CM passthrough validates on all 5 files (65/65 tests) — residual-skip decode reverts to Stage 1 after round-trip failure (see commit 217a5d2). NOTE: Stage 1 scaffolding with live match pre-pass causes **regression** on nci (+12.4pt) and webster (+12.5pt) — match overhead exceeds CM benefit at 64 KiB block size. **Feature-gated** behind `cargo test --features two_pass`; off by default |
 | **Micro SSM mixer** (8-dim recurrent state as additional base model + Byte-Pair Re-Pair word model) | mr, dickens, json, webster, nci | **complete** → **reverted (net regression)** | 65/65 tests pass; round-trip verified; BUT measured on 5-file subset: nci 20.9%→33.3%, webster 45.1%→57.6%, mr 27.3%→29.2%, dickens 51.7%→54.9%, json 3.9%→5.7%. SSM/Byte-Pair models add prediction overhead without ratio gain on these corpora. **Feature-gated** behind `cargo test --features two_pass`; off by default |
 | **Second-order mixer training** (Adam + per-model lr_scale; LZP learns 10× faster) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | Adam tested at lr=0.01: dickens 51.7%→51.4%, mr 27.3%→27.6%, json 3.9%→4.1%. SGD + lr_scale identical to baseline. Neither improves the default SGD path; `LogisticMixer::new_adam()` kept in-tree for future use. | kept as default |
-|| **BWT text trial** (per-block trial between RawCm, BWT→MTF→RLE0→CM, and LZP→BWT→MTF→CM using divsufsort; 1-byte method selector; trial only for Text blocks > 256KB) | dickens, json, mr, webster, nci | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%, webster 45.1%→44.8%; mr/nci unchanged (classified as Binary) | **kept as default** — rotation-based BWT (doubled string, filter SA to positions 0..n) avoids sentinel collision with 0x00 bytes; primary index stored as 4-byte LE; RLE0 escapes all 0xFF literals as 0xFF 0x00; LZP uses hash chains for O(n) match-finding |
+||| **BWT text trial** (per-block trial between RawCm, BWT→MTF→RLE0→CM, and LZP→BWT→MTF→CM using divsufsort; 1-byte method selector; trial only for Text blocks > 256KB) | dickens, json | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%; mr/nci unchanged (classified as Binary); webster unverified (too large for single-run benchmark) | **kept as default** — rotation-based BWT (doubled string, filter SA to positions 0..n) avoids sentinel collision with 0x00 bytes; primary index stored as 4-byte LE; RLE0 escapes all 0xFF literals as 0xFF 0x00; LZP uses hash chains for O(n) match-finding |
 
 Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
 method bytes + word model (text blocks only) + LazyLzp (neutral) + cross-block decay persistence + 4MB LZP
