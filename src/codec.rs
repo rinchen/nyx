@@ -42,6 +42,7 @@
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
 
+use crate::bwt::{self, BwtPathResult, BwtPipeline};
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
@@ -77,6 +78,10 @@ pub const METHOD_TEXT: u8 = 2;
 pub const METHOD_BINARY: u8 = 3;
 /// Exec-optimized CM stack (orders 0–2, Sparse, LZP, PPM order-3; no Exec model).
 pub const METHOD_EXEC: u8 = 4;
+/// Text BWT+B path: BWT(1MB) → MTF → RLE0 → CM on MTF ranks.
+pub const METHOD_BWT_MTF_RLE: u8 = 5;
+/// Text BWT path: LZP(4MB) → BWT → MTF → CM (no RLE0).
+pub const METHOD_LZP_BWT_MTF: u8 = 6;
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
 /// weight structure per block boundary, smoothly transferring context without
@@ -92,17 +97,6 @@ pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
     compress_with(buf, &mut build_stack_for_kind)
 }
 
-/// Compress `buf` using a custom per-block stack builder.
-///
-/// The builder receives the [`BlockKind`](crate::classify::BlockKind) the classifier
-/// assigned to each block and returns the `(models, mixer, lzp_idx)` triple.
-/// `lzp_idx` is the index of the LZP model in `models` (if present), used as the
-/// third input to the master mixer. Returns `(models, mixer, None)` if no LZP
-/// model is in the stack.
-///
-/// # Errors
-///
-/// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
@@ -135,16 +129,33 @@ where
         // Random blocks: store verbatim (method COPY). Don't run CM on
         // entropy-poor data — the rANS path would inflate and the decoder
         // treats METHOD_COPY as a passthrough anyway.
-        let comp = if kind == crate::classify::BlockKind::Random {
-            block_data.to_vec()
+        let (comp, method, store_orig_len) = if kind == crate::classify::BlockKind::Random {
+            (block_data.to_vec(), METHOD_COPY, block_data.len())
+        } else if kind == crate::classify::BlockKind::Text {
+            // Per-block trial: pick the best BWT pipeline for this Text block.
+            let trial = bwt::compress_text_with_trial(block_data);
+            let method = match trial.pipeline {
+                bwt::BwtPipeline::RawCm => METHOD_TEXT,
+                bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
+                bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
+            };
+            // Transform the block data through the chosen pipeline, then CM-encode.
+            let transformed = trial.pipeline.encode(block_data);
+            // For BWT paths, `orig_len` stores the *transformed* length (what the
+            // decoder must decode from rANS). The original length is recovered
+            // during BWT reversal; correctness is verified by CRC.
+            let comp = compress_block(&mut models, &mut mixer, lzp_idx, &transformed);
+            (comp, method, transformed.len())
         } else {
-            compress_block(&mut models, &mut mixer, lzp_idx, block_data)
+            // Binary / Exec: raw CM with the existing stack.
+            let comp = compress_block(&mut models, &mut mixer, lzp_idx, block_data);
+            (comp, method_for_kind(kind), block_data.len())
         };
 
         let entry = BlockEntry {
             comp_len: comp.len() as u32,
-            orig_len: block_data.len() as u32,
-            method: method_for_kind(kind),
+            orig_len: store_orig_len as u32,
+            method,
             crc32: crc32(block_data),
         };
         entries.push(entry);
@@ -155,7 +166,7 @@ where
         // structure across same-kind blocks in the stream. Skip for copy blocks
         // (no models were trained, no mixer state to decay) — mirrors the
         // decoder's `entry.method != METHOD_COPY` guard.
-        if method_for_kind(kind) != METHOD_COPY {
+        if method != METHOD_COPY {
             mixer.decay(BLOCK_DECAY);
         }
     }
@@ -641,7 +652,7 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
                 lzp_idx = new_lzp_idx;
                 last_kind = Some(kind);
             }
-            decode_block(
+            let decoded = decode_block(
                 comp,
                 entry.orig_len as usize,
                 &mut models,
@@ -651,7 +662,16 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
             .map_err(|e| match e {
                 NyxError::Entropy(s) => NyxError::CorruptBlock(s),
                 other => other,
-            })?
+            })?;
+            // Reverse BWT transforms for method 5/6, mirroring the encoder's trial.
+            match entry.method {
+                METHOD_BWT_MTF_RLE => bwt::bwt_mtf_rle_decode(&decoded),
+                METHOD_LZP_BWT_MTF => {
+                    let mtf = bwt::bwt_mtf_decode(&decoded);
+                    bwt::lzp_decode(&mtf, entry.orig_len as usize)
+                }
+                _ => decoded,
+            }
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -675,9 +695,10 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
 fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
     match method {
         METHOD_COPY => Ok(crate::classify::BlockKind::Random),
-        METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
+        METHOD_CM | METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
+        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF => Ok(crate::classify::BlockKind::Text),
         _ => Err(NyxError::InvalidContainer(format!(
             "unknown method {}",
             method

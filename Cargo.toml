@@ -11,6 +11,7 @@ byteorder = "1"
 crc32fast = "1"
 thiserror = "1"
 ans = "0.4.0"
+divsufsort = "2"
 
 [features]
 default = []

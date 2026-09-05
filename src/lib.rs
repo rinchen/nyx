@@ -11,6 +11,7 @@
     clippy::suboptimal_flops
 )]
 
+pub mod bwt;
 pub mod classify;
 pub mod codec;
 pub mod container;
