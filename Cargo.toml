@@ -12,6 +12,10 @@ crc32fast = "1"
 thiserror = "1"
 ans = "0.4.0"
 
+[features]
+default = []
+two_pass = []
+
 [dev-dependencies]
 criterion = "0.5"
 

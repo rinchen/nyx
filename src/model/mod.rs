@@ -13,9 +13,9 @@ pub mod mixer;
 pub mod mixer_bank;
 pub mod order;
 pub mod ppm;
-pub mod ssm;
 pub mod sparse;
 pub mod sse_apm;
+pub mod ssm;
 pub mod word;
 
 /// Assembles whole bytes from the per-bit [`BitModel::update`] stream so context

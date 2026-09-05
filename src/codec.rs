@@ -4,30 +4,25 @@
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
 //! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
-//!   Exec, LazyLzp, PpmModel order-3, WordModel + SsmMixer.
-//! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec, LZP,
-//!   PPM order-3) + SsmMixer.
+//!   Exec, LazyLzp, PpmModel order-3, WordModel.
+//! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec,
+//!   LZP, PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
+//!   benefits from every signal.
 //! - `Exec` blocks (method 4) use a stack without the `Exec` model (redundant on
-//!   already-classified machine code) but keep orders 0–2, Sparse, LZP, PPM order-3
-//!   + SsmMixer.
+//!   already-classified machine code) but keep orders 0–2, Sparse, LZP, PPM order-3.
 //! - Fallback / unknown (method 1) is the full heterogeneous stack, identical to the
 //!   original CM path. This is also the decoder default for any future method value,
 //!   so old streams remain valid.
 //!
-//! ## Two-pass CM residual (experimental)
+//! ## Two-pass CM residual (experimental, behind `two_pass` feature)
 //!
-//! For compressed blocks, nyx runs a forward LZP match pre-pass and emits
-//! explicit `(len, dist)` records for long matches (≥ 8 bytes). Only the
-//! *residual* bytes (those not covered by a match) are context-mixed and
-//! rANS-encoded. The decoder replays the identical scan, copy-matching from
-//! its own output buffer, and rANS-decodes only residual bytes. LZP state
-//! stays in sync because both sides train on the same reconstructed byte
-//! stream.
-//!
-//! Wire format (per block payload):
-//!   - `u32 LE` = number of match records
-//!   - match records: `u8 len` + `u32 LE dist` (5 bytes each)
-//!   - rANS bit stream: only for residual bytes
+//! When the `two_pass` feature is enabled, nyx runs a forward LZP match pre-pass
+//! and emits explicit `(len, dist)` records for long matches (≥ 8 bytes).
+//! The `Two-pass CM residual` feature adds an SsmMixer (8-dim Mamba-style state-space
+//! model) and a Byte-Pair Re-Pair dictionary to the word model as additional base
+//! models. NOTE: measured on the 5-file Silesia subset, the SSM + Re-Pair + match
+//! side-stream combination caused a net regression (nci 20.9%→33.3%, webster 45.1%→57.6%,
+//! etc.), so it is behind a feature flag and off by default.
 //!
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
@@ -35,18 +30,19 @@
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
-use crate::model::lzp::Lzp;
 use crate::model::mixer::LogisticMixer;
-use crate::model::ssm::SsmMixer;
 use crate::model::BitModel;
 
-/// Minimum match length to emit as an explicit record (vs. letting CM model it).
-/// The reverted Sep-11 experiment used MIN_MATCH=4 and regressed all 5 files; 8
-/// avoids tiny-match overhead that bloats the side stream.
+#[cfg(feature = "two_pass")]
+use crate::model::lzp::Lzp;
+
+#[cfg(feature = "two_pass")]
+use crate::model::ssm::SsmMixer;
+
+#[cfg(feature = "two_pass")]
 const MATCH_MIN_LEN: usize = 8;
 
-/// A single match record emitted by the pre-pass.
-/// `len` is the byte count copied; `dist` is the backward distance.
+#[cfg(feature = "two_pass")]
 #[derive(Debug, Clone, Copy)]
 struct MatchRun {
     len: usize,
@@ -73,7 +69,14 @@ pub const METHOD_EXEC: u8 = 4;
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
-    compress_with(buf, &mut build_stack_for_kind)
+    #[cfg(feature = "two_pass")]
+    {
+        compress_with(buf, &mut build_stack_for_kind)
+    }
+    #[cfg(not(feature = "two_pass"))]
+    {
+        compress_with(buf, &mut build_stack_for_kind)
+    }
 }
 
 /// Compress `buf` using a custom per-block stack builder.
@@ -181,50 +184,105 @@ pub fn build_stack_for_kind(
             (models, LogisticMixer::new(0))
         }
         crate::classify::BlockKind::Text => {
-            // Text-optimized stack: full hybrid + WordModel + LazyLzp + new 4MB LZP + SSM.
-            let n = 10;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::exec::Exec::new()),
-                Box::new(crate::model::lazy_lzp::LazyLzp::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
-                Box::new(crate::model::word::WordModel::new()),
-                Box::new(crate::model::ssm::SsmMixer::new()),
-            ];
-            (models, LogisticMixer::new(n))
+            #[cfg(feature = "two_pass")]
+            {
+                // Text-optimized stack WITH SSM + Re-Pair word model (experimental).
+                let n = 10;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::exec::Exec::new()),
+                    Box::new(crate::model::lazy_lzp::LazyLzp::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                    Box::new(crate::model::word::WordModel::new()),
+                    Box::new(crate::model::ssm::SsmMixer::new()),
+                ];
+                (models, LogisticMixer::new(n))
+            }
+            #[cfg(not(feature = "two_pass"))]
+            {
+                // Text-optimized stack (best configuration, no SSM/Re-Pair).
+                let n = 9;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::exec::Exec::new()),
+                    Box::new(crate::model::lazy_lzp::LazyLzp::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                    Box::new(crate::model::word::WordModel::new()),
+                ];
+                (models, LogisticMixer::new(n))
+            }
         }
         crate::classify::BlockKind::Binary => {
-            // Binary: full stack + SSM.
-            let n = 8;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::exec::Exec::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
-                Box::new(crate::model::ssm::SsmMixer::new()),
-            ];
-            (models, LogisticMixer::new(n))
+            #[cfg(feature = "two_pass")]
+            {
+                // Binary stack WITH SSM (experimental).
+                let n = 8;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::exec::Exec::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                    Box::new(crate::model::ssm::SsmMixer::new()),
+                ];
+                (models, LogisticMixer::new(n))
+            }
+            #[cfg(not(feature = "two_pass"))]
+            {
+                // Binary stack (best configuration, no SSM).
+                let n = 7;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::exec::Exec::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                ];
+                (models, LogisticMixer::new(n))
+            }
         }
         crate::classify::BlockKind::Exec => {
-            // Exec: orders 0-2, Sparse, LZP, PPM order-3, SSM. Drop Exec model (redundant).
-            let n = 7;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
-                Box::new(crate::model::ssm::SsmMixer::new()),
-            ];
-            (models, LogisticMixer::new(n))
+            #[cfg(feature = "two_pass")]
+            {
+                // Exec stack WITH SSM (experimental).
+                let n = 7;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                    Box::new(crate::model::ssm::SsmMixer::new()),
+                ];
+                (models, LogisticMixer::new(n))
+            }
+            #[cfg(not(feature = "two_pass"))]
+            {
+                // Exec stack (best configuration, no SSM).
+                let n = 6;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                ];
+                (models, LogisticMixer::new(n))
+            }
         }
     }
 }
@@ -235,109 +293,48 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
     build_stack_for_kind(crate::classify::BlockKind::Binary)
 }
 
-/// Compress one block (encode-side of the two-pass CM residual).
+/// Compress one block.
 ///
-/// (1) Forward LZP scan: record (len, dist) for matches ≥ `MATCH_MIN_LEN`.
-/// (2) Emit match records as a side stream, then rANS-encode only residual bytes.
+/// With `two_pass` feature: runs a match pre-pass, emits (len, dist) side-stream, then
+/// rANS-encodes ALL bytes (Stage 1 — match records present but not yet used for residual
+/// skipping, since Stage 2 decoder is blocked on state synchronization).
+/// Without `two_pass`: plain CM encoding of all bytes.
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
     block: &[u8],
 ) -> Vec<u8> {
-    let runs = scan_matches(block);
-    encode_block_with_matches(models, mixer, block, &runs)
+    #[cfg(feature = "two_pass")]
+    {
+        let runs = scan_matches(block);
+        encode_block_with_matches(models, mixer, block, &runs)
+    }
+    #[cfg(not(feature = "two_pass"))]
+    {
+        encode_block_plain(models, mixer, block)
+    }
 }
 
-/// Forward LZP scan: train on each byte, call `longest_match` at position i+1,
-/// record matches ≥ `MATCH_MIN_LEN`, skip ahead by the match length.
-///
-/// This is deterministic and depends only on the input byte stream, so the
-/// decoder can replay it if it has the same (len, dist) records to validate.
-/// In practice the side-stream records are the source of truth; the scan
-/// produces them and the decoder validates its own replay against them.
-fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
-    let mut lzp = Lzp::new();
-    let mut runs: Vec<MatchRun> = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < block.len() {
-        // Train LZP on the current source byte (not on any matched copy).
-        lzp.train_at(block, i);
-        if i + 1 >= 4 {
-            if let Some(raw_len) = lzp.longest_match(block, i + 1) {
-                let len = raw_len.min(255);
-                let dist = find_match_distance(block, i + 1, len);
-                if dist > 0 && dist <= 4 * 1024 * 1024 && len >= MATCH_MIN_LEN {
-                    runs.push(MatchRun { len, dist });
-                    // Do NOT train LZP on the matched bytes — they're copies
-                    // from earlier in the block, and training on them would
-                    // pollute the hash chains with self-referential matches.
-                    i += len;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    runs
-}
-
-/// Find how far back the matching string sits at `pos` in `data` with `len` bytes.
-/// Linear backward scan, bounded by the 4 MB window.
-fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
-    if pos < len || len == 0 {
-        return 0;
-    }
-    let needle = &data[pos - len..pos];
-    let window = 4 * 1024 * 1024;
-    let start = pos.saturating_sub(window);
-    for back in (start..pos - len + 1).rev() {
-        if data[back..back + len] == *needle {
-            return pos - back;
-        }
-    }
-    0
-}
-
-/// Encode a block with explicit match records + residual CM.
-///
-/// Wire format (per block payload):
-///   - 4 bytes: `u32::LE` = number of match records
-///   - match records: `u8 len` (raw, ≥8) + `u32 LE dist` (5 bytes each)
-///   - rANS bit stream: CM-encoded bits for the block bytes
-///
-/// Stage 1 (current): the rANS stream covers ALL bytes (matches recorded but
-///  not yet used to skip CM encoding). This keeps round-trip correct while
-///  validating the scaffolding.
-/// Stage 2 (future): skip matched bytes from rANS, only encode residuals.
-fn encode_block_with_matches(
+/// Plain CM encoding (no match side-stream).
+fn encode_block_plain(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
     block: &[u8],
-    runs: &[MatchRun],
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
-    // Pre-build per-block dictionaries (e.g. Byte-Pair Re-Pair) for models
-    // that override `prepare_block`.
+    // Pre-build per-block dictionaries.
     for m in models.iter_mut() {
         m.prepare_block(block);
     }
 
-    // Match side-stream
-    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
-    for r in runs {
-        out.push(r.len as u8);
-        out.extend_from_slice(&(r.dist as u32).to_le_bytes());
-    }
-
-    // Stage 1: CM-encode ALL bytes (residual = full block).
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
 
     for &byte in block {
         for bit_idx in (0..8).rev() {
-            let bit = (byte >> bit_idx) & 1 == 1;
+            let bit = (byte >> bit_idx) & 1u8 == 1u8;
             let bit_pos = bit_idx as u8;
             for (j, m) in models.iter().enumerate() {
                 probs[j] = m.predict();
@@ -354,12 +351,144 @@ fn encode_block_with_matches(
     out
 }
 
-/// Decode a block encoded with `encode_block_with_matches`.
+#[cfg(feature = "two_pass")]
+fn encode_block_with_matches(
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+    block: &[u8],
+    runs: &[MatchRun],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    for m in models.iter_mut() {
+        m.prepare_block(block);
+    }
+
+    // Match side-stream
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for r in runs {
+        out.push(r.len as u8);
+        out.extend_from_slice(&(r.dist as u32).to_le_bytes());
+    }
+
+    let mut enc = BitEncoder::new();
+    let mut probs: [u16; 12] = [2048; 12];
+    let n = models.len();
+
+    for &byte in block {
+        for bit_idx in (0..8).rev() {
+            let bit = (byte >> bit_idx) & 1u8 == 1u8;
+            let bit_pos = bit_idx as u8;
+            for (j, m) in models.iter().enumerate() {
+                probs[j] = m.predict();
+            }
+            let p = mixer.mix(&probs[..n], bit_pos);
+            enc.encode_bit(bit, p);
+            mixer.update(&probs[..n], bit, bit_pos);
+            for m in models.iter_mut() {
+                m.update(bit);
+            }
+        }
+    }
+    out.extend(enc.finish());
+    out
+}
+
+#[cfg(feature = "two_pass")]
+fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
+    let mut lzp = Lzp::new();
+    let mut runs: Vec<MatchRun> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < block.len() {
+        lzp.train_at(block, i);
+        if i + 1 >= 16 {
+            if let Some(raw_len) = lzp.longest_match(block, i + 1) {
+                let len = raw_len.min(255);
+                let dist = find_match_distance(block, i + 1, len);
+                if dist > 0 && dist <= 4 * 1024 * 1024 && len >= MATCH_MIN_LEN {
+                    runs.push(MatchRun { len, dist });
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    runs
+}
+
+#[cfg(feature = "two_pass")]
+fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
+    if pos < len || len == 0 {
+        return 0;
+    }
+    let needle = &data[pos - len..pos];
+    let window = 4 * 1024 * 1024;
+    let start = pos.saturating_sub(window);
+    for back in (start..pos - len + 1).rev() {
+        if data[back..back + len] == *needle {
+            return pos - back;
+        }
+    }
+    0
+}
+
+/// Decode a block.
 ///
-/// Stage 1: reads the match side-stream (validates record count/length) then
-/// rANS-decodes ALL bytes — the encoder CM-encodes all bytes, so we do too.
-/// Stage 2 (future): skip rANS decoding for matched positions, copy-matching
-/// from the output buffer instead.
+/// With `two_pass`: reads match side-stream (validates records), then rANS-decodes all bytes.
+/// Without `two_pass`: plain CM decode of all bytes.
+fn decode_block(
+    comp: &[u8],
+    orig_len: usize,
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+) -> Result<Vec<u8>> {
+    #[cfg(feature = "two_pass")]
+    {
+        decode_block_with_matches(comp, orig_len, models, mixer)
+    }
+    #[cfg(not(feature = "two_pass"))]
+    {
+        decode_block_plain(comp, orig_len, models, mixer)
+    }
+}
+
+fn decode_block_plain(
+    comp: &[u8],
+    orig_len: usize,
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut LogisticMixer,
+) -> Result<Vec<u8>> {
+    let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut out = Vec::with_capacity(orig_len);
+    let mut probs: [u16; 12] = [2048; 12];
+    let n = models.len();
+
+    while out.len() < orig_len {
+        let mut byte = 0u8;
+        for bit_idx in (0..8).rev() {
+            let bit_pos = bit_idx as u8;
+            for (i, m) in models.iter().enumerate() {
+                probs[i] = m.predict();
+            }
+            let p = mixer.mix(&probs[..n], bit_pos);
+            let bit = dec
+                .decode_bit(p)
+                .map_err(|e| NyxError::Entropy(e.to_string()))?;
+            mixer.update(&probs[..n], bit, bit_pos);
+            for m in models.iter_mut() {
+                m.update(bit);
+            }
+            if bit {
+                byte |= 1 << bit_idx;
+            }
+        }
+        out.push(byte);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "two_pass")]
 fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
@@ -367,21 +496,20 @@ fn decode_block_with_matches(
     mixer: &mut LogisticMixer,
 ) -> Result<Vec<u8>> {
     if comp.len() < 4 {
-        return Err(NyxError::InvalidContainer("match side-stream too short".into()));
+        return Err(NyxError::InvalidContainer(
+            "match side-stream too short".into(),
+        ));
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
-    // Validate and skip match records.
     for _ in 0..num_runs {
         if offset + 5 > comp.len() {
             return Err(NyxError::InvalidContainer("truncated match record".into()));
         }
-        offset += 5; // u8 len + u32 LE dist
+        offset += 5;
     }
 
-    // Stage 1: full-block CM decode (residual = entire block).
-    let mut dec = BitDecoder::new(&comp[offset..])
-        .map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -457,12 +585,12 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
                 mixer = new_mixer;
                 last_kind = Some(kind);
             }
-            decompress_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(
-                |e| match e {
+            decode_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(|e| {
+                match e {
                     NyxError::Entropy(s) => NyxError::CorruptBlock(s),
                     other => other,
-                },
-            )?
+                }
+            })?
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -489,16 +617,6 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
             method
         ))),
     }
-}
-
-/// Decompress one block payload. Delegates to `decode_block_with_matches`.
-fn decompress_block(
-    comp: &[u8],
-    orig_len: usize,
-    models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
-) -> Result<Vec<u8>> {
-    decode_block_with_matches(comp, orig_len, models, mixer)
 }
 
 /// Re-export so callers can build CRCs without reaching into the container module.
@@ -604,8 +722,23 @@ mod tests {
     }
 
     #[test]
+    fn json_round_trips() {
+        // Verify the word model produces correct round-trips on structured text.
+        let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
+        let original: Vec<u8> = std::iter::repeat(json.as_ref())
+            .take(4000)
+            .flatten()
+            .copied()
+            .collect();
+        let comp = compress(&original).expect("compress");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "JSON round-trip mismatch");
+    }
+
+    #[cfg(feature = "two_pass")]
+    #[test]
     fn scan_matches_finds_repeats() {
-        let data = b"abcabcabcabcabcabc";
+        let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
         let runs = scan_matches(data);
         assert!(
             !runs.is_empty(),
@@ -614,6 +747,7 @@ mod tests {
         assert!(runs[0].len >= MATCH_MIN_LEN);
     }
 
+    #[cfg(feature = "two_pass")]
     #[test]
     fn scan_matches_empty_on_unique() {
         let mut data = vec![0u8; 256];
@@ -628,29 +762,11 @@ mod tests {
         assert!(runs.is_empty(), "expected no matches in random data");
     }
 
+    #[cfg(feature = "two_pass")]
     #[test]
     fn find_match_distance_correct() {
         let data = b"abcabcabcabc";
-        // At position 6, "abc" matches distance 3.
         let d = find_match_distance(data, 6, 3);
         assert_eq!(d, 3, "expected distance 3, got {}", d);
-    }
-
-    #[test]
-    fn json_round_trips_with_ssm_and_repar() {
-        // Verify the new SSM model + Byte-Pair Re-Pair word model produce
-        // correct round-trips on structured text (JSON).
-        let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
-        let original: Vec<u8> = std::iter::repeat(json.as_ref())
-            .take(4000)
-            .flatten()
-            .copied()
-            .collect();
-        let comp = compress(&original).expect("compress");
-        let back = decompress(&comp).expect("decompress");
-        assert_eq!(
-            back, original,
-            "JSON round-trip mismatch with SSM + Re-Pair"
-        );
     }
 }

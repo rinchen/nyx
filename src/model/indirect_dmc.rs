@@ -21,9 +21,7 @@ const INDIRECT_SIZE: usize = 1 << INDIRECT_BITS;
 const CTX_BITS: u32 = 18; // 256K ctx buckets
 
 fn mix_hash(a: u64, b: u64) -> usize {
-    let h = a
-        .wrapping_mul(0x9E37_79B9_1AB3_57C5u64)
-        ^ b.wrapping_mul(0xBF58_4AC7_3295_6B65u64);
+    let h = a.wrapping_mul(0x9E37_79B9_1AB3_57C5u64) ^ b.wrapping_mul(0xBF58_4AC7_3295_6B65u64);
     (h as usize) & (INDIRECT_SIZE - 1)
 }
 
@@ -80,8 +78,8 @@ impl BitModel for IndirectModel {
     fn predict(&self) -> u16 {
         let [c0, c1] = self.ctab.get(self.key());
         let tot = c0 + c1;
-        (u32::from(c1) * MAX_PROB as u32 / (tot.max(1)))
-            .clamp(MIN_PROB as u32, MAX_PROB as u32) as u16
+        (u32::from(c1) * MAX_PROB as u32 / (tot.max(1))).clamp(MIN_PROB as u32, MAX_PROB as u32)
+            as u16
     }
 
     #[inline(always)]
@@ -160,8 +158,8 @@ impl BitModel for DmcModel {
     fn predict(&self) -> u16 {
         let [c0, c1] = self.ctab.get(self.key());
         let tot = c0 + c1;
-        (u32::from(c1) * MAX_PROB as u32 / (tot.max(1)))
-            .clamp(MIN_PROB as u32, MAX_PROB as u32) as u16
+        (u32::from(c1) * MAX_PROB as u32 / (tot.max(1))).clamp(MIN_PROB as u32, MAX_PROB as u32)
+            as u16
     }
 
     #[inline(always)]
