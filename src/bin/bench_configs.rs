@@ -159,7 +159,7 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
             comp_kb,
             ratio,
             enc_mbps,
-            dec_mbps
+            dec_mbps,
         );
     }
 
@@ -174,7 +174,8 @@ fn measure_buf(
         nyx::classify::BlockKind,
     ) -> (
         Vec<Box<dyn nyx::model::BitModel>>,
-        nyx::model::mixer::LogisticMixer,
+        nyx::model::mixer_bank::MixerBank,
+        Option<usize>,
     ),
 ) -> (usize, usize, f64, f64, f64) {
     let enc_start = Instant::now();

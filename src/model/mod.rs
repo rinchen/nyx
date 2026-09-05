@@ -65,6 +65,22 @@ impl ByteAssembler {
         }
     }
 
+    /// Directly record a completed byte, bypassing bit-by-bit assembly.
+    ///
+    /// This is used by callers (e.g. `MixerBank`) that track byte-level
+    /// context but don't need per-bit assembly for their own prediction
+    /// — only the completed byte history. Equivalent to feeding all 8 bits
+    /// MSB-first, but avoids 8 branchy calls.
+    #[inline]
+    pub fn push_byte(&mut self, byte: u8) {
+        if self.bytes.len() == self.cap {
+            self.bytes.remove(0);
+        }
+        self.bytes.push(byte);
+        self.nbits = 0;
+        self.pending = 0;
+    }
+
     /// The number of bits accumulated toward the current (in-progress) byte, 0..8.
     #[must_use]
     pub const fn nbits(&self) -> u8 {

@@ -1,5 +1,20 @@
-//! Core codec: glue the classifier, bit models, logistic mixer, rANS backend, and the
-//! `NYX1` container into `compress` / `decompress`.
+//! Core codec: glue the classifier, bit models, two-level logistic mixer, rANS backend,
+//! and the `NYX1` container into `compress` / `decompress`.
+//!
+//! ## Two-level mixer hierarchy
+//!
+//! The mixer uses a CMIX/PAQ8-style three-layer stack:
+//!
+//! 1. **Bank mixers** (4096 instances): selected by a context hash of
+//!    order-1 / order-2 / word-context + bit position. Each bank specializes
+//!    its weights to a specific context, avoiding the ~50% saturation that a
+//!    single logistic mixer hits on repetitive corpora like dickens.
+//! 2. **Global mixer**: a single context-agnostic mixer over the same models.
+//! 3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
+//!
+//! Only the selected bank + global + master are trained per bit — never all 4096.
+//! At block boundaries, weights are **decayed** (not reset), preserving learned
+//! structure across the stream.
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
@@ -30,7 +45,7 @@
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
-use crate::model::mixer::LogisticMixer;
+use crate::model::mixer_bank::MixerBank;
 use crate::model::BitModel;
 
 #[cfg(feature = "two_pass")]
@@ -63,6 +78,11 @@ pub const METHOD_BINARY: u8 = 3;
 /// Exec-optimized CM stack (orders 0–2, Sparse, LZP, PPM order-3; no Exec model).
 pub const METHOD_EXEC: u8 = 4;
 
+/// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
+/// weight structure per block boundary, smoothly transferring context without
+/// hard-clearing (which would defeat the 4k-bank specialization).
+const BLOCK_DECAY: f32 = 0.995;
+
 /// Compress `buf` into a `NYX1` container using classifier-aware stacks.
 ///
 /// # Errors
@@ -75,15 +95,17 @@ pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
 /// Compress `buf` using a custom per-block stack builder.
 ///
 /// The builder receives the [`BlockKind`](crate::classify::BlockKind) the classifier
-/// assigned to each block and returns the `(models, mixer)` pair to use. This is the
-/// extension point that classifier-aware selection uses.
+/// assigned to each block and returns the `(models, mixer, lzp_idx)` triple.
+/// `lzp_idx` is the index of the LZP model in `models` (if present), used as the
+/// third input to the master mixer. Returns `(models, mixer, None)` if no LZP
+/// model is in the stack.
 ///
 /// # Errors
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
-    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, LogisticMixer),
+    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
 {
     let mut out = Vec::new();
     let mut entries: Vec<BlockEntry> = Vec::new();
@@ -92,7 +114,8 @@ where
 
     let mut last_kind: Option<crate::classify::BlockKind> = None;
     let mut models: Vec<Box<dyn BitModel>> = Vec::new();
-    let mut mixer = LogisticMixer::new(0);
+    let mut mixer = MixerBank::new(0);
+    let mut lzp_idx: Option<usize> = None;
 
     while offset < buf.len() {
         let block = &buf[offset..];
@@ -102,13 +125,21 @@ where
         let block_data = &buf[offset..end];
 
         if last_kind != Some(kind) {
-            let (new_models, new_mixer) = build_stack(kind);
+            let (new_models, new_mixer, new_lzp_idx) = build_stack(kind);
             models = new_models;
             mixer = new_mixer;
+            lzp_idx = new_lzp_idx;
             last_kind = Some(kind);
         }
 
-        let comp = compress_block(&mut models, &mut mixer, block_data);
+        // Random blocks: store verbatim (method COPY). Don't run CM on
+        // entropy-poor data — the rANS path would inflate and the decoder
+        // treats METHOD_COPY as a passthrough anyway.
+        let comp = if kind == crate::classify::BlockKind::Random {
+            block_data.to_vec()
+        } else {
+            compress_block(&mut models, &mut mixer, lzp_idx, block_data)
+        };
 
         let entry = BlockEntry {
             comp_len: comp.len() as u32,
@@ -119,6 +150,14 @@ where
         entries.push(entry);
         payloads.extend_from_slice(&comp);
         offset = end;
+
+        // Decay (not reset) at block boundaries: preserve learned weight
+        // structure across same-kind blocks in the stream. Skip for copy blocks
+        // (no models were trained, no mixer state to decay) — mirrors the
+        // decoder's `entry.method != METHOD_COPY` guard.
+        if method_for_kind(kind) != METHOD_COPY {
+            mixer.decay(BLOCK_DECAY);
+        }
     }
 
     let header = Header {
@@ -137,7 +176,7 @@ where
 
 fn block_size_for_kind(
     kind: crate::classify::BlockKind,
-    block: &[u8],
+    _block: &[u8],
     offset: usize,
     total: usize,
 ) -> usize {
@@ -166,15 +205,18 @@ pub const fn method_for_kind(kind: crate::classify::BlockKind) -> u8 {
 
 /// Choose the model stack for a block, based on the classifier's `BlockKind`.
 /// Both encode and decode paths call this, so the stacks are guaranteed to be in sync.
+///
+/// Returns `(models, mixer, lzp_idx)` where `lzp_idx` is the index of the LZP
+/// model in `models` (if present).
 #[must_use]
 pub fn build_stack_for_kind(
     kind: crate::classify::BlockKind,
-) -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
     match kind {
         // Random: copy, no models needed (encoder won't call compress_block).
         crate::classify::BlockKind::Random => {
             let models: Vec<Box<dyn BitModel>> = vec![];
-            (models, LogisticMixer::new(0))
+            (models, MixerBank::new(0), None)
         }
         crate::classify::BlockKind::Text => {
             #[cfg(feature = "two_pass")]
@@ -193,7 +235,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::word::WordModel::new()),
                     Box::new(crate::model::ssm::SsmMixer::new()),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(6))
             }
             #[cfg(not(feature = "two_pass"))]
             {
@@ -210,7 +252,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                     Box::new(crate::model::word::WordModel::new()),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(6))
             }
         }
         crate::classify::BlockKind::Binary => {
@@ -228,7 +270,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                     Box::new(crate::model::ssm::SsmMixer::new()),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(5))
             }
             #[cfg(not(feature = "two_pass"))]
             {
@@ -243,7 +285,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::lzp::Lzp::new()),
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(5))
             }
         }
         crate::classify::BlockKind::Exec => {
@@ -260,7 +302,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                     Box::new(crate::model::ssm::SsmMixer::new()),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(4))
             }
             #[cfg(not(feature = "two_pass"))]
             {
@@ -274,7 +316,7 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::lzp::Lzp::new()),
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                 ];
-                (models, LogisticMixer::new(n))
+                (models, MixerBank::new(n), Some(4))
             }
         }
     }
@@ -282,7 +324,7 @@ pub fn build_stack_for_kind(
 
 /// Legacy alias kept for benchmark tooling (`src/stacks.rs`).
 #[must_use]
-pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
     build_stack_for_kind(crate::classify::BlockKind::Binary)
 }
 
@@ -294,24 +336,26 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
 /// Without `two_pass`: plain CM encoding of all bytes.
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
     block: &[u8],
 ) -> Vec<u8> {
     #[cfg(feature = "two_pass")]
     {
         let runs = scan_matches(block);
-        encode_block_with_matches(models, mixer, block, &runs)
+        encode_block_with_matches(models, mixer, lzp_idx, block, &runs)
     }
     #[cfg(not(feature = "two_pass"))]
     {
-        encode_block_plain(models, mixer, block)
+        encode_block_plain(models, mixer, lzp_idx, block)
     }
 }
 
 /// Plain CM encoding (no match side-stream).
 fn encode_block_plain(
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
     block: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -324,6 +368,7 @@ fn encode_block_plain(
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
+    let lzp_conf_default = 2048u16;
 
     for &byte in block {
         for bit_idx in (0..8).rev() {
@@ -332,13 +377,16 @@ fn encode_block_plain(
             for (j, m) in models.iter().enumerate() {
                 probs[j] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
             enc.encode_bit(bit, p);
-            mixer.update(&probs[..n], bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
+        // Feed completed byte to the mixer bank's byte assembler for context.
+        mixer.push_byte(byte);
     }
     out.extend(enc.finish());
     out
@@ -347,7 +395,8 @@ fn encode_block_plain(
 #[cfg(feature = "two_pass")]
 fn encode_block_with_matches(
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
     block: &[u8],
     runs: &[MatchRun],
 ) -> Vec<u8> {
@@ -367,6 +416,7 @@ fn encode_block_with_matches(
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
+    let lzp_conf_default = 2048u16;
 
     for &byte in block {
         for bit_idx in (0..8).rev() {
@@ -375,13 +425,15 @@ fn encode_block_with_matches(
             for (j, m) in models.iter().enumerate() {
                 probs[j] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
             enc.encode_bit(bit, p);
-            mixer.update(&probs[..n], bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
+        mixer.push_byte(byte);
     }
     out.extend(enc.finish());
     out
@@ -434,15 +486,16 @@ fn decode_block(
     comp: &[u8],
     orig_len: usize,
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
     #[cfg(feature = "two_pass")]
     {
-        decode_block_with_matches(comp, orig_len, models, mixer)
+        decode_block_with_matches(comp, orig_len, models, mixer, lzp_idx)
     }
     #[cfg(not(feature = "two_pass"))]
     {
-        decode_block_plain(comp, orig_len, models, mixer)
+        decode_block_plain(comp, orig_len, models, mixer, lzp_idx)
     }
 }
 
@@ -450,13 +503,14 @@ fn decode_block_plain(
     comp: &[u8],
     orig_len: usize,
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
-    let mut dec = BitDecoder::new(comp)
-        .map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
+    let lzp_conf_default = 2048u16;
 
     while out.len() < orig_len {
         let mut byte = 0u8;
@@ -465,11 +519,12 @@ fn decode_block_plain(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs[..n], bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -478,6 +533,7 @@ fn decode_block_plain(
             }
         }
         out.push(byte);
+        mixer.push_byte(byte);
     }
     Ok(out)
 }
@@ -487,10 +543,13 @@ fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
     models: &mut [Box<dyn BitModel>],
-    mixer: &mut LogisticMixer,
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
     if comp.len() < 4 {
-        return Err(NyxError::InvalidContainer("match side-stream too short".into()));
+        return Err(NyxError::InvalidContainer(
+            "match side-stream too short".into(),
+        ));
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
@@ -501,11 +560,11 @@ fn decode_block_with_matches(
         offset += 5;
     }
 
-    let mut dec = BitDecoder::new(&comp[offset..])
-        .map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
+    let lzp_conf_default = 2048u16;
 
     while out.len() < orig_len {
         let mut byte = 0u8;
@@ -514,11 +573,12 @@ fn decode_block_with_matches(
             for (i, m) in models.iter().enumerate() {
                 probs[i] = m.predict();
             }
-            let p = mixer.mix(&probs[..n], bit_pos);
+            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs[..n], bit, bit_pos);
+            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -527,11 +587,12 @@ fn decode_block_with_matches(
             }
         }
         out.push(byte);
+        mixer.push_byte(byte);
     }
     Ok(out)
 }
 
-/// Decompress a `NYF1` container back to the original bytes.
+/// Decompress a `NYX1` container back to the original bytes.
 ///
 /// # Errors
 ///
@@ -563,7 +624,8 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0usize;
     let mut last_kind: Option<crate::classify::BlockKind> = None;
     let mut models: Vec<Box<dyn BitModel>> = Vec::new();
-    let mut mixer = LogisticMixer::new(0);
+    let mut mixer = MixerBank::new(0);
+    let mut lzp_idx: Option<usize> = None;
     for (bi, entry) in entries.iter().enumerate() {
         let comp = &payloads[pos..pos + entry.comp_len as usize];
         pos += entry.comp_len as usize;
@@ -573,17 +635,23 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
         } else {
             let kind = kind_for_method(entry.method)?;
             if last_kind != Some(kind) {
-                let (new_models, new_mixer) = build_stack_for_kind(kind);
+                let (new_models, new_mixer, new_lzp_idx) = build_stack_for_kind(kind);
                 models = new_models;
                 mixer = new_mixer;
+                lzp_idx = new_lzp_idx;
                 last_kind = Some(kind);
             }
-            decode_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(
-                |e| match e {
-                    NyxError::Entropy(s) => NyxError::CorruptBlock(s),
-                    other => other,
-                },
-            )?
+            decode_block(
+                comp,
+                entry.orig_len as usize,
+                &mut models,
+                &mut mixer,
+                lzp_idx,
+            )
+            .map_err(|e| match e {
+                NyxError::Entropy(s) => NyxError::CorruptBlock(s),
+                other => other,
+            })?
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -594,6 +662,11 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
             ));
         }
         out.extend_from_slice(&block);
+
+        // Decay at block boundaries (mirrors compressor).
+        if entry.method != METHOD_COPY {
+            mixer.decay(BLOCK_DECAY);
+        }
     }
     Ok(out)
 }
@@ -622,7 +695,7 @@ mod tests {
     /// A ~200 KB mixed fixture: text + JSON + a binary blob + an ELF-like byte pattern.
     fn mixed_fixture() -> Vec<u8> {
         let mut v = Vec::new();
-        let text = b"the quick brown fox jumps over the lazy dog. \
+        let text = b"the quick brown fox jumps over the lazy dog. \\\
             compression mixes many context models so that each bit is predicted well. ";
         for _ in 0..2000 {
             v.extend_from_slice(text);

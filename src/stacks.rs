@@ -5,7 +5,7 @@
 
 use crate::model::exec::Exec;
 use crate::model::lzp::Lzp;
-use crate::model::mixer::LogisticMixer;
+use crate::model::mixer_bank::MixerBank;
 use crate::model::order::OrderN;
 use crate::model::ppm::PpmModel;
 use crate::model::sparse::Sparse;
@@ -19,7 +19,7 @@ pub struct HybridPpm3Builder;
 
 impl BaselineBuilder {
     #[must_use]
-    pub fn build() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+    pub fn build() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
         crate::codec::build_full_stack()
     }
 }
@@ -31,26 +31,26 @@ impl PpmBuilder {
     }
 
     #[must_use]
-    pub fn build(&self) -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+    pub fn build(&self) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
         let models: Vec<Box<dyn BitModel>> = vec![Box::new(PpmModel::new(self.max_order))];
-        let mixer = LogisticMixer::new(models.len());
-        (models, mixer)
+        let mixer = MixerBank::new(models.len());
+        (models, mixer, None)
     }
 }
 
 impl HybridPpm3Builder {
     #[must_use]
-    pub fn build() -> (Vec<Box<dyn BitModel>>, LogisticMixer) {
+    pub fn build() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
         let models: Vec<Box<dyn BitModel>> = vec![
             Box::new(OrderN::new(0)),
             Box::new(OrderN::new(1)),
             Box::new(OrderN::new(2)),
             Box::new(Sparse::new()),
-            Box::new(Lzp::new()),
             Box::new(Exec::new()),
+            Box::new(Lzp::new()),
             Box::new(PpmModel::new(3)),
         ];
-        let mixer = LogisticMixer::new(models.len());
-        (models, mixer)
+        let mixer = MixerBank::new(models.len());
+        (models, mixer, Some(5))
     }
 }

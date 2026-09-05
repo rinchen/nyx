@@ -155,6 +155,10 @@ impl LogisticMixer {
     }
 
     /// Reset weights to initial state (called at block boundaries).
+    ///
+    /// NOTE: Prefer `decay` for cross-block continuity — it shrinks weights
+    /// toward their init value (1.0) instead of hard-clearing, preserving
+    /// learned structure across block boundaries.
     pub fn reset(&mut self) {
         self.weights.fill(1.0);
         for pw in &mut self.pos_weights {
@@ -165,6 +169,26 @@ impl LogisticMixer {
         self.adam_m.fill(0.0);
         self.adam_v.fill(0.0);
         self.lr = 0.02;
+    }
+
+    /// Decay all learned weights toward their init values by `factor`.
+    ///
+    /// Base weights decay toward 1.0, pos_weights decay toward 0.0.
+    /// `weight = init + (weight - init) * f`
+    ///
+    /// A factor of 0.0 restores init; 1.0 leaves unchanged. This preserves
+    /// learned structure across block boundaries without hard-clearing, which
+    /// would throw away the per-context weight vectors that the 4096-bank
+    /// hierarchy depends on.
+    pub fn decay(&mut self, factor: f32) {
+        for w in &mut self.weights {
+            *w = 1.0 + (*w - 1.0) * factor;
+        }
+        for pw in &mut self.pos_weights {
+            for dw in pw.iter_mut() {
+                *dw = 0.0 + (*dw - 0.0) * factor;
+            }
+        }
     }
 
     #[inline]
