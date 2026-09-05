@@ -69,14 +69,7 @@ pub const METHOD_EXEC: u8 = 4;
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
-    #[cfg(feature = "two_pass")]
-    {
-        compress_with(buf, &mut build_stack_for_kind)
-    }
-    #[cfg(not(feature = "two_pass"))]
-    {
-        compress_with(buf, &mut build_stack_for_kind)
-    }
+    compress_with(buf, &mut build_stack_for_kind)
 }
 
 /// Compress `buf` using a custom per-block stack builder.
@@ -459,7 +452,8 @@ fn decode_block_plain(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut LogisticMixer,
 ) -> Result<Vec<u8>> {
-    let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(comp)
+        .map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -496,9 +490,7 @@ fn decode_block_with_matches(
     mixer: &mut LogisticMixer,
 ) -> Result<Vec<u8>> {
     if comp.len() < 4 {
-        return Err(NyxError::InvalidContainer(
-            "match side-stream too short".into(),
-        ));
+        return Err(NyxError::InvalidContainer("match side-stream too short".into()));
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
@@ -509,7 +501,8 @@ fn decode_block_with_matches(
         offset += 5;
     }
 
-    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(&comp[offset..])
+        .map_err(|e| NyxError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -585,12 +578,12 @@ fn decompress_impl(data: &[u8]) -> Result<Vec<u8>> {
                 mixer = new_mixer;
                 last_kind = Some(kind);
             }
-            decode_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(|e| {
-                match e {
+            decode_block(comp, entry.orig_len as usize, &mut models, &mut mixer).map_err(
+                |e| match e {
                     NyxError::Entropy(s) => NyxError::CorruptBlock(s),
                     other => other,
-                }
-            })?
+                },
+            )?
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -723,7 +716,6 @@ mod tests {
 
     #[test]
     fn json_round_trips() {
-        // Verify the word model produces correct round-trips on structured text.
         let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
         let original: Vec<u8> = std::iter::repeat(json.as_ref())
             .take(4000)

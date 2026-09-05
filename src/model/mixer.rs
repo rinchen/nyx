@@ -58,9 +58,17 @@ fn squash_table() -> &'static [u16; 4096] {
 pub struct LogisticMixer {
     weights: Vec<f32>,
     lr: f32,
+    lr_scales: Vec<f32>,
     // Per (model, bit_position) weight deltas. `bit_pos` ∈ [0,7].
     // The effective weight for model `i` at bit position `b` is `base[i] + pos_weights[i][b]`.
     pos_weights: Vec<[f32; 8]>,
+    // Adam state for base weights.
+    adam_m: Vec<f32>,
+    adam_v: Vec<f32>,
+    adam_t: u32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
 }
 
 impl LogisticMixer {
@@ -76,16 +84,63 @@ impl LogisticMixer {
             // blocks. Positive weights also keep the mix grounded in the models'
             // evidence rather than the prior.
             weights: vec![1.0; n],
+            // All models start with lr_scale=1.0 (SGD).
+            lr_scales: vec![1.0; n],
             // Position deltas start at 0 so the initial mix is identical to the
             // non-context-aware version (pure 1.0 base weights).
             pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
             lr: 0.02,
+            // Adam state initialized in new_adam; zeroed here for plain SGD.
+            adam_m: vec![0.0; n],
+            adam_v: vec![0.0; n],
+            adam_t: 0,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        }
+    }
+
+    /// Create a mixer with Adam optimizer (adaptive per-weight learning rates).
+    /// Base weights use Adam; per-bit-position deltas use plain SGD.
+    #[must_use]
+    pub fn new_adam(n: usize, lr: f32) -> Self {
+        Self {
+            weights: vec![1.0; n],
+            lr_scales: vec![1.0; n],
+            pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
+            lr,
+            adam_m: vec![0.0; n],
+            adam_v: vec![0.0; n],
+            adam_t: 0,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
         }
     }
 
     /// Set the learning rate (default 0.02).
     pub const fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    /// Set per-model learning rate scale. Index corresponds to model position in the stack.
+    pub fn set_lr_scale(&mut self, idx: usize, scale: f32) {
+        if idx < self.lr_scales.len() {
+            self.lr_scales[idx] = scale;
+        }
+    }
+
+    /// Set all per-model learning rate scales.
+    pub fn set_lr_scales(&mut self, scales: Vec<f32>) {
+        if scales.len() == self.lr_scales.len() {
+            self.lr_scales = scales;
+        }
+    }
+
+    /// Return a copy of the per-model learning rate scales.
+    #[must_use]
+    pub fn lr_scales(&self) -> Vec<f32> {
+        self.lr_scales.clone()
     }
 
     /// Replace base weights. Keeps per-bit-position deltas unchanged.
@@ -105,6 +160,10 @@ impl LogisticMixer {
         for pw in &mut self.pos_weights {
             pw.fill(0.0);
         }
+        self.lr_scales.fill(1.0);
+        self.adam_t = 0;
+        self.adam_m.fill(0.0);
+        self.adam_v.fill(0.0);
         self.lr = 0.02;
     }
 
@@ -135,6 +194,8 @@ impl LogisticMixer {
     }
 
     /// Online update after the true `bit` is known.
+    ///
+    /// Base weights use Adam when `adam_t > 0`; pos_weights always use SGD.
     pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8) {
         let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
@@ -145,9 +206,29 @@ impl LogisticMixer {
         }
         let pred = 1.0 / (1.0 + (-acc).exp());
         let err = target - pred;
+
         for (i, &p) in probs.iter().enumerate() {
-            self.weights[i] += self.lr * err * self.stretch_of(p);
-            self.pos_weights[i][b] += self.lr * err * self.stretch_of(p);
+            let scale = self.lr_scales[i];
+            let grad = self.lr * scale * err * self.stretch_of(p);
+
+            if self.adam_t > 0 {
+                // Adam update for base weights.
+                self.adam_m[i] = self.beta1 * self.adam_m[i] + (1.0 - self.beta1) * grad;
+                self.adam_v[i] = self.beta2 * self.adam_v[i] + (1.0 - self.beta2) * grad * grad;
+                let m_hat = self.adam_m[i] / (1.0 - self.beta1.powi(self.adam_t as i32));
+                let v_hat = self.adam_v[i] / (1.0 - self.beta2.powi(self.adam_t as i32));
+                self.weights[i] += m_hat / (v_hat.sqrt() + self.eps);
+            } else {
+                // Plain SGD.
+                self.weights[i] += grad;
+            }
+
+            // Per-bit-position deltas always use SGD.
+            self.pos_weights[i][b] += grad;
+        }
+
+        if self.adam_t > 0 {
+            self.adam_t = self.adam_t.saturating_add(1);
         }
     }
 }
