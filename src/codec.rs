@@ -4,14 +4,12 @@
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
 //! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
-//!   Exec, LazyLzp, PpmModel order-3, WordModel.
+//!   Exec, LazyLzp, PpmModel order-3, WordModel + SsmMixer.
 //! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec, LZP,
-//!   PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
-//!   benefits from every signal.
+//!   PPM order-3) + SsmMixer.
 //! - `Exec` blocks (method 4) use a stack without the `Exec` model (redundant on
 //!   already-classified machine code) but keep orders 0–2, Sparse, LZP, PPM order-3
-//!   — binary structure plus higher-order context matches better than byte-pattern
-//!   detection on known code.
+//!   + SsmMixer.
 //! - Fallback / unknown (method 1) is the full heterogeneous stack, identical to the
 //!   original CM path. This is also the decoder default for any future method value,
 //!   so old streams remain valid.
@@ -39,6 +37,7 @@ use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
 use crate::model::lzp::Lzp;
 use crate::model::mixer::LogisticMixer;
+use crate::model::ssm::SsmMixer;
 use crate::model::BitModel;
 
 /// Minimum match length to emit as an explicit record (vs. letting CM model it).
@@ -318,6 +317,12 @@ fn encode_block_with_matches(
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
+    // Pre-build per-block dictionaries (e.g. Byte-Pair Re-Pair) for models
+    // that override `prepare_block`.
+    for m in models.iter_mut() {
+        m.prepare_block(block);
+    }
+
     // Match side-stream
     out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
     for r in runs {
@@ -326,12 +331,6 @@ fn encode_block_with_matches(
     }
 
     // Stage 1: CM-encode ALL bytes (residual = full block).
-    // Pre-build per-block dictionaries (e.g. Byte-Pair Re-Pair) for models
-    // that override `prepare_block`.
-    for m in models.iter_mut() {
-        m.prepare_block(block);
-    }
-
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -340,8 +339,8 @@ fn encode_block_with_matches(
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1 == 1;
             let bit_pos = bit_idx as u8;
-            for (i, m) in models.iter().enumerate() {
-                probs[i] = m.predict();
+            for (j, m) in models.iter().enumerate() {
+                probs[j] = m.predict();
             }
             let p = mixer.mix(&probs[..n], bit_pos);
             enc.encode_bit(bit, p);
@@ -649,6 +648,9 @@ mod tests {
             .collect();
         let comp = compress(&original).expect("compress");
         let back = decompress(&comp).expect("decompress");
-        assert_eq!(back, original, "JSON round-trip mismatch with SSM + Re-Pair");
+        assert_eq!(
+            back, original,
+            "JSON round-trip mismatch with SSM + Re-Pair"
+        );
     }
 }
