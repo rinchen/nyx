@@ -61,7 +61,7 @@ There is also `scripts/bench_vs_sota.sh <corpus_dir>` which times nyx against
 > in MB/s (higher is better). See [BENCH.md](BENCH.md) for the full
 > zstd-1 / zstd-19 / FSE comparison and before/after optimization tables.
 
-### Current (post SSE/APM/APM2 cascade + cross-block persistence + real 4MB LDM window; 55 tests, clippy clean)
+### Current (post SSE/APM/APM2 cascade + cross-block persistence + real 4MB LDM window; 62 tests, clippy warning-free)
 
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -112,14 +112,14 @@ secondary.
 | Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
 | Literal bypass hint model (high-entropy byte bypass) | mr, dickens, json, webster, nci | regressed dickens 56.3%→57.1% | reverted |
 | **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | **kept as default** |
-| Context-selected mixer banks (4k mixers, byte-class + context hash) | mr, dickens, json, webster, nci | in progress | WIP commit; blocked on mixer reset not clearing weights |
+| Context-selected mixer banks (4k mixers, byte-class + context hash) | mr, dickens, json, webster, nci | neutral | implemented and tested; not adopted in default stacks — 4k mixers add ~1.1 MB memory for neutral ratio on 5-file subset | kept in-tree (not on default path)
 | **Indirect context + DMC models** (table[hash(o2)]→last byte, predict via hash(indirect,o1)) | mr, dickens, json, webster, nci | regressed dickens +0.7pt, webster +0.4pt; json improved | reverted due to perf cost on large files |
 | **Cross-block persistence + real 4MB LDM window** (reuse model/mixer state across same-kind blocks; 4MB LZP hash chains) | json, mr, dickens, nci, webster | **improved**: json 5.5%→3.9%, mr 28.6%→27.3%, dickens 56.0%→51.7%, nci 26.6%→20.9%, webster 50.4%→45.1% | **kept as default** |
 | LZP ring buffer performance fix (O(n) drain→O(1) ring) | all files | performance fix, no ratio change | kept |
 | Micro SSM mixer (16-dim recurrent state replacing logistic mixer) | json, mr | **regressed**: json 3.9%→10.7%, mr 27.3%→37.2% | reverted; SSM too large for 64KB blocks, gradient issues |
 | **Two-pass CM residual v2** (≥8-byte match threshold + residual-only CM, interleaved decoder scan) | mr, dickens, json, webster, nci | **scaffold complete (Stage 1)**, Stage 2 blocked on decoder state synchronization | match side-stream (5-byte len+dist records) committed; full-block CM passthrough validates on all 5 files (65/65 tests) — residual-skip decode reverts to Stage 1 after round-trip failure (see commit 217a5d2). NOTE: Stage 1 scaffolding with live match pre-pass causes **regression** on nci (+12.4pt) and webster (+12.5pt) — match overhead exceeds CM benefit at 64 KiB block size. **Feature-gated** behind `cargo test --features two_pass`; off by default |
 | **Micro SSM mixer** (8-dim recurrent state as additional base model + Byte-Pair Re-Pair word model) | mr, dickens, json, webster, nci | **complete** → **reverted (net regression)** | 65/65 tests pass; round-trip verified; BUT measured on 5-file subset: nci 20.9%→33.3%, webster 45.1%→57.6%, mr 27.3%→29.2%, dickens 51.7%→54.9%, json 3.9%→5.7%. SSM/Byte-Pair models add prediction overhead without ratio gain on these corpora. **Feature-gated** behind `cargo test --features two_pass`; off by default |
-| **Second-order mixer training** (Adam + per-model lr_scale; LZP learns 10× faster) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | Adam tested at lr=0.01: dickens 51.7%→51.4%, mr 27.3%→27.6%, json 3.9%→4.1%. SGD + lr_scale identical to baseline. Neither improves the default SGD path; `LogisticMixer::new_adam()` kept in-tree for future use. |kept as default
+| **Second-order mixer training** (Adam + per-model lr_scale; LZP learns 10× faster) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | Adam tested at lr=0.01: dickens 51.7%→51.4%, mr 27.3%→27.6%, json 3.9%→4.1%. SGD + lr_scale identical to baseline. Neither improves the default SGD path; `LogisticMixer::new_adam()` kept in-tree for future use. | kept as default |
 
 Current best configuration is **hybrid_ppm3 + per-bit-position logistic mix + classifier-aware
 method bytes + word model (text blocks only) + SSE/APM/APM2 cascade + LazyLzp (neutral) + cross-block persistence + 4MB LZP window**.
