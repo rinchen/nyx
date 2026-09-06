@@ -208,13 +208,25 @@ impl LogisticMixer {
     #[must_use]
     #[inline(always)]
     pub fn mix(&self, probs: &[u16], bit_pos: u8) -> u16 {
+        self.mix_acc(probs, bit_pos).1
+    }
+
+    /// Compute the logistic accumulator AND the squashed probability in one pass.
+    ///
+    /// Returns `(acc, q)` with `acc = Σ w_i·stretch(p_i)` (pre-squash) and `q`
+    /// the squashed probability in `[1,4095]`. The caller that is about to call
+    /// [`update`](Self::update) for the *same* (`probs`, `bit_pos`) can reuse the
+    /// returned `acc` instead of letting `update` recompute the dot product.
+    #[must_use]
+    #[inline(always)]
+    pub fn mix_acc(&self, probs: &[u16], bit_pos: u8) -> (f32, u16) {
         let b = usize::from(bit_pos.min(7));
         let mut acc = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
             let w = self.weights[i] + self.pos_weights[i][b];
             acc += w * self.stretch_of(p);
         }
-        self.squash_of(acc)
+        (acc, self.squash_of(acc))
     }
 
     /// Online update after the true `bit` is known.
@@ -226,13 +238,16 @@ impl LogisticMixer {
     /// mixer's output into a higher-level mixer (the master) can then reuse `q`
     /// instead of re-mixing — the entire prediction is a single dot product.
     pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8) -> u16 {
+        let acc = self.mix_acc(probs, bit_pos).0;
+        self.update_from_acc(probs, bit, bit_pos, acc)
+    }
+
+    /// Same as [`update`](Self::update), but the logistic accumulator `acc`
+    /// (from [`mix_acc`](Self::mix_acc) with the same inputs) is supplied by the
+    /// caller so the dot product is not recomputed a second time.
+    pub fn update_from_acc(&mut self, probs: &[u16], bit: bool, bit_pos: u8, acc: f32) -> u16 {
         let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
-        let mut acc = 0.0f32;
-        for (i, &p) in probs.iter().enumerate() {
-            let w = self.weights[i] + self.pos_weights[i][b];
-            acc += w * self.stretch_of(p);
-        }
         // pred from the precomputed squash table — no exp() in the hot loop.
         let q = self.squash_of(acc);
         let pred = f32::from(q) / 4095.0;

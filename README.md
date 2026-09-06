@@ -164,6 +164,8 @@ secondary.
  | **DP parse O(n·window) fix** (`Lzp::best_match` returns `(len, dist)` directly from the hash-chain walk; removed the per-position O(window) backward re-scan `find_match_with_len`) | two_pass | kills the pathological worst case on large text blocks | **kept** |
  | **Speed pass #2 — byte-level "fast" path** (`--mode fast`; `src/bytecodec.rs` PPM-style single-context count coder: deterministic order-0/1/2 selector + fused 256-symbol cumulative `walk_dist` + byte rANS in `src/entropy/byterans.rs`; no mixer/softmax) | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** (fast 1.15s/0.279x vs slow 2.97s/0.470x; round-trip verified; full suite 118/118 green incl. exact-triple `walk_roundtrip_exact`). Note: byte models (trained on transformed streams) beat the text-builtin bit models here — as predicted for CM after BWT+MTF | **new default `--mode fast`**, slow path retained as `--mode slow` |
 
+| **Speed pass #3 — single-pass acc-merge in the mixers** (`MixerBank::mix_acc`/`update_acc`/`mix_and_update` + `LogisticMixer::mix_acc`/`update_from_acc`: each dot product computed once per bit and re-used across mix/update across the bank → global → master chain; encode side fuses mix→rANS→SGD in one call) | dickens 2MB (slow) | **~10% encode speedup, bit-identical output, ratio flat** (3.28s→2.97s user; output `cmp`-identical to pass #2; 118/118 tests). Also tested and **reverted**: fixed-point i16 mixer (Q8 weights/Q10 stretch, i64 dot) → ratio +0.8pt and no speed — integer round-off per step loses small SGD gradients. Float + stretch bucket arrays kept | **kept as default** |
+
 Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
 method bytes + word model (text blocks only) + cross-block decay persistence + 4MB LZP
 window + BWT text trial with fast-path heuristics + parallel trial + JSON stream splitting (method 7) +
@@ -173,6 +175,7 @@ Two-pass: additional gains on dickens (41.9%), webster (31.4%), nci (8.2%), huge
 Build and tests green (106/106 default, 109/109 with two_pass).
 Speed pass #1 (LazyLzp removal + trial fast-path + parallel trial + mixer math): **~3× faster encode on text, ratio flat**.
 Speed pass #2 (byte-level fast path, PPM-style count coder + byte rANS, no mixer): **~2.6× faster than slow on dickens 2MB with ~1.7× better ratio on BWT+MTF streams**.
+Speed pass #3 (single-pass acc-merge across the bank → global → master mixer chain): **~10% faster slow-path encode, bit-identical output, ratio flat**. Fixed-point i16 mixer attempted and reverted (ratio +0.8pt, no speed win).
 
 ## Speed roadmap (2026-09)
 
@@ -183,8 +186,7 @@ than the bit path on dickens 2MB with a much better ratio on BWT+MTF streams.
 
 Planned next steps (slow `--mode slow` path still dominates on some inputs):
 
-1. **Fixed-point mixer** (i16 weights + precomputed stretch/squash; AVX2 `_mm256_madd_epi16` dot with
-   scalar fallback) to cut the remaining f64 division + float FMA cost in the mixers.
+1. ~~Fixed-point mixer~~ **attempted and reverted** — integer round-off per SGD step loses small gradients (ratio +0.8pt) with no measurable speed win. Remaining slow-path micro-options: SoA weight layout for the 4096 banks (contiguous fetch instead of per-bank Vec pointer-chase) and stretch-value reuse (carry stretch bucket lookups through `MixerAcc`); both bit-identical and ratio-neutral.
 2. **Interleaved byte rANS** (32-way, 2KB state buffers) to replace the scalar
    single-stream rANS state step in the fast path.
 3. **Wider refrain/context tuning for the fast path** — measure the corpus files

@@ -484,6 +484,7 @@ fn encode_block_plain(
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
     let lzp_conf_default = 2048u16;
+    let mut enc_bit = |bit: bool, p: u16| enc.encode_bit(bit, p);
 
     for &byte in block {
         for bit_idx in (0..8).rev() {
@@ -493,9 +494,7 @@ fn encode_block_plain(
                 probs[j] = m.predict();
             }
             let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
-            enc.encode_bit(bit, p);
-            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+            mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut enc_bit);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -545,6 +544,7 @@ fn encode_block_with_matches(
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
     let lzp_conf_default = 2048u16;
+    let mut enc_bit = |bit: bool, p: u16| enc.encode_bit(bit, p);
 
     // Helper closure: feed a byte through models+mixer WITHOUT rANS encoding.
     // Used for matched bytes — they must update context state but not produce
@@ -587,9 +587,7 @@ fn encode_block_with_matches(
                     probs[j] = m.predict();
                 }
                 let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-                let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
-                enc.encode_bit(bit, p);
-                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut enc_bit);
                 for m in models.iter_mut() {
                     m.update(bit);
                 }
@@ -743,11 +741,11 @@ fn decode_block_plain(
                 probs[i] = m.predict();
             }
             let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
+            let (p, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
             let bit = dec
                 .decode_bit(p)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+            mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -848,11 +846,11 @@ fn decode_block_with_matches(
                     probs[j] = m.predict();
                 }
                 let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-                let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
+                let (p, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
                 let bit = dec
                     .decode_bit(p)
                     .map_err(|e| NyxError::Entropy(e.to_string()))?;
-                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
                 for m in models.iter_mut() {
                     m.update(bit);
                 }

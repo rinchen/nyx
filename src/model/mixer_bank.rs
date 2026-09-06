@@ -74,6 +74,20 @@ pub fn mixer_id(
     ((class_bits << 9) | (bp << 6) | (o1 << 4) | (o2 << 2) | wh) & 0xFFF
 }
 
+/// Reusable per-bit accumulator state from [`MixerBank::mix_acc`].
+///
+/// Carries the three dot products (bank / global / master) plus the squashed
+/// bank/global probabilities, so [`MixerBank::update_acc`] can run the SGD
+/// updates without recomputing them. `bit` is unknown until after rANS decode,
+/// so the hot loops split each bit into `mix_acc` → rANS step → `update_acc`.
+#[derive(Clone, Copy)]
+pub struct MixerAcc {
+    acc_bank: f32,
+    acc_global: f32,
+    acc_master: f32,
+    master_probs: [u16; 3],
+}
+
 /// Two-level mixer: 4096 bank mixers + a global mixer + a master mixer.
 ///
 /// - `mixers`: context-specific bank selected by `mixer_id`. Only the selected
@@ -154,11 +168,65 @@ impl MixerBank {
     #[must_use]
     #[inline(always)]
     pub fn mix(&self, probs: &[u16], bit_pos: u8, lzp_conf: u16) -> u16 {
+        self.mix_acc(probs, bit_pos, lzp_conf).0
+    }
+
+    /// Single-pass mix: compute the master prediction AND the per-mixer
+    /// accumulators for reuse by [`update_acc`](Self::update_acc).
+    ///
+    /// Returns `(master_prediction, acc)` where `acc` holds the bank/global/
+    /// master dot products computed here with the *pre-update* weights. The
+    /// caller runs its rANS step on `master_prediction`, then calls
+    /// [`update_acc`](Self::update_acc) with `acc` — avoiding a second set of
+    /// dot products per bit (previously `mix` then `update` recomputed them).
+    #[must_use]
+    #[inline(always)]
+    pub fn mix_acc(&self, probs: &[u16], bit_pos: u8, lzp_conf: u16) -> (u16, MixerAcc) {
         let bank_id = self.current_bank_id(bit_pos);
-        let p_bank = self.mixers[bank_id].mix(probs, bit_pos);
-        let p_global = self.global_mixer.mix(probs, bit_pos);
-        // Master blends bank + global + lzp confidence.
-        self.master_mixer.mix(&[p_bank, p_global, lzp_conf], 0)
+        let (acc_bank, q_bank) = self.mixers[bank_id].mix_acc(probs, bit_pos);
+        let (acc_global, q_global) = self.global_mixer.mix_acc(probs, bit_pos);
+        let master_probs = [q_bank, q_global, lzp_conf];
+        let (acc_master, p) = self.master_mixer.mix_acc(&master_probs, 0);
+        (
+            p,
+            MixerAcc {
+                acc_bank,
+                acc_global,
+                acc_master,
+                master_probs,
+            },
+        )
+    }
+
+    /// Train the selected bank, the global mixer, and the master using the
+    /// accumulators from [`mix_acc`](Self::mix_acc) with the same inputs.
+    ///
+    /// Identical to `update` but reuses the precomputed (`acc_bank`,
+    /// `acc_global`, `acc_master`) rather than recomputing the dot products.
+    #[inline(always)]
+    pub fn update_acc(&mut self, probs: &[u16], bit: bool, bit_pos: u8, acc: MixerAcc) {
+        let bank_id = self.current_bank_id(bit_pos);
+        self.mixers[bank_id].update_from_acc(probs, bit, bit_pos, acc.acc_bank);
+        self.global_mixer.update_from_acc(probs, bit, bit_pos, acc.acc_global);
+        self.master_mixer
+            .update_from_acc(&acc.master_probs, bit, 0, acc.acc_master);
+    }
+
+/// Encoder-side single call: mix, run the encoded bit against the fused
+    /// prediction via `encode`, then train all three mixers in one pass.
+    ///
+    /// The bit is known at encode time, so the acc can be fed straight through.
+    pub fn mix_and_update(
+        &mut self,
+        probs: &[u16],
+        bit: bool,
+        bit_pos: u8,
+        lzp_conf: u16,
+        encode: &mut impl FnMut(bool, u16),
+    ) {
+        let (p, acc) = self.mix_acc(probs, bit_pos, lzp_conf);
+        encode(bit, p);
+        self.update_acc(probs, bit, bit_pos, acc);
     }
 
     /// Train the selected bank mixer, the global mixer, and the master mixer.
