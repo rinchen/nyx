@@ -82,9 +82,9 @@ pub fn mixer_id(
 /// so the hot loops split each bit into `mix_acc` → rANS step → `update_acc`.
 #[derive(Clone, Copy)]
 pub struct MixerAcc {
-    acc_bank: f32,
-    acc_global: f32,
-    acc_master: f32,
+    acc_bank: i64,
+    acc_global: i64,
+    acc_master: i64,
     master_probs: [u16; 3],
 }
 

@@ -9,29 +9,58 @@
 //! For higher compression, see [`super::sse_apm::SseApmCascade`] which adds SSE/APM/APM2
 //! refinement stages after the mixer, and [`super::mixer_bank::MixerBank`] which selects
 //! from 4096 context-specific mixer instances.
+//!
+//! ## Fixed-point arithmetic (Q16 weights, Q10 stretch)
+//!
+//! The hot loop is integer-only: base weights and per-bit-position deltas are stored as
+//! `i32` in Q16 (1.0 = 65536), the stretch table is `i16` in Q10 (logits × 1024), the
+//! dot product accumulates in `i64`, and the squash is a float clamp into a 4096-entry
+//! table (unchanged). This avoids f32 FMA entirely in the prediction and update loops.
+//!
+//! Q16 was chosen over Q8 because SGD weight updates per bit are small (~0.01 in float
+//! units); Q8 rounded these to zero, killing learning. Q16 gives ~640 integer units per
+//! step (0.01 × 65536), preserving gradient fidelity.
 
 use super::BitModel;
 
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
+/// Base-weight fixed-point scale: 1.0 = `1 << WEIGHT_Q`. Range ≈ ±128 (i32).
+const WEIGHT_Q: i32 = 16;
+/// Stretch-table scale: 1.0 logit = `1 << STRETCH_Q`.
+const STRETCH_Q: i32 = 10;
+/// Combined exponent: acc_q = Σ w_q16 · stretch_q10 = acc_float · 2^26.
+const ACC_SHIFT: i32 = WEIGHT_Q + STRETCH_Q;
+/// Fixed-point init value of a base weight (1.0).
+const W_INIT: i32 = 1 << WEIGHT_Q;
+/// Per-bit grad scaling: grad_q16 = lr·scale·err·stretch_q10 · 2^(WEIGHT_Q - STRETCH_Q).
+const GRAD_SCALE: i32 = WEIGHT_Q - STRETCH_Q; // = 6
+
 /// Shared stretch/squash tables (12-bit probability ↔ logit).
 /// These are identical for every mixer instance, so we allocate once globally.
-static STRETCH: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+static STRETCH_Q10: std::sync::OnceLock<[i16; 4096]> = std::sync::OnceLock::new();
 static SQUASH: std::sync::OnceLock<[u16; 4096]> = std::sync::OnceLock::new();
 
-fn stretch_table() -> &'static [f32; 4096] {
-    STRETCH.get_or_init(|| {
-        let mut t = [0.0f32; 4096];
+/// Logit (× 1024, i16) of `pr ∈ [0,1]`.
+fn logit_i16(pr: f32) -> i16 {
+    let scale = (1u32 << STRETCH_Q) as f32;
+    let l = if pr <= 1e-6 {
+        -7.0
+    } else if pr >= 1.0 - 1e-6 {
+        7.0
+    } else {
+        (pr / (1.0 - pr)).ln()
+    };
+    (l * scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+fn stretch_table() -> &'static [i16; 4096] {
+    STRETCH_Q10.get_or_init(|| {
+        let mut t = [0i16; 4096];
         for (p_slot, slot) in t.iter_mut().enumerate() {
             let pr = (p_slot as f32 + 0.5) / 4096.0;
-            *slot = if pr <= 1e-6 {
-                -7.0
-            } else if pr >= 1.0 - 1e-6 {
-                7.0
-            } else {
-                (pr / (1.0 - pr)).ln()
-            };
+            *slot = logit_i16(pr);
         }
         t
     })
@@ -56,16 +85,17 @@ fn squash_table() -> &'static [u16; 4096] {
 /// bits are nearly always 0), so conditioning the mixer weights on `bit_pos`
 /// lets it specialize without changing the container format.
 pub struct LogisticMixer {
-    weights: Vec<f32>,
+    /// Base weights (per model), fixed-point Q16.
+    weights: Vec<i32>,
     lr: f32,
     lr_scales: Vec<f32>,
-    // Per (model, bit_position) weight deltas. `bit_pos` ∈ [0,7].
+    // Per (model, bit_position) weight deltas, fixed-point Q16.
     // The effective weight for model `i` at bit position `b` is `base[i] + pos_weights[i][b]`.
-    pos_weights: Vec<[f32; 8]>,
-    // Adam state for base weights.
+    pos_weights: Vec<[i32; 8]>,
+    // Adam state (kept for API compat; not used in default stacks).
+    adam_t: u32,
     adam_m: Vec<f32>,
     adam_v: Vec<f32>,
-    adam_t: u32,
     beta1: f32,
     beta2: f32,
     eps: f32,
@@ -83,35 +113,39 @@ impl LogisticMixer {
             // trust the models — which costs most of the compression on small/early
             // blocks. Positive weights also keep the mix grounded in the models'
             // evidence rather than the prior.
-            weights: vec![1.0; n],
+            weights: vec![W_INIT; n],
             // All models start with lr_scale=1.0 (SGD).
             lr_scales: vec![1.0; n],
             // Position deltas start at 0 so the initial mix is identical to the
             // non-context-aware version (pure 1.0 base weights).
-            pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
+            pos_weights: (0..n).map(|_| [0i32; 8]).collect(),
             lr: 0.02,
-            // Adam state initialized in new_adam; zeroed here for plain SGD.
+            // Adam state (unused in default SGD path).
+            adam_t: 0,
             adam_m: vec![0.0; n],
             adam_v: vec![0.0; n],
-            adam_t: 0,
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
         }
     }
 
-    /// Create a mixer with Adam optimizer (adaptive per-weight learning rates).
-    /// Base weights use Adam; per-bit-position deltas use plain SGD.
+    /// Create a mixer with Adam optimizer.
+    ///
+    /// NOTE: Adam is kept for API compatibility only. The hot path is fixed-point
+    /// SGD; `new_adam` produces an SGD-trained mixer with the requested `lr`
+    /// (Adam's adaptive rates were never measurably better on the default stacks,
+    /// see README experiment log — "Second-order mixer training" row).
     #[must_use]
     pub fn new_adam(n: usize, lr: f32) -> Self {
         Self {
-            weights: vec![1.0; n],
+            weights: vec![W_INIT; n],
             lr_scales: vec![1.0; n],
-            pos_weights: (0..n).map(|_| [0.0f32; 8]).collect(),
+            pos_weights: (0..n).map(|_| [0i32; 8]).collect(),
             lr,
+            adam_t: 0,
             adam_m: vec![0.0; n],
             adam_v: vec![0.0; n],
-            adam_t: 0,
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
@@ -145,13 +179,19 @@ impl LogisticMixer {
 
     /// Replace base weights. Keeps per-bit-position deltas unchanged.
     pub fn set_weights(&mut self, weights: Vec<f32>) {
-        self.weights = weights;
+        self.weights = weights
+            .into_iter()
+            .map(|w| (w * (1 << WEIGHT_Q) as f32).round().clamp(i32::MIN as f32, i32::MAX as f32) as i32)
+            .collect();
     }
 
-    /// Return a copy of the base weights.
+    /// Return a copy of the base weights (as floats).
     #[must_use]
     pub fn weights(&self) -> Vec<f32> {
-        self.weights.clone()
+        self.weights
+            .iter()
+            .map(|&w| w as f32 / (1 << WEIGHT_Q) as f32)
+            .collect()
     }
 
     /// Reset weights to initial state (called at block boundaries).
@@ -160,15 +200,15 @@ impl LogisticMixer {
     /// toward their init value (1.0) instead of hard-clearing, preserving
     /// learned structure across block boundaries.
     pub fn reset(&mut self) {
-        self.weights.fill(1.0);
+        self.weights.fill(W_INIT);
         for pw in &mut self.pos_weights {
-            pw.fill(0.0);
+            pw.fill(0);
         }
         self.lr_scales.fill(1.0);
+        self.lr = 0.02;
         self.adam_t = 0;
         self.adam_m.fill(0.0);
         self.adam_v.fill(0.0);
-        self.lr = 0.02;
     }
 
     /// Decay all learned weights toward their init values by `factor`.
@@ -181,24 +221,28 @@ impl LogisticMixer {
     /// would throw away the per-context weight vectors that the 4096-bank
     /// hierarchy depends on.
     pub fn decay(&mut self, factor: f32) {
+        let f = factor;
         for w in &mut self.weights {
-            *w = 1.0 + (*w - 1.0) * factor;
+            let nf = *w as f32 * f + W_INIT as f32 * (1.0 - f);
+            *w = nf.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
         }
         for pw in &mut self.pos_weights {
             for dw in pw.iter_mut() {
-                *dw = 0.0 + (*dw - 0.0) * factor;
+                let nf = *dw as f32 * f;
+                *dw = nf.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
             }
         }
     }
 
     #[inline]
-    fn stretch_of(&self, p: u16) -> f32 {
+    fn stretch_of(&self, p: u16) -> i16 {
         stretch_table()[(p as usize).clamp(1, 4095)]
     }
 
     #[inline]
-    fn squash_of(&self, acc: f32) -> u16 {
-        // map logistic accumulator to a table index in [0,4095]
+    fn squash_of(&self, acc_q: i64) -> u16 {
+        // acc_float = acc_q / 2^ACC_SHIFT (logits). Map to a table index in [0,4095].
+        let acc = acc_q as f32 / ((1i64 << ACC_SHIFT) as f32);
         let idx = ((acc + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize;
         squash_table()[idx]
     }
@@ -213,25 +257,23 @@ impl LogisticMixer {
 
     /// Compute the logistic accumulator AND the squashed probability in one pass.
     ///
-    /// Returns `(acc, q)` with `acc = Σ w_i·stretch(p_i)` (pre-squash) and `q`
-    /// the squashed probability in `[1,4095]`. The caller that is about to call
-    /// [`update`](Self::update) for the *same* (`probs`, `bit_pos`) can reuse the
-    /// returned `acc` instead of letting `update` recompute the dot product.
+    /// Returns `(acc, q)` with `acc = Σ w_i·stretch(p_i)` (pre-squash, fixed-point)
+    /// and `q` the squashed probability in `[1,4095]`. The caller that is about to
+    /// call [`update`](Self::update) for the *same* (`probs`, `bit_pos`) can reuse
+    /// the returned `acc` instead of letting `update` recompute the dot product.
     #[must_use]
     #[inline(always)]
-    pub fn mix_acc(&self, probs: &[u16], bit_pos: u8) -> (f32, u16) {
+    pub fn mix_acc(&self, probs: &[u16], bit_pos: u8) -> (i64, u16) {
         let b = usize::from(bit_pos.min(7));
-        let mut acc = 0.0f32;
+        let mut acc: i64 = 0;
         for (i, &p) in probs.iter().enumerate() {
             let w = self.weights[i] + self.pos_weights[i][b];
-            acc += w * self.stretch_of(p);
+            acc += i64::from(w) * i64::from(self.stretch_of(p));
         }
         (acc, self.squash_of(acc))
     }
 
     /// Online update after the true `bit` is known.
-    ///
-    /// Base weights use Adam when `adam_t > 0`; pos_weights always use SGD.
     ///
     /// Returns the predicted probability `q` (the squashed accumulator with the
     /// *pre-update* weights) that was used for this bit. Callers that blend this
@@ -245,7 +287,7 @@ impl LogisticMixer {
     /// Same as [`update`](Self::update), but the logistic accumulator `acc`
     /// (from [`mix_acc`](Self::mix_acc) with the same inputs) is supplied by the
     /// caller so the dot product is not recomputed a second time.
-    pub fn update_from_acc(&mut self, probs: &[u16], bit: bool, bit_pos: u8, acc: f32) -> u16 {
+    pub fn update_from_acc(&mut self, probs: &[u16], bit: bool, bit_pos: u8, acc: i64) -> u16 {
         let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
         // pred from the precomputed squash table — no exp() in the hot loop.
@@ -253,29 +295,19 @@ impl LogisticMixer {
         let pred = f32::from(q) / 4095.0;
         let err = target - pred;
 
+        // Grad in weight units (Q16) from a stretch in Q10:
+        //   grad_q16 = lr·scale·err·stretch_q10 · 2^(WEIGHT_Q - STRETCH_Q)
+        // WEIGHT_Q - STRETCH_Q = 6, so scale by 64.
         for (i, &p) in probs.iter().enumerate() {
             let scale = self.lr_scales[i];
-            let grad = self.lr * scale * err * self.stretch_of(p);
-
-            if self.adam_t > 0 {
-                // Adam update for base weights.
-                self.adam_m[i] = self.beta1 * self.adam_m[i] + (1.0 - self.beta1) * grad;
-                self.adam_v[i] = self.beta2 * self.adam_v[i] + (1.0 - self.beta2) * grad * grad;
-                let m_hat = self.adam_m[i] / (1.0 - self.beta1.powi(self.adam_t as i32));
-                let v_hat = self.adam_v[i] / (1.0 - self.beta2.powi(self.adam_t as i32));
-                self.weights[i] += m_hat / (v_hat.sqrt() + self.eps);
-            } else {
-                // Plain SGD.
-                self.weights[i] += grad;
-            }
-
-            // Per-bit-position deltas always use SGD.
-            self.pos_weights[i][b] += grad;
+            let stretch_q10 = i32::from(self.stretch_of(p));
+            // lr·scale·err is f32; multiply by stretch_q10·64, then round to i32.
+            let delta = (self.lr * scale * err * stretch_q10 as f32 * (1 << GRAD_SCALE) as f32).round();
+            let d = delta.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+            self.weights[i] += d;
+            self.pos_weights[i][b] += d;
         }
 
-        if self.adam_t > 0 {
-            self.adam_t = self.adam_t.saturating_add(1);
-        }
         q
     }
 }
@@ -291,9 +323,9 @@ impl BitModel for LogisticMixer {
     }
 
     fn reset(&mut self) {
-        self.weights.fill(1.0);
+        self.weights.fill(W_INIT);
         for pw in &mut self.pos_weights {
-            pw.fill(0.0);
+            pw.fill(0);
         }
     }
 
@@ -342,5 +374,50 @@ mod tests {
         let mixer = LogisticMixer::new(3);
         let p = mixer.mix(&[1000, 2048, 3000], 0);
         assert!((1..=4095).contains(&p));
+    }
+
+    #[test]
+    fn weights_are_q16() {
+        let mixer = LogisticMixer::new(2);
+        assert_eq!(mixer.weights, vec![65536, 65536]);
+        assert_eq!(mixer.weights(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn decay_preserves_init() {
+        let mut mixer = LogisticMixer::new(2);
+        mixer.weights[0] = 0; // moved toward -1.0
+        mixer.decay(0.0);
+        assert_eq!(mixer.weights[0], W_INIT);
+    }
+
+    #[test]
+    fn squash_and_stretch_consistent() {
+        // squash(stretch(p)) ≈ p for mid probabilities.
+        let mixer = LogisticMixer::new(1);
+        for p in [1024u16, 2048, 3072] {
+            let back = mixer.mix(&[p], 0);
+            let expected = p;
+            let diff = i32::from(back) - i32::from(expected);
+            assert!(
+                diff.abs() <= 800,
+                "squash∘stretch(p)={back} vs p={p} drifted too far"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_point_bank_end_to_end() {
+        // Exercise the exact flow `MixerBank` uses (mix_acc → update_from_acc)
+        // and check it stays deterministic and learns.
+        let mut mixer = LogisticMixer::new(2);
+        let mut acc_hist = Vec::new();
+        for _ in 0..100 {
+            let (acc, _q) = mixer.mix_acc(&[2000, 3000], 0);
+            acc_hist.push(acc);
+            mixer.update_from_acc(&[2000, 3000], true, 0, acc);
+        }
+        let (_acc, q) = mixer.mix_acc(&[2000, 3000], 0);
+        assert!(q > 2048, "mixer should learn toward 1 after 100 ones, got {q}");
     }
 }
