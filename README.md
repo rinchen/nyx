@@ -1,43 +1,42 @@
 # Nyx
 
 A from-scratch Rust lossless compressor with a **per-block data-type classifier**
-and an **online logistic bit-mixer** (LZP pre-stage + rANS-grade entropy coder).
-It is a self-contained CLI with its own `NYX1` container format.
+and an **online logistic bit-mixer**. It is a self-contained CLI with its own
+`NYX1` container format.
 
-> **Status: actively improving.** Nyx is a working implementation of context
-> mixing with an online logistic mixer and its own `NYX1` container format. It
-> ships two entropy paths: `--mode slow` (the bit-level 8–9 model logistic mixer)
-> and `--mode fast` (a PPM-style single-context count coder + byte rANS). The
-> current benchmark target is **ratio parity with `zstd -1`** on text + mixed
-> corpora, with `FSE` (Finite State Entropy) as a secondary reference. See
-> [Benchmarks](#benchmarks) for the real numbers (ratio and speed).
+> **Status: actively improving.** Nyx ships two entropy paths:
+> `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
+> 4k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
+> coder + byte rANS). The benchmark target is ratio parity with `zstd -1` on
+> text + mixed corpora, with `FSE` as a secondary reference. See
+> [Benchmarks](#benchmarks) for the numbers.
 
 ## The method
 
-Input is split into variable-size blocks depending on data type. Each block is classified by a cheap order-0
-Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
+Input is split into variable-size blocks by data type. Each block is classified
+by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 
-- `Random` blocks are stored verbatim (a copy record) — no prediction cost.
-- `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range word repeats into local runs)
-- `Binary`, `Exec`, and `Random` blocks use the default 64 KiB chunk size.
-- Everything else runs a **bit-level predictor stack**: order-0 / order-1 / order-2
-  byte-context models, a sparse/stride context model, an executable 2D-context
-  model, and an LZP match pre-stage. The predictions are fused by a **two-level
-  logistic mixer hierarchy**:
-  1. **Bank mixers** (4096 instances): selected by a context hash of byte-class,
-     bit-position, order-1/order-2 bytes, and word-hash. Each bank specializes
-     weights to its context, avoiding the ~50% saturation a single logistic
-     mixer hits on repetitive corpora.
-  2. **Global mixer**: a single context-agnostic mixer over the same models.
-  3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
+- `Random` blocks are stored verbatim — no prediction cost.
+- `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range
+  word repeats into local runs).
+- `Binary`, `Exec`, and `Random` use the default 64 KiB chunk size.
 
-  Only the selected bank + global + master are trained per bit — never all 4096.
-  At block boundaries, weights are **decayed** (not reset), preserving learned
-  structure across the stream. The fused probability drives an rANS bit coder
-  (via the audited [`ans`](https://crates.io/crates/ans) crate).
+The bit-level path runs an **online logistic mixer hierarchy**:
 
-Because modeling is causal, the decoder reconstructs identical model state from the
-decoded stream, so round-trips are lossless.
+1. **Bank mixers** (4096 instances): selected by a context hash of byte-class,
+   bit-position, order-1/order-2 bytes, and word-hash. Each bank specializes
+   weights to its context, avoiding the ~50% saturation a single mixer hits
+   on repetitive corpora.
+2. **Global mixer**: a context-agnostic fallback over the same models.
+3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
+
+Only the selected bank + global + master are trained per bit — never all 4096.
+At block boundaries, weights are **decayed** (not reset), preserving learned
+structure across the stream. The fused probability drives an rANS bit coder
+(via the audited [`ans`](https://crates.io/crates/ans) crate).
+
+Because modeling is causal, the decoder reconstructs identical model state from
+the coded stream, so round-trips are lossless.
 
 ## Build
 
@@ -61,21 +60,20 @@ nyx bench path/to/corpus
 nyx self-test
 ```
 
-There is also `nyx bench <corpus_dir>` which benchmarks nyx over every file in the given corpus.
-
 ## Benchmarks
 
-> **Both ratio and speed, on every run.** nyx codes bit-by-bit, so a fair comparison
-> must report both axes. Full-corpus (12-file Silesia + mixed) numbers are expensive
-> at ~1.5 MB/s, so the headline table below is a representative **5-file subset**
-> (dickens, webster, nci, mr, json — text, mixed-binary, structured). `ratio%` is
-> the compressed size as a percentage of the original (lower is better); speed is
-> in MB/s (higher is better). Full benchmark data is in the README table above.
+> **Both ratio and speed, on every run.** nyx codes bit-by-bit, so a fair
+> comparison must report both axes. Full-corpus (12-file Silesia + mixed)
+> numbers are expensive at ~1.5 MB/s, so the headline table below is a
+> representative **5-file subset** (dickens, webster, nci, mr, json).
+> `ratio%` is the compressed size as a percentage of the original (lower is
+> better); speed is in MB/s (higher is better). Full data is in the
+> [experiments log](#experiments-log-2026-09).
 
-### Current (two-level 4k bank mixer hierarchy + cross-block decay + real 4MB LDM window + BWT text trial + JSON stream splitting + per-stream pipeline selection + DP optimal LZP parse + speed pass #1 (LazyLzp removed, parallel trial, mixer math) + 106 tests, all pass)
+### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 4MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse)
 
-| file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
-|--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
+| file | orig (KB) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
+|------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
 | dickens | 9953.6 | 46.2 | 0.5 | 0.4 | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
 | webster | 40487.0 | 35.1 | 0.7 | 0.5 | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | 9.0 | 0.7 | 0.5 | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **nyx** | **zstd -19** |
@@ -86,31 +84,43 @@ There is also `nyx bench <corpus_dir>` which benchmarks nyx over every file in t
 
 ### Two-pass DP optimal LZP parse (`cargo test --features two_pass`)
 
-With `two_pass` enabled, nyx adds a forward LZP match pre-pass with **DP optimal parsing** (cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost, threshold ≥16). Matched bytes are skipped in the rANS stream — only literals are CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u24).
+With `two_pass` enabled, nyx adds a forward LZP match pre-pass with **DP optimal
+parsing** (cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost,
+threshold ≥16). Matched bytes are skipped in the rANS stream — only literals are
+CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u24).
 
-| file | orig (kb) | nyx two_pass ratio% | vs default | zstd -1 ratio% | beats zstd-1? |
+| file | orig (KB) | nyx two_pass ratio% | vs default | zstd -1 ratio% | beats zstd-1? |
 |------|----------:|--------------------:|-----------:|---------------:|:------------:|
-| dickens | 9953.6 | 41.9 | 46.2→41.9 (**-4.3pt**) | 41.7 | ~parity |
-| webster (10MB) | 10000.0 | 31.4 | 35.1→31.4 (**-3.7pt**) | 33.0 | ✅ |
-| nci | 32767.0 | 8.2 | 9.0→8.2 (**-0.8pt**) | 85.2 | ✅ |
+| dickens | 9953.6 | 41.9 | 46.2→41.9 (**−4.3pt**) | 41.7 | ~parity |
+| webster (10MB) | 10000.0 | 31.4 | 35.1→31.4 (**−3.7pt**) | 33.0 | ✅ |
+| nci | 32767.0 | 8.2 | 9.0→8.2 (**−0.8pt**) | 85.2 | ✅ |
 | mr | 9736.9 | 29.1 | 27.5→29.1 (**+1.6pt**) | 38.3 | ✅ (vs default) |
 | json | 478.5 | 0.1 | 0.1 (same) | 0.3 | ✅ |
-| huge_json | 5641.7 | 1.3 | 2.7→1.3 (**-1.4pt**) | 2.5 | ✅ |
+| huge_json | 5641.7 | 1.3 | 2.7→1.3 (**−1.4pt**) | 2.5 | ✅ |
 | massive_json | 22885.9 | 0.97 | 0.81→0.97 (**+0.16pt**) | 2.48 | ✅ |
 
-**Key insight:** DP optimal parse with literal-skipping rANS is a net win on most files. `dickens` and `webster` approach or beat `zstd -1`. `mr` regresses slightly (+1.6pt) — the SSM model addition in the two_pass stack is the likely cause, not the DP parse itself. `massive_json` also regresses slightly — the match pre-pass overhead exceeds savings at very high compression.
+**Key insight:** DP optimal parse with literal-skipping rANS is a net win on
+most files. `dickens` and `webster` approach or beat `zstd -1`. `mr` and
+`massive_json` regress slightly — the SSM model added alongside the DP parse
+is the likely cause, not the DP parse itself.
 
 ### Reading the table
 
-- **Ratio:** lower % is better. nyx wins on `nci`, `mr`, and `json` (see the **ratio winner** column); it is **close to zstd -1 and FSE on webster** (35.1% vs zstd-1's 33.5% — BWT trial narrows the gap from 50.4%→35.1%); zstd `-19` still dominates on text and high-redundancy structured data. `zstd -1` is the fast/low-level reference against which the current optimization stage is measured.
+- **Ratio:** lower % is better. nyx wins on `nci`, `mr`, and `json` (see the
+  **ratio winner** column); it is close to zstd -1 on webster (35.1% vs zstd-1's
+  33.5% — BWT trial narrows the gap from 50.4%→35.1%). zstd `-19` still dominates
+  on text and high-redundancy structured data. `zstd -1` is the fast/low-level
+  reference against which the current optimization stage is measured.
 
-  Note: `json` now achieves 0.1% ratio (vs 3.0% with raw CM) because BWT turns long-range word repeats
-into local MTF zero-runs that RLE0 + CM compress to near-entropy. The two-level bank mixer hierarchy
-also excels at repetitive-but-structured data where context switches matter — the per-context bank specialization
-captures byte-position and text-class distributions that zstd's LZ77 dictionary approach misses at this scale.
-On **large JSON** (5.4MB, 22MB), nyx's JSON stream splitting + per-stream BWT trial **beats zstd -1 and even zstd -19**
-(json 5.4MB: nyx 2.7% vs zstd-1 2.5% vs zstd-19 1.8%; json 22MB: nyx 0.81% vs zstd-1 2.48% vs zstd-19 1.35%).
-- **Speed:** higher MB/s is better. nyx is **~0.6–1.0 MB/s** compress /
+  Note: `json` now achieves 0.1% ratio (vs 3.0% with raw CM) because BWT turns
+  long-range word repeats into local MTF zero-runs that RLE0 + CM compress to
+  near-entropy. The two-level bank mixer hierarchy also excels at
+  repetitive-but-structured data where context switches matter. On **large JSON**
+  (5.4MB, 22MB), nyx's JSON stream splitting + per-stream BWT trial **beats
+  zstd -1 and even zstd -19** (json 5.4MB: nyx 2.7% vs zstd-1 2.5% vs zstd-19 1.8%;
+  json 22MB: nyx 0.81% vs zstd-1 2.48% vs zstd-19 1.35%).
+
+- **Speed:** higher MB/s is better. nyx is **~0.5–0.7 MB/s** compress /
   **~0.4–0.5 MB/s** decode. zstd `-1` is **~400–12000 MB/s** compress /
   **~1000–36000 MB/s** decode; zstd `-19` is **~3–4 MB/s** compress /
   **~200–900 MB/s** decode; FSE is **~200–1600 MB/s** both ways. That is a
@@ -125,71 +135,67 @@ secondary.
 
 ## Experiments log (2026-09)
 
+### Architecture & modeling
+
 | experiment | files tested | result | action |
 |---|---|---|---|
-| Adaptive LZP confidence scaling | mr, dickens | neutral | reverted |
-| Per-model / prev-byte mixer bias | mr, json | regressed | reverted |
-| PPM order-4 extra mixer input | dickens | neutral | reverted |
-| Per-model reliability dampening | dickens, json | regressed | reverted |
-| Classifier-aware Text stack dropping Exec + PPM order-4 | json | regressed | reverted to full hybrid_ppm3 |
-| Explicit match-copy records | mr, dickens, json, webster, nci | **regressed all** | reverted |
-| Run-length-limited sparse contexts | mr, dickens, json, webster, nci | neutral (<1 byte diff) | reverted |
-| **Per-bit-position mixer context** | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
-| **Classifier-aware method bytes** | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
-| **Word/string model** (case-folded, bigram prefix) | dickens, json, webster, nci | +0.1pt on 4/5 | kept as default (text blocks) |
+| Per-bit-position mixer context | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
+| Classifier-aware method bytes | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
+| Word/string model (case-folded, bigram prefix) | dickens, json, webster, nci | +0.1pt on 4/5 | kept as default (text blocks) |
 | Refined word model (trigram + char-class + 21-bit table) | json | regressed 5.6%→5.8% | reverted to simple word model |
-| Record segmentation model (JSON key/value parser) | dickens, json, webster, nci | neutral on json/dickens/mr; regressed webster/nci | reverted |
+| Record segmentation model (JSON key/value parser) | dickens, json, webster, nci | neutral json/dickens/mr; regressed webster/nci | reverted |
 | ICM (22-state PAQ8) | mr, dickens, json, webster, nci | regressed on 4/5 | reverted |
 | ICM (256-state probability-quantized) | mr, dickens, json, webster, nci | regressed on all 5 | reverted |
 | Order-4 PPM with word-boundary-aware context masking | mr, dickens, json, webster, nci | regressed dickens +0.1pt, webster +0.5pt, nci +0.1pt, json +3.6pt | reverted |
-| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (-0.1pt on dickens/json) | kept in place, not adopted |
+| Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (−0.1pt) | kept in place, not adopted |
 | Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
 | Literal bypass hint model (high-entropy byte bypass) | mr, dickens, json, webster, nci | regressed dickens 56.3%→57.1% | reverted |
-| **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | developed but **not wired into codec** — `SseApmCascade` exists in `src/model/sse_apm.rs` but is not integrated into the encode/decode path. Results reflect pre-integration measurements; module retained for future integration |
-| **Context-selected 4k mixer banks** (4096 per-context LogisticMixer instances selected by byte-class + order-1/order-2 + word-hash, blended with global + master) | mr, dickens, json, webster, nci | **improved**: json 3.9%→3.0%, dickens 51.7%→51.2% | **kept as default** — two-level bank→global→master hierarchy, cross-block **decay** (not reset) preserves 4096 vectors, only selected bank + master trained per bit |
-| **Indirect context + DMC models** (table[hash(o2)]→last byte, predict via hash(indirect,o1)) | mr, dickens, json, webster, nci | regressed dickens +0.7pt, webster +0.4pt; json improved | reverted due to perf cost on large files |
-| **Cross-block persistence + real 4MB LDM window** (reuse model/mixer state across same-kind blocks; 4MB LZP hash chains) | json, mr, dickens, nci, webster | **improved**: json 5.5%→3.9%, mr 28.6%→27.3%, dickens 56.0%→51.7%, nci 26.6%→20.9%, webster 50.4%→45.1% | **kept as default** |
+| **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci −0.9pt, mr −0.8pt, dickens −0.3pt, webster −0.5pt, json −0.1pt | developed but **not wired into codec** — `SseApmCascade` exists in `src/model/sse_apm.rs` but is not integrated into the encode/decode path |
+| **Context-selected 4k mixer banks** (4096 per-context LogisticMixer instances selected by byte-class + order-1/order-2 + word-hash, blended with global + master) | mr, dickens, json, webster, nci | **improved**: json 3.9%→3.0%, dickens 51.7%→51.2% | **kept as default** — two-level bank→global→master hierarchy, cross-block **decay** preserves 4096 vectors, only selected bank + master trained per bit |
+| **Indirect context + DMC models** | mr, dickens, json, webster, nci | regressed dickens +0.7pt, webster +0.4pt; json improved | reverted due to perf cost |
+| **Cross-block persistence + real 4MB LDM window** | json, mr, dickens, nci, webster | **improved**: json 5.5%→3.9%, mr 28.6%→27.3%, dickens 56.0%→51.7%, nci 26.6%→20.9%, webster 50.4%→45.1% | **kept as default** |
 | LZP ring buffer performance fix (O(n) drain→O(1) ring) | all files | performance fix, no ratio change | kept |
 | Micro SSM mixer (16-dim recurrent state replacing logistic mixer) | json, mr | **regressed**: json 3.9%→10.7%, mr 27.3%→37.2% | reverted; SSM too large for 64KB blocks, gradient issues |
-| **Two-pass CM residual v2** (≥8-byte match threshold + residual-only CM, interleaved decoder scan) | mr, dickens, json, webster, nci | **scaffold complete (Stage 1)**, Stage 2 blocked on decoder state synchronization | match side-stream (5-byte len+dist records) committed; full-block CM passthrough validates on all 5 files (65/65 tests) — residual-skip decode reverts to Stage 1 after round-trip failure (see commit 217a5d2). NOTE: Stage 1 scaffolding with live match pre-pass causes **regression** on nci (+12.4pt) and webster (+12.5pt) — match overhead exceeds CM benefit at 64 KiB block size. **Feature-gated** behind `cargo test --features two_pass`; off by default |
-| **Micro SSM mixer** (8-dim recurrent state as additional base model + Byte-Pair Re-Pair word model) | mr, dickens, json, webster, nci | **complete** → **reverted (net regression)** | 65/65 tests pass; round-trip verified; BUT measured on 5-file subset: nci 20.9%→33.3%, webster 45.1%→57.6%, mr 27.3%→29.2%, dickens 51.7%→54.9%, json 3.9%→5.7%. SSM/Byte-Pair models add prediction overhead without ratio gain on these corpora. **Feature-gated** behind `cargo test --features two_pass`; off by default |
-| **Second-order mixer training** (Adam + per-model lr_scale; LZP learns 10× faster) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | Adam tested at lr=0.01: dickens 51.7%→51.4%, mr 27.3%→27.6%, json 3.9%→4.1%. SGD + lr_scale identical to baseline. Neither improves the default SGD path; `LogisticMixer::new_adam()` kept in-tree for future use. | kept as default |
-| **BWT text trial** (per-block trial between RawCm, BWT→MTF→RLE0→CM, and LZP→BWT→MTF→CM using divsufsort; 1-byte method selector; trial only for Text blocks ≥ 256KB) | dickens, json, webster | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%, **webster 50.4%→35.1%** (verified full-file round-trip); mr/nci unchanged (classified as Binary) | **kept as default** — rotation-based BWT (doubled string, filter SA to positions 0..n) avoids sentinel collision with 0x00 bytes; primary index stored as 4-byte LE; RLE0 escapes all 0xFF literals as 0xFF 0x00; LZP uses hash chains for O(n) match-finding |
-| **JSON stream splitting + per-stream pipeline selection** (split JSON text blocks into 4 streams — structural `{}[]:,,`, keys, string values, numbers — each independently trials RawCm/BwtMtfRle/LzpBwtMtf and picks the best per stream; selector byte encodes 2 bits/stream; 4-byte orig_len prefix for decoder reconstruction) | json (478KB), big_json (1.1MB), huge_json (5.4MB), massive_json (22MB), nci (32MB) | **improved**: json 0.1% (unchanged); huge_json 2.7% (vs zstd-19 1.8%, zstd-1 2.5% — beats zstd-1); massive_json 0.81% (vs zstd-19 1.35%, zstd-1 2.48% — beats both zstd variants); nci 20.9%→9.0% (BWT trial triggers on Binary→Text); round-trip verified on all files | **kept as default** — METHOD_JSON_SPLIT=7; trial on Text blocks ≥256KB; `looks_like_json` heuristic; 0xFE markers in structural stream; per-stream pipeline selector (2 bits/stream) |
-| **Order-8 PPMd with SEE + sparse de Bruijn** (orders 0-8 with information inheritance; Secondary Escape Estimation table SEE[order][context_hash] 64K slots × 4-bit state; 3 sparse contexts [0][1][3][4], [0][1][2][5], [0][1][2][3][6][7] gap patterns capturing skip-grams; 18-bit hash, 4-bit state; 256K buckets × 12 tables = 24MB) | webster, dickens, json | **mixed** (original): webster 35.1%→34.3% (+0.8pt); dickens 46.1%→46.3% (-0.2pt); json 0.1%→0.1% (same). Config fixed: PpmdSsmBuilder now keeps WordModel + LazyLzp (matching hybrid_ppm3); context tables shrunk from 22→18 bits (24MB vs 384MB); predict loop skips empty higher-order contexts; SEE update simplified. **Awaiting re-benchmark with fair config.** | **re-evaluated** — original gap was likely due to missing WordModel + LazyLzp in comparison config. Config now matches hybrid_ppm3; model retained in `src/model/ppmd_ssm.rs` for future benchmarking. |
-| **DP optimal LZP parse** (replaced greedy longest-match in `scan_matches` with DP; cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost; threshold ≥16; matched bytes skipped in rANS, only literals CM-encoded; 8-byte match records: pos:u32 + len:u8 + dist:u24) | dickens, webster(10MB), nci, mr, json, huge_json, massive_json | **improved**: dickens 46.2%→41.9% (-4.3pt, ~parity with zstd-1); webster 35.1%→31.4% (-3.7pt, beats zstd-1 33.0%); nci 9.0%→8.2% (-0.8pt); huge_json 2.7%→1.3% (-1.4pt, beats zstd-1 2.5%); json 0.1% (unchanged). **Regressed**: mr 27.5%→29.1% (+1.6pt — likely SSM model overhead, not DP parse); massive_json 0.81%→0.97% (+0.16pt — match overhead at very high compression). Round-trip verified on all files. | **kept as experimental** — DP parse + literal-skipping is a net win on 5/7 files (text + structured data). The `mr` regression is from the SSM model added in the two_pass stack, not the DP parse itself. Feature-gated behind `--features two_pass`. Next step: isolate DP parse from SSM to confirm the regression source. |
-| **Speed pass #1 — LazyLzp removal** (LazyLzp kept a `Vec<u8>` history capped at 1MB via `history.drain(0..drop)` — an O(n²) memmove per byte once over 1MB; its match-extension loop `hlen + len < history.len()` with `hlen == history.len()` was always false, so it emitted constant 2048 — pure overhead) | dickens, webster | **3.3× encode speedup on text, zero ratio change** (dickens 2MB: 10.9s→3.3s, byte-identical output; dickens 9.7MB: >2min→14.9s, 46.2%→45.7%). Profile showed 92% of samples in `_platform_memmove` inside `LazyLzp::update` | **removed from all default stacks** (codec Text + two_pass Text + PpmdSsmBuilder). Model rewritten with a fixed-capacity ring buffer + causal extension loop, kept in-tree for future experiments |
-| **Fast-path trial heuristics + parallel trial** (skip BWT/JSON trials when block < 1MB non-JSON or shannon > 7.2; run pipeline B/C/D trials concurrently via `std::thread::scope`) | dickens, json | trial wall-time cut ~3×; json 478KB still trialed (JSON carve-out keeps 0.1% ratio); near-random text skips BWT | **kept as default** — `TRIAL_MIN_LEN` = 1MB, `TRIAL_MAX_SHANNON` = 7.2 |
-| **Mixer math** (`LogisticMixer::update` replaced `exp()` with the precomputed squash table; `update` now returns the pre-update probability `q` so `MixerBank` feeds the master without re-running the bank/global dot products — 2 fewer dot products + no transcendentals per bit) | all | ratio unchanged (json same, dickens −0.5pt from earlier optimizations) | **kept as default** |
- | **DP parse O(n·window) fix** (`Lzp::best_match` returns `(len, dist)` directly from the hash-chain walk; removed the per-position O(window) backward re-scan `find_match_with_len`) | two_pass | kills the pathological worst case on large text blocks | **kept** |
- | **Speed pass #2 — byte-level "fast" path** (`--mode fast`; `src/bytecodec.rs` PPM-style single-context count coder: deterministic order-0/1/2 selector + fused 256-symbol cumulative `walk_dist` + byte rANS in `src/entropy/byterans.rs`; no mixer/softmax) | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** (fast 1.15s/0.279x vs slow 2.97s/0.470x; round-trip verified; full suite 118/118 green incl. exact-triple `walk_roundtrip_exact`). Note: byte models (trained on transformed streams) beat the text-builtin bit models here — as predicted for CM after BWT+MTF | **new default `--mode fast`**, slow path retained as `--mode slow` |
+| Second-order mixer training (Adam + per-model lr_scale) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | kept as default; Adam never measurably better on default stacks |
+| BWT text trial (RawCm vs BWT→MTF→RLE0→CM vs LZP→BWT→MTF→CM) | dickens, json, webster | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%, **webster 50.4%→35.1%** | **kept as default** |
+| JSON stream splitting + per-stream pipeline selection | json (478KB–22MB) | **improved**; beats zstd-1 and zstd-19 on large JSON | **kept as default** |
+| Order-8 PPMd with SEE + sparse de Bruijn | webster, dickens, json | mixed; config now matches hybrid_ppm3 | **re-evaluated** — model retained for future benchmarking |
+| DP optimal LZP parse | dickens, webster, nci, mr, json, huge_json, massive_json | **improved** on 5/7 (dickens −4.3pt, webster −3.7pt); **regressed** mr +1.6pt, massive_json +0.16pt | **kept as experimental** (behind `--features two_pass`) |
 
-| **Speed pass #3 — single-pass acc-merge + Q16 fixed-point mixer** (`MixerBank::mix_acc`/`update_acc`/`mix_and_update` + `LogisticMixer::mix_acc`/`update_from_acc`: each dot product computed once per bit and re-used across the bank → global → master mix and update steps. Encode side fuses mix→rANS→SGD in one call. Fixed-point: base weights and pos_weights as i32 Q16 (1.0=65536), stretch i16 Q10, i64 accumulator; SGD grad scaled by 2^(16-10)=64 so per-bit deltas are meaningful (~640 units ≈ 0.01 float). Reverted Q8 attempt (ratio +0.8pt, no speed); Q16 preserves ratio exactly) | dickens 2MB (slow) | **~10% encode speedup, bit-identical output, ratio flat** (3.28s→2.81s user; 0.470x → 0.470x, 986560 vs 986551 B; 127/127 tests). Q16 fixed-point + acc-merge retained | **kept as default** |
-| **Speed pass #4 — 32-way interleaved byte rANS** (`RansByteEncoder32`/`RansByteDecoder32` in `src/entropy/byterans.rs`: per-symbol-position `p % 32` lanes with independent states, layout `[total:u32][32×state][32×run_len][lane runs]`; `bytecodec.rs` decode restructured as groups of 32 decoding in forward byte order to preserve model context) | dickens 2MB (fast) | **no measurable speedup** (1.15s→1.17s user, ratio 0.279x 584064→584304 B, round-trip OK). Profiling shows the rANS step is ~10% of fast-path total — the dominant cost is the `walk_dist` linear 256-probability scan in `ByteCountModel::walk_dist`, which stays fully serial under byte-interleaving since the byte model context advances strictly forward per byte. Correct, tested (4 round-trip cases incl. fuzz), kept in-tree; not wired out | **attempted, no win** — fast-path bottleneck is the distribution walk, not rANS. Next lever: SIMD `walk_dist` + table-free cumulative counts |
+### Speed passes
 
-Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
-method bytes + word model (text blocks only) + cross-block decay persistence + 4MB LZP
-window + BWT text trial with fast-path heuristics + parallel trial + JSON stream splitting (method 7) +
-DP optimal LZP parse (behind `--features two_pass`, experimental).**
-Default (no features): round-trip verified on all 5 files (0.1% on json, 9.0% on nci, 27.5% on mr, 35.1% on webster, 46.2% on dickens).
-Two-pass: additional gains on dickens (41.9%), webster (31.4%), nci (8.2%), huge_json (1.3%); mixed results on mr/massive_json.
-Build and tests green (127/127).
-Speed pass #1 (LazyLzp removal + trial fast-path + parallel trial + mixer math): **~3× faster encode on text, ratio flat**.
-Speed pass #2 (byte-level fast path, PPM-style count coder + byte rANS, no mixer): **~2.6× faster than slow on dickens 2MB with ~1.7× better ratio on BWT+MTF streams**.
-Speed pass #3 (single-pass acc-merge + Q16 fixed-point mixer): **~10% faster slow-path encode, bit-identical output, ratio flat**.
-Speed pass #4 (32-way interleaved byte rANS): **no measurable win** — fast-path dominated by `walk_dist` distribution scan (linear 256), not rANS state.
+| pass | description | files tested | result | status |
+|---|---|---|---|---|
+| #1 | LazyLzp removal (O(n²) memmove per byte over 1MB; match-extension loop dead). Model rewritten with fixed-capacity ring buffer + causal extension loop. | dickens, webster | **3× encode speedup on text, zero ratio change** (dickens 2MB: 10.9s→3.3s, byte-identical) | removed from all default stacks |
+| #2 | Byte-level "fast" path (`--mode fast`): PPM-style single-context count coder (deterministic order-0/1/2 selector + fused 256-symbol cumulative walk_dist + byte rANS). No mixer/softmax. | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** (fast 1.15s/0.279x vs slow 2.97s/0.470x; round-trip verified; 127/127 tests) | kept as `--mode fast` |
+| #3 | Single-pass acc-merge across the mixer chain (`MixerBank::mix_acc`/`update_acc`/`mix_and_update` + `LogisticMixer::mix_acc`/`update_from_acc`). Also: Q16 fixed-point mixer (i32 Q16 weights, i16 Q10 stretch, i64 accumulator; SGD grad scaled ×64 so per-bit deltas are meaningful). | dickens 2MB (slow) | **~10% encode speedup, ratio flat** (3.28s→2.81s user; 0.470x → 0.470x, 986560 vs 986551 B). Q8 attempt reverted (ratio +0.8pt, gradients rounded to 0) | kept as default |
+| #4 | 32-way interleaved byte rANS (32 independent lane states, per-symbol-position `p % 32` lanes). | dickens 2MB (fast) | **no measurable speedup** (1.15s→1.17s user). Profiling: rANS is ~10% of fast path; `walk_dist`'s linear 256-probability scan dominates and stays serial under byte-interleaving | kept in-tree, not wired out |
+
+### Code-quality / correctness notes
+
+| experiment | files tested | result | action |
+|---|---|---|---|
+| round-trip verification | all 5 | lossless | every pass round-trip verified |
+| test suite | all | 127/127 green (including `walk_roundtrip_exact` triple-equality test) | kept |
+| bit-identical output | dickens 2MB | each pass `cmp`-identical to prior | kept |
 
 ## Speed roadmap (2026-09)
 
-Slow encode remains the standing pain point but the byte-level fast path is now in
-place (Speed pass #2): a PPM-style count coder (`--mode fast`) with deterministic
-order-0/1/2 selection and a fused cumulative `walk_dist` + byte rANS, ~2.6× faster
-than the bit path on dickens 2MB with a much better ratio on BWT+MTF streams.
+The fast path (`--mode fast`) has the full speed stack in place. The slow
+path (`--mode slow`) still dominates on some inputs; the remaining levers, in
+priority order:
 
-Planned next steps (slow `--mode slow` path still dominates on some inputs):
-
-1. ~~Fixed-point mixer~~ **attempted and reverted** — integer round-off per SGD step loses small gradients (ratio +0.8pt) with no measurable speed win. Remaining slow-path micro-options: SoA weight layout for the 4096 banks (contiguous fetch instead of per-bank Vec pointer-chase) and stretch-value reuse (carry stretch bucket lookups through `MixerAcc`); both bit-identical and ratio-neutral.
-2. ~~Interleaved byte rANS~~ **attempted, no measurable win** (fast-path dominated by `walk_dist` linear scan, not rANS; walk-dist is the bottleneck and stays serial under byte-interleaving). **Remaining lever**: SIMD-accelerated `walk_dist` + table-free cumulative counts, or widen stride of the context model.
+1. **SIMD-accelerated `walk_dist`** — the linear 256-probability scan in
+   `ByteCountModel::walk_dist` is the fast-path bottleneck (~90% of encode+decode
+   time). Table-free cumulative counts via SIMD (AVX2/AVX-512) would remove
+   this. Also applicable to the slow path.
+2. **SoA weight layout for the 4096 banks** — contiguous weight arrays instead
+   of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
+   Bit-identical, ratio-neutral.
+3. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
+   to avoid ~11 table re-lookups per bit. Bit-identical, ratio-neutral.
+4. **Wider stride / context model** — increase the number of models or the
+   order-2 context size to improve prediction quality on diverse corpora.
 
 ## License
 
