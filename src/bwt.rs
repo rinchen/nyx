@@ -424,19 +424,88 @@ impl BwtPipeline {
             BwtPipeline::LzpBwtMtf => bwt_mtf_encode(&lzp_encode(data)),
             BwtPipeline::JsonSplit => {
                 let streams = crate::json_split::split(data);
-                let s0 = bwt_mtf_rle_encode(&streams.structural);
-                let s1 = bwt_mtf_rle_encode(&streams.keys);
-                let s2 = bwt_mtf_rle_encode(&streams.string_values);
-                let s3 = bwt_mtf_rle_encode(&streams.numbers);
-                // Layout: [s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
-                let mut out = Vec::with_capacity(data.len());
-                out.extend_from_slice(&(s0.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(s1.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(s2.len() as u32).to_le_bytes());
-                out.extend_from_slice(&s0);
-                out.extend_from_slice(&s1);
-                out.extend_from_slice(&s2);
-                out.extend_from_slice(&s3);
+                // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
+                // 2 bits per stream in selector: 0=RawCm, 1=BwtMtfRle, 2=LzpBwtMtf
+                let s_raw = streams.structural.len();
+                let s_bwt = bwt_mtf_rle_encode(&streams.structural);
+                let s_lzp = bwt_mtf_encode(&lzp_encode(&streams.structural));
+                let struct_pipe = if s_bwt.len() <= s_raw && s_bwt.len() <= s_lzp.len() {
+                    1
+                } else if s_lzp.len() <= s_raw && s_lzp.len() <= s_bwt.len() {
+                    2
+                } else {
+                    0
+                };
+                let struct_encoded = match struct_pipe {
+                    0 => streams.structural.clone(),
+                    1 => s_bwt,
+                    _ => s_lzp,
+                };
+
+                let k_raw = streams.keys.len();
+                let k_bwt = bwt_mtf_rle_encode(&streams.keys);
+                let k_lzp = bwt_mtf_encode(&lzp_encode(&streams.keys));
+                let keys_pipe = if k_bwt.len() <= k_raw && k_bwt.len() <= k_lzp.len() {
+                    1
+                } else if k_lzp.len() <= k_raw && k_lzp.len() <= k_bwt.len() {
+                    2
+                } else {
+                    0
+                };
+                let keys_encoded = match keys_pipe {
+                    0 => streams.keys.clone(),
+                    1 => k_bwt,
+                    _ => k_lzp,
+                };
+
+                let v_raw = streams.string_values.len();
+                let v_bwt = bwt_mtf_rle_encode(&streams.string_values);
+                let v_lzp = bwt_mtf_encode(&lzp_encode(&streams.string_values));
+                let vals_pipe = if v_bwt.len() <= v_raw && v_bwt.len() <= v_lzp.len() {
+                    1
+                } else if v_lzp.len() <= v_raw && v_lzp.len() <= v_bwt.len() {
+                    2
+                } else {
+                    0
+                };
+                let vals_encoded = match vals_pipe {
+                    0 => streams.string_values.clone(),
+                    1 => v_bwt,
+                    _ => v_lzp,
+                };
+
+                let n_raw = streams.numbers.len();
+                let n_bwt = bwt_mtf_rle_encode(&streams.numbers);
+                let n_lzp = bwt_mtf_encode(&lzp_encode(&streams.numbers));
+                let nums_pipe = if n_bwt.len() <= n_raw && n_bwt.len() <= n_lzp.len() {
+                    1
+                } else if n_lzp.len() <= n_raw && n_lzp.len() <= n_bwt.len() {
+                    2
+                } else {
+                    0
+                };
+                let nums_encoded = match nums_pipe {
+                    0 => streams.numbers.clone(),
+                    1 => n_bwt,
+                    _ => n_lzp,
+                };
+
+                let selector = (struct_pipe as u8)
+                    | ((keys_pipe as u8) << 2)
+                    | ((vals_pipe as u8) << 4)
+                    | ((nums_pipe as u8) << 6);
+
+                // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
+                let mut out = Vec::with_capacity(data.len() + 21);
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.push(selector);
+                out.extend_from_slice(&(struct_encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(keys_encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(vals_encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&struct_encoded);
+                out.extend_from_slice(&keys_encoded);
+                out.extend_from_slice(&vals_encoded);
+                out.extend_from_slice(&nums_encoded);
                 out
             }
         }
@@ -452,16 +521,26 @@ impl BwtPipeline {
                 lzp_decode(&mtf, orig_len)
             }
             BwtPipeline::JsonSplit => {
-                if payload.len() < 12 {
+                // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
+                if payload.len() < 17 {
                     return Vec::new();
                 }
-                let s0_len =
+                let orig_len =
                     u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-                let s1_len =
-                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                let selector = payload[4];
+                let s0_pipe = selector & 0x3;
+                let s1_pipe = (selector >> 2) & 0x3;
+                let s2_pipe = (selector >> 4) & 0x3;
+                let s3_pipe = (selector >> 6) & 0x3;
+
+                let s0_len =
+                    u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+                let s1_len = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]])
+                    as usize;
                 let s2_len =
-                    u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
-                let mut pos = 12;
+                    u32::from_le_bytes([payload[13], payload[14], payload[15], payload[16]])
+                        as usize;
+                let mut pos = 17;
                 let s0 = &payload[pos..pos + s0_len];
                 pos += s0_len;
                 let s1 = &payload[pos..pos + s1_len];
@@ -469,14 +548,25 @@ impl BwtPipeline {
                 let s2 = &payload[pos..pos + s2_len];
                 pos += s2_len;
                 let s3 = &payload[pos..];
-                let streams = crate::json_split::JsonStreams {
-                    structural: bwt_mtf_rle_decode(s0),
-                    keys: bwt_mtf_rle_decode(s1),
-                    string_values: bwt_mtf_rle_decode(s2),
-                    numbers: bwt_mtf_rle_decode(s3),
+
+                let decode_stream = |data: &[u8], pipe: u8| -> Vec<u8> {
+                    match pipe {
+                        0 => data.to_vec(),
+                        1 => bwt_mtf_rle_decode(data),
+                        _ => {
+                            let mtf = bwt_mtf_decode(data);
+                            lzp_decode(&mtf, 0)
+                        }
+                    }
                 };
-                crate::json_split::merge(&streams, orig_len)
-                    .unwrap_or_else(|_| crate::json_split::merge_naive(&streams, orig_len))
+
+                let streams = crate::json_split::JsonStreams {
+                    structural: decode_stream(s0, s0_pipe),
+                    keys: decode_stream(s1, s1_pipe),
+                    string_values: decode_stream(s2, s2_pipe),
+                    numbers: decode_stream(s3, s3_pipe),
+                };
+                crate::json_split::merge(&streams, orig_len).unwrap_or_default()
             }
         }
     }
@@ -766,5 +856,13 @@ mod tests {
             result.pipeline, result.encoded_size
         );
         assert!(result.pipeline != BwtPipeline::RawCm || result.encoded_size <= text.len());
+    }
+
+    #[test]
+    fn bwt_pipeline_json_split_round_trip() {
+        let text = b"{\"name\":\"John\",\"age\":42,\"city\":\"New York\"}\n".repeat(500);
+        let encoded = BwtPipeline::JsonSplit.encode(&text);
+        let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len());
+        assert_eq!(decoded, text);
     }
 }
