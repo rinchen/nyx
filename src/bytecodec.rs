@@ -36,7 +36,7 @@
 //! only produces/consumes the rANS byte stream for one block. Uncompressed
 //! length travels in the container `BlockEntry`.
 
-use crate::entropy::byterans::{RansByteDecoder, RansByteEncoder, BYTE_SCALE};
+use crate::entropy::byterans::{RansByteDecoder32, RansByteEncoder32, BYTE_SCALE};
 use crate::error::{NyxError, Result};
 
 /// Hashed order-2 contexts. 4 096 rows × 256 × u16 = 2 MB.
@@ -278,7 +278,7 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
     let mut o0 = ByteCountModel::new(1);
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
-    let mut enc = RansByteEncoder::new();
+    let mut enc = RansByteEncoder32::new();
 
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;
@@ -317,33 +317,37 @@ pub fn decompress_block(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
     let mut o0 = ByteCountModel::new(1);
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
-    let mut dec =
-        RansByteDecoder::new(comp).map_err(|_| NyxError::CorruptBlock("short rANS stream".into()))?;
+    let mut dec = RansByteDecoder32::new(comp, orig_len)
+        .map_err(|_| NyxError::CorruptBlock("short rANS stream".into()))?;
 
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;
 
     let mut out = Vec::with_capacity(orig_len);
     while out.len() < orig_len {
-        let c1 = usize::from(p_1);
-        let c2 = hash2(p_1, p_2) & order2_mask;
-        let ord = pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2));
-        let wr = {
-            let cdf = Some(dec.cdf());
-            match ord {
-                Order::Order0 => o0.walk_dist(0, None, cdf),
-                Order::Order1 => o1.walk_dist(c1, None, cdf),
-                Order::Order2 => o2.walk_dist(c2, None, cdf),
-            }
-        };
-        dec.advance(wr.freq, wr.cum);
-        o0.update(0, wr.sym);
-        o1.update(c1, wr.sym);
-        o2.update(c2, wr.sym);
+        let cdfs = dec.cdf_batch();
+        let in_group = dec.remaining().min(32);
+        for lane in 0..in_group {
+            let c1 = usize::from(p_1);
+            let c2 = hash2(p_1, p_2) & order2_mask;
+            let ord = pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2));
+            let wr = {
+                let cdf = cdfs[lane];
+                match ord {
+                    Order::Order0 => o0.walk_dist(0, None, Some(cdf)),
+                    Order::Order1 => o1.walk_dist(c1, None, Some(cdf)),
+                    Order::Order2 => o2.walk_dist(c2, None, Some(cdf)),
+                }
+            };
+            dec.lane_advance(lane, wr.freq, wr.cum);
+            o0.update(0, wr.sym);
+            o1.update(c1, wr.sym);
+            o2.update(c2, wr.sym);
 
-        out.push(wr.sym);
-        p_2 = p_1;
-        p_1 = wr.sym;
+            out.push(wr.sym);
+            p_2 = p_1;
+            p_1 = wr.sym;
+        }
     }
     Ok(out)
 }
@@ -351,6 +355,7 @@ pub fn decompress_block(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entropy::byterans::{RansByteDecoder, RansByteEncoder};
 
     fn roundtrip(data: &[u8]) {
         let comp = compress_block(data);
