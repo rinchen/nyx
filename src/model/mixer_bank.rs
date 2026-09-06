@@ -166,17 +166,18 @@ impl MixerBank {
     /// Only three mixers are touched per bit: the context-selected bank, the
     /// global, and the master. Not all 4096. This is the key performance
     /// property of the two-level hierarchy.
+    ///
+    /// Returns the master mixer's predicted probability for this bit.
     #[inline]
-    pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8, lzp_conf: u16) {
+    pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8, lzp_conf: u16) -> u16 {
         let bank_id = self.current_bank_id(bit_pos);
-        // Train bank and global with the full model stack.
-        self.mixers[bank_id].update(probs, bit, bit_pos);
-        self.global_mixer.update(probs, bit, bit_pos);
+        // `LogisticMixer::update` returns the pre-update probability it fed the
+        // loss, so the master can reuse it as its input without a second dot
+        // product per mixer (previously bank.mix + global.mix re-ran the sums).
+        let q_bank = self.mixers[bank_id].update(probs, bit, bit_pos);
+        let q_global = self.global_mixer.update(probs, bit, bit_pos);
         // Master blends bank + global + lzp_conf.
-        let p_bank = self.mixers[bank_id].mix(probs, bit_pos);
-        let p_global = self.global_mixer.mix(probs, bit_pos);
-        self.master_mixer
-            .update(&[p_bank, p_global, lzp_conf], bit, 0);
+        self.master_mixer.update(&[q_bank, q_global, lzp_conf], bit, 0)
     }
 
     /// Feed a completed byte so byte-history context advances.

@@ -71,7 +71,7 @@ There is also `nyx bench <corpus_dir>` which benchmarks nyx over every file in t
 > the compressed size as a percentage of the original (lower is better); speed is
 > in MB/s (higher is better). Full benchmark data is in the README table above.
 
-### Current (two-level 4k bank mixer hierarchy + cross-block decay + real 4MB LDM window + BWT text trial + JSON stream splitting + per-stream pipeline selection + DP optimal LZP parse + 106 tests, all pass)
+### Current (two-level 4k bank mixer hierarchy + cross-block decay + real 4MB LDM window + BWT text trial + JSON stream splitting + per-stream pipeline selection + DP optimal LZP parse + speed pass #1 (LazyLzp removed, parallel trial, mixer math) + 106 tests, all pass)
 
 | file   | orig (kb) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |--------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -157,14 +157,32 @@ secondary.
 | **JSON stream splitting + per-stream pipeline selection** (split JSON text blocks into 4 streams — structural `{}[]:,,`, keys, string values, numbers — each independently trials RawCm/BwtMtfRle/LzpBwtMtf and picks the best per stream; selector byte encodes 2 bits/stream; 4-byte orig_len prefix for decoder reconstruction) | json (478KB), big_json (1.1MB), huge_json (5.4MB), massive_json (22MB), nci (32MB) | **improved**: json 0.1% (unchanged); huge_json 2.7% (vs zstd-19 1.8%, zstd-1 2.5% — beats zstd-1); massive_json 0.81% (vs zstd-19 1.35%, zstd-1 2.48% — beats both zstd variants); nci 20.9%→9.0% (BWT trial triggers on Binary→Text); round-trip verified on all files | **kept as default** — METHOD_JSON_SPLIT=7; trial on Text blocks ≥256KB; `looks_like_json` heuristic; 0xFE markers in structural stream; per-stream pipeline selector (2 bits/stream) |
 | **Order-8 PPMd with SEE + sparse de Bruijn** (orders 0-8 with information inheritance; Secondary Escape Estimation table SEE[order][context_hash] 64K slots × 4-bit state; 3 sparse contexts [0][1][3][4], [0][1][2][5], [0][1][2][3][6][7] gap patterns capturing skip-grams; 18-bit hash, 4-bit state; 256K buckets × 12 tables = 24MB) | webster, dickens, json | **mixed** (original): webster 35.1%→34.3% (+0.8pt); dickens 46.1%→46.3% (-0.2pt); json 0.1%→0.1% (same). Config fixed: PpmdSsmBuilder now keeps WordModel + LazyLzp (matching hybrid_ppm3); context tables shrunk from 22→18 bits (24MB vs 384MB); predict loop skips empty higher-order contexts; SEE update simplified. **Awaiting re-benchmark with fair config.** | **re-evaluated** — original gap was likely due to missing WordModel + LazyLzp in comparison config. Config now matches hybrid_ppm3; model retained in `src/model/ppmd_ssm.rs` for future benchmarking. |
 | **DP optimal LZP parse** (replaced greedy longest-match in `scan_matches` with DP; cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost; threshold ≥16; matched bytes skipped in rANS, only literals CM-encoded; 8-byte match records: pos:u32 + len:u8 + dist:u24) | dickens, webster(10MB), nci, mr, json, huge_json, massive_json | **improved**: dickens 46.2%→41.9% (-4.3pt, ~parity with zstd-1); webster 35.1%→31.4% (-3.7pt, beats zstd-1 33.0%); nci 9.0%→8.2% (-0.8pt); huge_json 2.7%→1.3% (-1.4pt, beats zstd-1 2.5%); json 0.1% (unchanged). **Regressed**: mr 27.5%→29.1% (+1.6pt — likely SSM model overhead, not DP parse); massive_json 0.81%→0.97% (+0.16pt — match overhead at very high compression). Round-trip verified on all files. | **kept as experimental** — DP parse + literal-skipping is a net win on 5/7 files (text + structured data). The `mr` regression is from the SSM model added in the two_pass stack, not the DP parse itself. Feature-gated behind `--features two_pass`. Next step: isolate DP parse from SSM to confirm the regression source. |
+| **Speed pass #1 — LazyLzp removal** (LazyLzp kept a `Vec<u8>` history capped at 1MB via `history.drain(0..drop)` — an O(n²) memmove per byte once over 1MB; its match-extension loop `hlen + len < history.len()` with `hlen == history.len()` was always false, so it emitted constant 2048 — pure overhead) | dickens, webster | **3.3× encode speedup on text, zero ratio change** (dickens 2MB: 10.9s→3.3s, byte-identical output; dickens 9.7MB: >2min→14.9s, 46.2%→45.7%). Profile showed 92% of samples in `_platform_memmove` inside `LazyLzp::update` | **removed from all default stacks** (codec Text + two_pass Text + PpmdSsmBuilder). Model rewritten with a fixed-capacity ring buffer + causal extension loop, kept in-tree for future experiments |
+| **Fast-path trial heuristics + parallel trial** (skip BWT/JSON trials when block < 1MB non-JSON or shannon > 7.2; run pipeline B/C/D trials concurrently via `std::thread::scope`) | dickens, json | trial wall-time cut ~3×; json 478KB still trialed (JSON carve-out keeps 0.1% ratio); near-random text skips BWT | **kept as default** — `TRIAL_MIN_LEN` = 1MB, `TRIAL_MAX_SHANNON` = 7.2 |
+| **Mixer math** (`LogisticMixer::update` replaced `exp()` with the precomputed squash table; `update` now returns the pre-update probability `q` so `MixerBank` feeds the master without re-running the bank/global dot products — 2 fewer dot products + no transcendentals per bit) | all | ratio unchanged (json same, dickens −0.5pt from earlier optimizations) | **kept as default** |
+| **DP parse O(n·window) fix** (`Lzp::best_match` returns `(len, dist)` directly from the hash-chain walk; removed the per-position O(window) backward re-scan `find_match_with_len`) | two_pass | kills the pathological worst case on large text blocks | **kept** |
 
 Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
-method bytes + word model (text blocks only) + LazyLzp (neutral) + cross-block decay persistence + 4MB LZP
-window + BWT text trial (methods 5/6/7, per-block selection > 256KB) + JSON stream splitting (method 7) +
+method bytes + word model (text blocks only) + cross-block decay persistence + 4MB LZP
+window + BWT text trial with fast-path heuristics + parallel trial + JSON stream splitting (method 7) +
 DP optimal LZP parse (behind `--features two_pass`, experimental).**
 Default (no features): round-trip verified on all 5 files (0.1% on json, 9.0% on nci, 27.5% on mr, 35.1% on webster, 46.2% on dickens).
 Two-pass: additional gains on dickens (41.9%), webster (31.4%), nci (8.2%), huge_json (1.3%); mixed results on mr/massive_json.
 Build and tests green (106/106 default, 109/109 with two_pass).
+Speed pass #1 (LazyLzp removal + trial fast-path + parallel trial + mixer math): **~3× faster encode on text, ratio flat**.
+
+## Speed roadmap (2026-09)
+
+Slow encode (~0.5 MB/s text) is the standing pain point. Profiled hotspots and the
+planned fixes:
+
+1. **Byte-level mixer** (the big one): the per-bit loop costs 8 model-predict + 8 mixer-mix + 8
+   update passes per byte (16M bit-steps per 2MB). Switching to a 256-way byte mixer (softmax over
+   mixed per-symbol logits, one rANS symbol per byte) amortizes that 8×. Planned as default with the
+   current bit-level path retained as `--ultra`.
+2. **Fixed-point mixer** (i16 weights + precomputed stretch/squash; AVX2 `_mm256_madd_epi16` dot with
+   scalar fallback) to cut the remaining f64 division + float FMA cost in the mixers.
+3. **Byte rANS** (32-way interleaved, 2KB state buffers) to replace the per-bit `ans` scalar path.
 
 ## License
 

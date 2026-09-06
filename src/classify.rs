@@ -26,14 +26,14 @@ impl BlockKind {
     }
 }
 
-/// Classify a block.
+/// Order-0 Shannon entropy of a buffer, in bits/byte (0..8).
 ///
-/// `buf` may be empty (treated as `Random` so it is copied, never modeled).
+/// Cheap single pass over the data; used by [`classify`] and by the codec's
+/// fast-path heuristics (high-entropy blocks skip expensive BWT/DP trials).
 #[must_use]
-pub fn classify(buf: &[u8]) -> BlockKind {
-    if buf.len() < 32 {
-        // Too small to estimate reliably; copy tiny blocks.
-        return BlockKind::Random;
+pub fn shannon_estimate(buf: &[u8]) -> f32 {
+    if buf.is_empty() {
+        return 0.0;
     }
     let mut hist = [0u32; 256];
     for &b in buf {
@@ -47,6 +47,20 @@ pub fn classify(buf: &[u8]) -> BlockKind {
             h -= p * p.log2();
         }
     }
+    h
+}
+
+/// Classify a block.
+///
+/// `buf` may be empty (treated as `Random` so it is copied, never modeled).
+#[must_use]
+pub fn classify(buf: &[u8]) -> BlockKind {
+    if buf.len() < 32 {
+        // Too small to estimate reliably; copy tiny blocks.
+        return BlockKind::Random;
+    }
+    let h = shannon_estimate(buf);
+    let n = buf.len() as f32;
     let frac_printable = buf.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count() as f32 / n;
 
     if h > 7.9 {

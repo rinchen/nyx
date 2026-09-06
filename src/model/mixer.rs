@@ -220,7 +220,12 @@ impl LogisticMixer {
     /// Online update after the true `bit` is known.
     ///
     /// Base weights use Adam when `adam_t > 0`; pos_weights always use SGD.
-    pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8) {
+    ///
+    /// Returns the predicted probability `q` (the squashed accumulator with the
+    /// *pre-update* weights) that was used for this bit. Callers that blend this
+    /// mixer's output into a higher-level mixer (the master) can then reuse `q`
+    /// instead of re-mixing — the entire prediction is a single dot product.
+    pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8) -> u16 {
         let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
         let mut acc = 0.0f32;
@@ -228,7 +233,9 @@ impl LogisticMixer {
             let w = self.weights[i] + self.pos_weights[i][b];
             acc += w * self.stretch_of(p);
         }
-        let pred = 1.0 / (1.0 + (-acc).exp());
+        // pred from the precomputed squash table — no exp() in the hot loop.
+        let q = self.squash_of(acc);
+        let pred = f32::from(q) / 4095.0;
         let err = target - pred;
 
         for (i, &p) in probs.iter().enumerate() {
@@ -254,6 +261,7 @@ impl LogisticMixer {
         if self.adam_t > 0 {
             self.adam_t = self.adam_t.saturating_add(1);
         }
+        q
     }
 }
 

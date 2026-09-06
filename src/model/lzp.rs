@@ -199,6 +199,57 @@ impl Lzp {
         }
     }
 
+    /// Walk at most `MAX_CHAIN` candidates and return the best match as
+    /// `(len, dist)` — the length and the match distance — or `None` if no
+    /// candidate reaches `MIN_MATCH`.
+    ///
+    /// Unlike [`longest_match`](Self::longest_match), this reports the distance
+    /// directly from the chain walk instead of making the caller re-discover it
+    /// with an O(window) backward scan. The match-length comparison is unchanged,
+    /// so distances are exact, not estimates.
+    pub fn best_match(&self, data: &[u8], pos: usize) -> Option<(usize, usize)> {
+        if pos < 4 || pos >= data.len() {
+            return None;
+        }
+        let idx = Self::hash_static(&data[..pos]);
+        let mut best_len = 0usize;
+        let mut best_dist = 0usize;
+        let mut cur = self.heads[idx];
+        let mut walked = 0usize;
+        let limit = self.current_pos.saturating_sub(self.window);
+        while cur != 0 && walked < MAX_CHAIN {
+            let p = cur as usize;
+            let ni = p % NEXT_SIZE;
+            if p >= pos || p < limit {
+                cur = self.next[ni];
+                walked += 1;
+                continue;
+            }
+            let mut len = 0usize;
+            while pos + len < data.len() && p + len < data.len() && data[pos + len] == data[p + len]
+            {
+                len += 1;
+                if len > 255 {
+                    break;
+                }
+            }
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - p;
+                if len == 255 {
+                    break;
+                }
+            }
+            cur = self.next[ni];
+            walked += 1;
+        }
+        if best_len >= MIN_MATCH {
+            Some((best_len, best_dist))
+        } else {
+            None
+        }
+    }
+
     /// Find the most recent matching byte in the hash chain.
     /// Cached per-byte to avoid redundant chain walks on every bit.
     fn matched_byte(&mut self) -> Option<u8> {

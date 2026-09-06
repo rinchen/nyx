@@ -583,18 +583,33 @@ pub struct BwtPathResult {
     pub is_bwt: bool,
 }
 
+/// Fast-path threshold: blocks smaller than this skip the BWT/JSON trials and
+/// go straight to raw CM. Below ~1 MB the transformed-size comparison rarely pays
+/// for the BWT construction + two extra full-CM passes. JSON is exempt — its
+/// stream-split win is large enough that trialing it from 256 KB up is worth it.
+const TRIAL_MIN_LEN: usize = 1 << 20; // 1 MB
+/// Blocks remaining above this trial threshold but near-random skip all trials.
+/// (Text passed the classifier at shannon < 7.9, but rich-but-near-random text
+/// gains nothing from BWT's long-range reordering.)
+const TRIAL_MAX_SHANNON: f32 = 7.2;
+
 /// Run all three BWT paths on `data` and return the smallest.
 ///
-/// For small blocks (< 256 KB), only Path A (raw CM) is used to avoid the overhead of
-/// BWT/LZP trials. For large blocks, all three paths are tried and the one with the
-/// smallest transformed output is chosen. Only the **pipeline** and **size** are
-/// returned; the caller re-encodes with the chosen pipeline. For blocks < 256 KB,
-/// the caller can skip the BWT encode and pass the raw data directly.
+/// Fast-path heuristics: blocks < 256 KB always use raw CM (the transforms can
+/// only help long-range structure that short blocks lack). Blocks under 1 MB
+/// (256 KB..1 MB) skip trials *unless* they look like JSON — JSON stream-splitting
+/// pays off from 256 KB up. Blocks above 1 MB use a Shannon guard: near-random
+/// text skips trials too. Only the **pipeline** and **size** are returned; the
+/// caller re-encodes with the chosen pipeline.
 ///
 /// If the block looks like JSON and is large enough, a fourth path (JSON split) is
 /// also tried: the block is split into 4 streams and each is BWT-trialed independently.
 pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
-    if data.len() < 256 * 1024 {
+    let is_json = crate::json_split::looks_like_json(data);
+    let small = data.len() < 256 * 1024;
+    let medium = (256 * 1024..TRIAL_MIN_LEN).contains(&data.len()) && !is_json;
+    let near_random = crate::classify::shannon_estimate(data) > TRIAL_MAX_SHANNON;
+    if small || medium || near_random {
         return BwtPathResult {
             pipeline: BwtPipeline::RawCm,
             encoded_size: data.len(),
@@ -604,18 +619,20 @@ pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
 
     let path_a_size = data.len();
 
-    let path_b = BwtPipeline::BwtMtfRle.encode(data);
-    let path_b_size = path_b.len();
-
-    let path_c = BwtPipeline::LzpBwtMtf.encode(data);
-    let path_c_size = path_c.len();
-
-    // For JSON-like data, try stream splitting as Path D.
+    let mut path_b_size = data.len();
+    let mut path_c_size = data.len();
+    // Run Paths B, C (and D for JSON) concurrently: each is an independent
+    // transform + full-buffer comparison. This is the dominant cost of Text
+    // blocks (divsufsort + MTF/RLE passes), and they share nothing.
     let mut json_split_size: Option<usize> = None;
-    if crate::json_split::looks_like_json(data) {
-        let json_encoded = BwtPipeline::JsonSplit.encode(data);
-        json_split_size = Some(json_encoded.len());
-    }
+    std::thread::scope(|s| {
+        let hb = s.spawn(|| BwtPipeline::BwtMtfRle.encode(data).len());
+        let hc = s.spawn(|| BwtPipeline::LzpBwtMtf.encode(data).len());
+        let hd = is_json.then(|| s.spawn(|| BwtPipeline::JsonSplit.encode(data).len()));
+        path_b_size = hb.join().unwrap_or(data.len());
+        path_c_size = hc.join().unwrap_or(data.len());
+        json_split_size = hd.and_then(|h| h.join().ok());
+    });
 
     let (best_pipeline, best_size, is_bwt) = if let Some(json_size) = json_split_size {
         // Compare all four paths.

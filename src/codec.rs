@@ -19,7 +19,7 @@
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
 //! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
-//!   Exec, LazyLzp, PpmModel order-3, WordModel.
+//!   Exec, Lzp, PpmModel order-3, WordModel.
 //! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec,
 //!   LZP, PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
 //!   benefits from every signal.
@@ -77,7 +77,7 @@ pub const DEFAULT_BLOCK_SIZE_LOG: u8 = 16;
 pub const METHOD_COPY: u8 = 0;
 /// Full heterogenous CM stack (legacy / fallback).
 pub const METHOD_CM: u8 = 1;
-/// Text-optimized CM stack (orders 0–2, Sparse, Exec, LazyLzp, PpmModel order-3, WordModel).
+/// Text-optimized CM stack (orders 0–2, Sparse, Exec, Lzp, PpmModel order-3, WordModel).
 pub const METHOD_TEXT: u8 = 2;
 /// Binary CM stack (orders 0–2, Sparse, Exec, LZP, PPM order-3).
 pub const METHOD_BINARY: u8 = 3;
@@ -241,24 +241,6 @@ pub fn build_stack_for_kind(
             #[cfg(feature = "two_pass")]
             {
                 // Text-optimized stack WITH SSM + Re-Pair word model (experimental).
-                let n = 10;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lazy_lzp::LazyLzp::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                    Box::new(crate::model::word::WordModel::new()),
-                    Box::new(crate::model::ssm::SsmMixer::new()),
-                ];
-                (models, MixerBank::new(n), Some(6))
-            }
-            #[cfg(not(feature = "two_pass"))]
-            {
-                // Text-optimized stack (best configuration, no SSM/Re-Pair).
                 let n = 9;
                 let models: Vec<Box<dyn BitModel>> = vec![
                     Box::new(crate::model::order::OrderN::new(0)),
@@ -266,12 +248,30 @@ pub fn build_stack_for_kind(
                     Box::new(crate::model::order::OrderN::new(2)),
                     Box::new(crate::model::sparse::Sparse::new()),
                     Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lazy_lzp::LazyLzp::new()),
+                    Box::new(crate::model::lzp::Lzp::new()),
+                    Box::new(crate::model::ppm::PpmModel::new(3)),
+                    Box::new(crate::model::word::WordModel::new()),
+                    Box::new(crate::model::ssm::SsmMixer::new()),
+                ];
+                (models, MixerBank::new(n), Some(5))
+            }
+            #[cfg(not(feature = "two_pass"))]
+            {
+                // Text-optimized stack (best configuration, no SSM/Re-Pair).
+                // NOTE: LazyLzp removed — its `history.drain` was O(n²) on text
+                // (92% of encode time) and always predicted neutral (2048).
+                let n = 8;
+                let models: Vec<Box<dyn BitModel>> = vec![
+                    Box::new(crate::model::order::OrderN::new(0)),
+                    Box::new(crate::model::order::OrderN::new(1)),
+                    Box::new(crate::model::order::OrderN::new(2)),
+                    Box::new(crate::model::sparse::Sparse::new()),
+                    Box::new(crate::model::exec::Exec::new()),
                     Box::new(crate::model::lzp::Lzp::new()),
                     Box::new(crate::model::ppm::PpmModel::new(3)),
                     Box::new(crate::model::word::WordModel::new()),
                 ];
-                (models, MixerBank::new(n), Some(6))
+                (models, MixerBank::new(n), Some(5))
             }
         }
         crate::classify::BlockKind::Binary => {
@@ -522,18 +522,16 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
 
     // Phase 1: pre-compute the best match at every position.
     // best_match[i] = Some((len, dist)) if a match of >= MATCH_MIN_LEN exists at position i.
+    // The LZP chain walk reports (len, dist) in one pass — no O(window) backward
+    // re-scan per position, which was the pathological blow-up on large text blocks.
     let mut best_match: Vec<Option<(usize, usize)>> = vec![None; n];
     for i in 0..n {
         lzp.train_at(block, i);
         if i + 1 >= 16 && i + MATCH_MIN_LEN <= n {
-            if let Some(raw_len) = lzp.longest_match(block, i) {
-                if raw_len >= MATCH_MIN_LEN {
-                    let len = raw_len.min(255);
-                    if let Some(dist) = find_match_with_len(block, i, len, window) {
-                        if dist > 0 && dist <= window {
-                            best_match[i] = Some((len, dist));
-                        }
-                    }
+            if let Some((len, dist)) = lzp.best_match(block, i) {
+                let len = len.min(255);
+                if len >= MATCH_MIN_LEN && dist > 0 && dist <= window {
+                    best_match[i] = Some((len, dist));
                 }
             }
         }
@@ -590,24 +588,6 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     }
 
     runs
-}
-
-#[cfg(feature = "two_pass")]
-/// Find the match distance for a match of exactly `len` bytes at position `pos`.
-/// Searches backwards from `pos - len` to find the matching position.
-fn find_match_with_len(data: &[u8], pos: usize, len: usize, window: usize) -> Option<usize> {
-    if pos < len || len == 0 || pos + len > data.len() {
-        return None;
-    }
-    let needle = &data[pos..pos + len];
-    let start = pos.saturating_sub(window);
-    // Search backwards for the closest match (greedy within DP framework).
-    for back in (start..=pos - len).rev() {
-        if data[back..back + len] == *needle {
-            return Some(pos - back);
-        }
-    }
-    None
 }
 
 #[cfg(feature = "two_pass")]

@@ -59,8 +59,9 @@ impl HybridPpm3Builder {
 
 /// Stack using the PpmdSsm model (orders 0-8 + SEE + sparse de Bruijn contexts)
 /// instead of PpmModel(3). Useful for comparing PPMd vs vanilla PPM on text.
-/// Unlike the original PpmdSsmBuilder, this version keeps WordModel + LazyLzp
-/// in the stack, matching the hybrid_ppm3 configuration.
+/// Unlike the original PpmdSsmBuilder, this version keeps WordModel in the
+/// stack, matching the hybrid_ppm3 configuration. (LazyLzp removed for speed —
+/// its drain-based history was O(n²) on large blocks.)
 impl PpmdSsmBuilder {
     #[must_use]
     pub fn build() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
@@ -71,7 +72,6 @@ impl PpmdSsmBuilder {
             Box::new(Sparse::new()),
             Box::new(Exec::new()),
             Box::new(Lzp::new()),
-            Box::new(crate::model::lazy_lzp::LazyLzp::new()),
             Box::new(PpmdSsm::new()),
             Box::new(crate::model::word::WordModel::new()),
         ];
