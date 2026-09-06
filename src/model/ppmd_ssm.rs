@@ -37,8 +37,9 @@ use super::ByteAssembler;
 const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
-/// Address bits for context tables: 2^22 = 4M buckets.
-const CTX_BITS: u32 = 22;
+/// Address bits for context tables: 2^18 = 256K buckets per table.
+/// 9 order tables + 3 sparse = 12 tables × 256K × 8 bytes = 24MB total.
+const CTX_BITS: u32 = 18;
 
 /// Number of states in the SEE table (4-bit state).
 const SEE_STATES: usize = 16;
@@ -209,12 +210,15 @@ impl BitModel for PpmdSsm {
         // Walk from highest order down. For each non-empty context, blend the raw bit
         // probability with the lower-order prediction via an escape probability
         // adjusted by the SEE table.
+        // Only walk orders up to the current assembler depth (beyond that, contexts
+        // are empty and we'd waste time hashing nothing).
         let bit_pos = self.asm.nbits();
+        let max_order = self.asm.bytes_len().min(MAX_ORDER as u64) as usize;
         let mut p_lower: f64 = 2048.0;
         let mut used = 0usize;
         let mut escaped_orders: u32 = 0;
 
-        for order in (0..=MAX_ORDER).rev() {
+        for order in (0..=max_order).rev() {
             let ctx = self.ctx(order);
             let [c0, c1] = self.orders[order].get(ctx);
             let tot = c0 + c1;
@@ -279,18 +283,17 @@ impl BitModel for PpmdSsm {
         let escaped_orders = self.last_escaped_orders.get();
         let bit_pos = self.asm.nbits();
 
-        // Update the trusted order and order-0 (standard PPM update rule).
-        for order in [0, used] {
+        // Update only the trusted order + order 0 (standard PPM rule).
+        // Orders that escaped had their counts already read (not written) during
+        // predict; only the order that provided the final prediction gets updated
+        // with the new bit. This is both correct (matches PpmModel behavior)
+        // and fast (at most 2 table writes per bit).
+        for order in [0usize, used].into_iter() {
             let ctx = self.ctx(order);
             self.orders[order].update(ctx, bit);
-        }
-
-        // Update SEE state for each order that escaped during predict().
-        for order in 0..=MAX_ORDER {
-            if (escaped_orders >> order) & 1 != 0 {
-                let ctx = self.ctx(order);
-                self.see.update(order, Self::see_hash(ctx, bit_pos), true);
-            }
+            // Update SEE: escaped orders get escape=true, lower orders get false.
+            let escaped = (escaped_orders >> order) & 1 != 0;
+            self.see.update(order, Self::see_hash(ctx, bit_pos), escaped);
         }
 
         // Update sparse context tables.
