@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use nyx::codec::{compress, decompress};
+use nyx::codec::{self, decompress, CodecMode};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +25,14 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ModeArg {
+    /// Bit-level CM (higher ratio, slower).
+    Slow,
+    /// Byte-level CM (faster, slightly worse ratio).
+    Fast,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Compress a file into a .nyx (NYX1) container.
@@ -34,6 +42,9 @@ enum Cmd {
         /// Entropy backend (only `rans` is built in).
         #[arg(long, default_value = "rans")]
         backend: String,
+        /// Entropy mode: `slow` (bit-level CM, default) or `fast` (byte-level CM).
+        #[arg(long, value_enum, default_value_t = ModeArg::Slow)]
+        mode: ModeArg,
     },
     /// Decompress a .nyx (NYX1) container back to a file.
     Decompress { input: PathBuf, output: PathBuf },
@@ -43,6 +54,9 @@ enum Cmd {
         /// Reserved for SOTA comparison (see `scripts/bench_vs_sota.sh`).
         #[arg(long)]
         vs: Option<String>,
+        /// Use the byte-level (fast) entropy mode.
+        #[arg(long)]
+        fast: bool,
     },
     /// Run the library test suite and report PASS/FAIL.
     SelfTest,
@@ -62,21 +76,31 @@ fn run() -> Result<(), String> {
             input,
             output,
             backend,
-        } => cmd_compress(&input, &output, &backend),
+            mode,
+        } => cmd_compress(&input, &output, &backend, mode),
         Cmd::Decompress { input, output } => cmd_decompress(&input, &output),
-        Cmd::Bench { corpus, vs } => cmd_bench(&corpus, vs.as_deref()),
+        Cmd::Bench { corpus, vs, fast } => cmd_bench(&corpus, vs.as_deref(), fast),
         Cmd::SelfTest => cmd_selftest(),
     }
 }
 
-fn cmd_compress(input: &PathBuf, output: &PathBuf, backend: &str) -> Result<(), String> {
+fn cmd_compress(
+    input: &PathBuf,
+    output: &PathBuf,
+    backend: &str,
+    mode: ModeArg,
+) -> Result<(), String> {
     if backend != "rans" {
         return Err(format!(
             "unsupported backend '{backend}' (only 'rans' is built in)"
         ));
     }
     let data = fs::read(input).map_err(|e| format!("read {}: {e}", input.display()))?;
-    let compressed = compress(&data).map_err(|e| format!("compress failed: {e}"))?;
+    let mode = match mode {
+        ModeArg::Slow => CodecMode::Slow,
+        ModeArg::Fast => CodecMode::Fast,
+    };
+    let compressed = codec::compress_mode(&data, mode).map_err(|e| format!("compress failed: {e}"))?;
     fs::write(output, &compressed).map_err(|e| format!("write {}: {e}", output.display()))?;
     let ratio = compressed.len() as f64 / (data.len() as f64).max(1.0);
     eprintln!(
@@ -102,13 +126,14 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_bench(corpus: &PathBuf, vs: Option<&str>) -> Result<(), String> {
+fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool) -> Result<(), String> {
     if !corpus.is_dir() {
         return Err(format!(
             "corpus path {} is not a directory",
             corpus.display()
         ));
     }
+    let mode = if fast { CodecMode::Fast } else { CodecMode::Slow };
     println!(
         "{:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",
         "name", "orig_kb", "comp_kb", "ratio%", "cmp_MBps", "dec_MBps"
@@ -139,7 +164,7 @@ fn cmd_bench(corpus: &PathBuf, vs: Option<&str>) -> Result<(), String> {
         }
 
         let enc_start = Instant::now();
-        let Ok(compressed) = compress(&data) else {
+        let Ok(compressed) = codec::compress_mode(&data, mode) else {
             continue;
         };
         let enc_ms = enc_start.elapsed().as_secs_f64() * 1000.0;

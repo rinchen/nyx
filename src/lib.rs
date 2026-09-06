@@ -12,6 +12,7 @@
 )]
 
 pub mod bwt;
+pub mod bytecodec;
 pub mod classify;
 pub mod codec;
 pub mod container;

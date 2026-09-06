@@ -4,11 +4,12 @@ A from-scratch Rust lossless compressor with a **per-block data-type classifier*
 and an **online logistic bit-mixer** (LZP pre-stage + rANS-grade entropy coder).
 It is a self-contained CLI with its own `NYX1` container format.
 
-> **Status: actively improving.** Nyx is a working implementation of bit-level context
-> mixing with an online logistic mixer and its own `NYX1` container format. The
+> **Status: actively improving.** Nyx is a working implementation of context
+> mixing with an online logistic mixer and its own `NYX1` container format. It
+> ships two entropy paths: `--mode slow` (the bit-level 8–9 model logistic mixer)
+> and `--mode fast` (a PPM-style single-context count coder + byte rANS). The
 > current benchmark target is **ratio parity with `zstd -1`** on text + mixed
-> corpora, with `FSE` (Finite State Entropy) as a secondary reference. Speed is
-> a documented architectural constant, not the tuning target. See
+> corpora, with `FSE` (Finite State Entropy) as a secondary reference. See
 > [Benchmarks](#benchmarks) for the real numbers (ratio and speed).
 
 ## The method
@@ -160,7 +161,8 @@ secondary.
 | **Speed pass #1 — LazyLzp removal** (LazyLzp kept a `Vec<u8>` history capped at 1MB via `history.drain(0..drop)` — an O(n²) memmove per byte once over 1MB; its match-extension loop `hlen + len < history.len()` with `hlen == history.len()` was always false, so it emitted constant 2048 — pure overhead) | dickens, webster | **3.3× encode speedup on text, zero ratio change** (dickens 2MB: 10.9s→3.3s, byte-identical output; dickens 9.7MB: >2min→14.9s, 46.2%→45.7%). Profile showed 92% of samples in `_platform_memmove` inside `LazyLzp::update` | **removed from all default stacks** (codec Text + two_pass Text + PpmdSsmBuilder). Model rewritten with a fixed-capacity ring buffer + causal extension loop, kept in-tree for future experiments |
 | **Fast-path trial heuristics + parallel trial** (skip BWT/JSON trials when block < 1MB non-JSON or shannon > 7.2; run pipeline B/C/D trials concurrently via `std::thread::scope`) | dickens, json | trial wall-time cut ~3×; json 478KB still trialed (JSON carve-out keeps 0.1% ratio); near-random text skips BWT | **kept as default** — `TRIAL_MIN_LEN` = 1MB, `TRIAL_MAX_SHANNON` = 7.2 |
 | **Mixer math** (`LogisticMixer::update` replaced `exp()` with the precomputed squash table; `update` now returns the pre-update probability `q` so `MixerBank` feeds the master without re-running the bank/global dot products — 2 fewer dot products + no transcendentals per bit) | all | ratio unchanged (json same, dickens −0.5pt from earlier optimizations) | **kept as default** |
-| **DP parse O(n·window) fix** (`Lzp::best_match` returns `(len, dist)` directly from the hash-chain walk; removed the per-position O(window) backward re-scan `find_match_with_len`) | two_pass | kills the pathological worst case on large text blocks | **kept** |
+ | **DP parse O(n·window) fix** (`Lzp::best_match` returns `(len, dist)` directly from the hash-chain walk; removed the per-position O(window) backward re-scan `find_match_with_len`) | two_pass | kills the pathological worst case on large text blocks | **kept** |
+ | **Speed pass #2 — byte-level "fast" path** (`--mode fast`; `src/bytecodec.rs` PPM-style single-context count coder: deterministic order-0/1/2 selector + fused 256-symbol cumulative `walk_dist` + byte rANS in `src/entropy/byterans.rs`; no mixer/softmax) | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** (fast 1.15s/0.279x vs slow 2.97s/0.470x; round-trip verified; full suite 118/118 green incl. exact-triple `walk_roundtrip_exact`). Note: byte models (trained on transformed streams) beat the text-builtin bit models here — as predicted for CM after BWT+MTF | **new default `--mode fast`**, slow path retained as `--mode slow` |
 
 Current best configuration is **hybrid_ppm3 + two-level 4k bank mixer (bank → global → master) + classifier-aware
 method bytes + word model (text blocks only) + cross-block decay persistence + 4MB LZP
@@ -170,19 +172,24 @@ Default (no features): round-trip verified on all 5 files (0.1% on json, 9.0% on
 Two-pass: additional gains on dickens (41.9%), webster (31.4%), nci (8.2%), huge_json (1.3%); mixed results on mr/massive_json.
 Build and tests green (106/106 default, 109/109 with two_pass).
 Speed pass #1 (LazyLzp removal + trial fast-path + parallel trial + mixer math): **~3× faster encode on text, ratio flat**.
+Speed pass #2 (byte-level fast path, PPM-style count coder + byte rANS, no mixer): **~2.6× faster than slow on dickens 2MB with ~1.7× better ratio on BWT+MTF streams**.
 
 ## Speed roadmap (2026-09)
 
-Slow encode (~0.5 MB/s text) is the standing pain point. Profiled hotspots and the
-planned fixes:
+Slow encode remains the standing pain point but the byte-level fast path is now in
+place (Speed pass #2): a PPM-style count coder (`--mode fast`) with deterministic
+order-0/1/2 selection and a fused cumulative `walk_dist` + byte rANS, ~2.6× faster
+than the bit path on dickens 2MB with a much better ratio on BWT+MTF streams.
 
-1. **Byte-level mixer** (the big one): the per-bit loop costs 8 model-predict + 8 mixer-mix + 8
-   update passes per byte (16M bit-steps per 2MB). Switching to a 256-way byte mixer (softmax over
-   mixed per-symbol logits, one rANS symbol per byte) amortizes that 8×. Planned as default with the
-   current bit-level path retained as `--ultra`.
-2. **Fixed-point mixer** (i16 weights + precomputed stretch/squash; AVX2 `_mm256_madd_epi16` dot with
+Planned next steps (slow `--mode slow` path still dominates on some inputs):
+
+1. **Fixed-point mixer** (i16 weights + precomputed stretch/squash; AVX2 `_mm256_madd_epi16` dot with
    scalar fallback) to cut the remaining f64 division + float FMA cost in the mixers.
-3. **Byte rANS** (32-way interleaved, 2KB state buffers) to replace the per-bit `ans` scalar path.
+2. **Interleaved byte rANS** (32-way, 2KB state buffers) to replace the scalar
+   single-stream rANS state step in the fast path.
+3. **Wider refrain/context tuning for the fast path** — measure the corpus files
+   under `--mode fast` to pick where the simple count coder beats the bit path and
+   where the slow path should remain the default.
 
 ## License
 

@@ -89,6 +89,23 @@ pub const METHOD_BWT_MTF_RLE: u8 = 5;
 pub const METHOD_LZP_BWT_MTF: u8 = 6;
 /// Text JSON split path: split JSON into 4 streams → 4× BWT → CM.
 pub const METHOD_JSON_SPLIT: u8 = 7;
+/// Byte-level CM (fast path): orders 0–2 count models + byte rANS.
+pub const METHOD_BYTE_CM: u8 = 8;
+/// Text BWT+RLE0 path, byte-coded (fast).
+pub const METHOD_BYTE_BWT_MTF_RLE: u8 = 9;
+/// Text LZP→BWT→MTF path, byte-coded (fast).
+pub const METHOD_BYTE_LZP_BWT_MTF: u8 = 10;
+/// Text JSON split path, byte-coded (fast).
+pub const METHOD_BYTE_JSON_SPLIT: u8 = 11;
+
+/// Encoding strategy for [`compress_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecMode {
+    /// Bit-level CM: 8–9 models + two-level bank mixer + bit rANS (current default).
+    Slow,
+    /// Byte-level CM: orders 0–2 count models + byte rANS.
+    Fast,
+}
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
 /// weight structure per block boundary, smoothly transferring context without
@@ -101,10 +118,36 @@ const BLOCK_DECAY: f32 = 0.995;
 ///
 /// Returns [`NyxError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
-    compress_with(buf, &mut build_stack_for_kind)
+    compress_mode(buf, CodecMode::Slow)
+}
+
+/// Compress `buf` using the byte-level (fast) path.
+///
+/// # Errors
+///
+/// Returns [`NyxError`] if an entropy primitive fails.
+pub fn compress_fast(buf: &[u8]) -> Result<Vec<u8>> {
+    compress_mode(buf, CodecMode::Fast)
 }
 
 pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
+where
+    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+{
+    compress_impl(buf, CodecMode::Slow, build_stack)
+}
+
+/// Compress with an explicit [`CodecMode`]. Both encoder sides of a given
+/// mode decode correctly from the method byte in the container.
+///
+/// # Errors
+///
+/// Returns [`NyxError`] if an entropy primitive fails.
+pub fn compress_mode(buf: &[u8], mode: CodecMode) -> Result<Vec<u8>> {
+    compress_impl(buf, mode, &mut build_stack_for_kind)
+}
+
+fn compress_impl<F>(buf: &[u8], mode: CodecMode, build_stack: &mut F) -> Result<Vec<u8>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
 {
@@ -125,7 +168,7 @@ where
         let end = (offset + block_size).min(buf.len());
         let block_data = &buf[offset..end];
 
-        if last_kind != Some(kind) {
+        if mode == CodecMode::Slow && last_kind != Some(kind) {
             let (new_models, new_mixer, new_lzp_idx) = build_stack(kind);
             models = new_models;
             mixer = new_mixer;
@@ -133,31 +176,9 @@ where
             last_kind = Some(kind);
         }
 
-        // Random blocks: store verbatim (method COPY). Don't run CM on
-        // entropy-poor data — the rANS path would inflate and the decoder
-        // treats METHOD_COPY as a passthrough anyway.
-        let (comp, method, store_orig_len) = if kind == crate::classify::BlockKind::Random {
-            (block_data.to_vec(), METHOD_COPY, block_data.len())
-        } else if kind == crate::classify::BlockKind::Text {
-            // Per-block trial: pick the best BWT pipeline for this Text block.
-            let trial = bwt::compress_text_with_trial(block_data);
-            let method = match trial.pipeline {
-                bwt::BwtPipeline::RawCm => METHOD_TEXT,
-                bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
-                bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
-                bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
-            };
-            // Transform the block data through the chosen pipeline, then CM-encode.
-            let transformed = trial.pipeline.encode(block_data);
-            // For BWT paths, `orig_len` stores the *transformed* length (what the
-            // decoder must decode from rANS). The original length is recovered
-            // during BWT reversal; correctness is verified by CRC.
-            let comp = compress_block(&mut models, &mut mixer, lzp_idx, &transformed);
-            (comp, method, transformed.len())
-        } else {
-            // Binary / Exec: raw CM with the existing stack.
-            let comp = compress_block(&mut models, &mut mixer, lzp_idx, block_data);
-            (comp, method_for_kind(kind), block_data.len())
+        let (comp, method, store_orig_len) = match mode {
+            CodecMode::Fast => encode_block_fast(block_data, kind),
+            CodecMode::Slow => encode_block_slow(block_data, kind, &mut models, &mut mixer, lzp_idx),
         };
 
         let entry = BlockEntry {
@@ -174,7 +195,7 @@ where
         // structure across same-kind blocks in the stream. Skip for copy blocks
         // (no models were trained, no mixer state to decay) — mirrors the
         // decoder's `entry.method != METHOD_COPY` guard.
-        if method != METHOD_COPY {
+        if mode == CodecMode::Slow && method != METHOD_COPY {
             mixer.decay(BLOCK_DECAY);
         }
     }
@@ -191,6 +212,80 @@ where
     }
     out.extend_from_slice(&payloads);
     Ok(out)
+}
+
+/// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
+fn encode_block_fast(
+    block_data: &[u8],
+    kind: crate::classify::BlockKind,
+) -> (Vec<u8>, u8, usize) {
+    if kind == crate::classify::BlockKind::Random {
+        (block_data.to_vec(), METHOD_COPY, block_data.len())
+    } else if kind == crate::classify::BlockKind::Text {
+        // Same BWT trial as the bit path; the chosen pipeline's output is then
+        // byte-coded (one rANS symbol per byte instead of per bit).
+        let trial = bwt::compress_text_with_trial(block_data);
+        let transformed = trial.pipeline.encode(block_data);
+        let (comp, method) = match trial.pipeline {
+            bwt::BwtPipeline::RawCm => (crate::bytecodec::compress_block(&transformed), METHOD_BYTE_CM),
+            bwt::BwtPipeline::BwtMtfRle => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_BWT_MTF_RLE,
+            ),
+            bwt::BwtPipeline::LzpBwtMtf => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_LZP_BWT_MTF,
+            ),
+            bwt::BwtPipeline::JsonSplit => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_JSON_SPLIT,
+            ),
+        };
+        (comp, method, transformed.len())
+    } else {
+        // Binary / Exec: raw byte CM.
+        (
+            crate::bytecodec::compress_block(block_data),
+            METHOD_BYTE_CM,
+            block_data.len(),
+        )
+    }
+}
+
+/// Slow-mode per-block encode: bit-level CM with the classifier-aware stacks.
+fn encode_block_slow(
+    block_data: &[u8],
+    kind: crate::classify::BlockKind,
+    models: &mut [Box<dyn BitModel>],
+    mixer: &mut MixerBank,
+    lzp_idx: Option<usize>,
+) -> (Vec<u8>, u8, usize) {
+    // Random blocks: store verbatim (method COPY). Don't run CM on
+    // entropy-poor data — the rANS path would inflate and the decoder
+    // treats METHOD_COPY as a passthrough anyway.
+    if kind == crate::classify::BlockKind::Random {
+        (block_data.to_vec(), METHOD_COPY, block_data.len())
+    } else if kind == crate::classify::BlockKind::Text {
+        // Per-block trial: pick the best BWT pipeline for this Text block.
+        let trial = bwt::compress_text_with_trial(block_data);
+        let method = match trial.pipeline {
+            bwt::BwtPipeline::RawCm => METHOD_TEXT,
+            bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
+            bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
+            bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
+        };
+        // Transform the block data through the chosen pipeline, then CM-encode.
+        let transformed = trial.pipeline.encode(block_data);
+        // For BWT paths, `orig_len` stores the *transformed* length (what the
+        // decoder must decode from rANS). The original length is recovered
+        // during BWT reversal; correctness is verified by CRC.
+        let comp = compress_block(models, mixer, lzp_idx, &transformed);
+        (comp, method, transformed.len())
+    } else {
+        // Binary / Exec: raw CM with the existing stack.
+        let comp = compress_block(models, mixer, lzp_idx, block_data);
+        (comp, method_for_kind(kind), block_data.len())
+    }
 }
 
 fn block_size_for_kind(
@@ -828,6 +923,30 @@ where
 
         let block = if entry.method == METHOD_COPY {
             comp.to_vec()
+        } else if matches!(
+            entry.method,
+            METHOD_BYTE_CM
+                | METHOD_BYTE_BWT_MTF_RLE
+                | METHOD_BYTE_LZP_BWT_MTF
+                | METHOD_BYTE_JSON_SPLIT
+        ) {
+            // Byte-level (fast) path: one rANS symbol per byte.
+            let decoded = crate::bytecodec::decompress_block(comp, entry.orig_len as usize)
+                .map_err(|e| match e {
+                    NyxError::CorruptBlock(s) => NyxError::CorruptBlock(s),
+                    other => other,
+                })?;
+            match entry.method {
+                METHOD_BYTE_BWT_MTF_RLE => bwt::bwt_mtf_rle_decode(&decoded),
+                METHOD_BYTE_LZP_BWT_MTF => {
+                    let mtf = bwt::bwt_mtf_decode(&decoded);
+                    bwt::lzp_decode(&mtf, entry.orig_len as usize)
+                }
+                METHOD_BYTE_JSON_SPLIT => {
+                    bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
+                }
+                _ => decoded,
+            }
         } else {
             let kind = kind_for_method(entry.method)?;
             if last_kind != Some(kind) {
@@ -887,6 +1006,10 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
         METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT => Ok(crate::classify::BlockKind::Text),
+        METHOD_BYTE_CM
+        | METHOD_BYTE_BWT_MTF_RLE
+        | METHOD_BYTE_LZP_BWT_MTF
+        | METHOD_BYTE_JSON_SPLIT => Ok(crate::classify::BlockKind::Text),
         _ => Err(NyxError::InvalidContainer(format!(
             "unknown method {}",
             method
