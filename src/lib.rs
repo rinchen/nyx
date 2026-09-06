@@ -17,5 +17,6 @@ pub mod codec;
 pub mod container;
 pub mod entropy;
 pub mod error;
+pub mod json_split;
 pub mod model;
 pub mod stacks;

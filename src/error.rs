@@ -24,6 +24,10 @@ pub enum NyxError {
     /// An entropy-coding primitive failed.
     #[error("entropy coder error: {0}")]
     Entropy(String),
+
+    /// JSON stream splitting/merging failed (corrupt sub-stream).
+    #[error("json split error: {0}")]
+    JsonSplitError(String),
 }
 
 /// Convenience alias for codec results.

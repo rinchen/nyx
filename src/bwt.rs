@@ -408,16 +408,37 @@ pub enum BwtPipeline {
     BwtMtfRle,
     /// Path C: LZP → BWT → MTF → CM (no RLE0).
     LzpBwtMtf,
+    /// Path D: JSON stream split → 4× independent BWT trials → CM.
+    JsonSplit,
 }
 
 impl BwtPipeline {
     /// Encode `data` using this pipeline, returning the payload that CM/rANS will
     /// compress. For `RawCm`, the payload IS the original data.
+    ///
+    /// For `JsonSplit`, the payload is: `[4×4-byte stream lengths][4 BWT-encoded streams]`.
     pub fn encode(self, data: &[u8]) -> Vec<u8> {
         match self {
             BwtPipeline::RawCm => data.to_vec(),
             BwtPipeline::BwtMtfRle => bwt_mtf_rle_encode(data),
             BwtPipeline::LzpBwtMtf => bwt_mtf_encode(&lzp_encode(data)),
+            BwtPipeline::JsonSplit => {
+                let streams = crate::json_split::split(data);
+                let s0 = bwt_mtf_rle_encode(&streams.structural);
+                let s1 = bwt_mtf_rle_encode(&streams.keys);
+                let s2 = bwt_mtf_rle_encode(&streams.string_values);
+                let s3 = bwt_mtf_rle_encode(&streams.numbers);
+                // Layout: [s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
+                let mut out = Vec::with_capacity(data.len());
+                out.extend_from_slice(&(s0.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(s1.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(s2.len() as u32).to_le_bytes());
+                out.extend_from_slice(&s0);
+                out.extend_from_slice(&s1);
+                out.extend_from_slice(&s2);
+                out.extend_from_slice(&s3);
+                out
+            }
         }
     }
 
@@ -429,6 +450,33 @@ impl BwtPipeline {
             BwtPipeline::LzpBwtMtf => {
                 let mtf = bwt_mtf_decode(payload);
                 lzp_decode(&mtf, orig_len)
+            }
+            BwtPipeline::JsonSplit => {
+                if payload.len() < 12 {
+                    return Vec::new();
+                }
+                let s0_len =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                let s1_len =
+                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                let s2_len =
+                    u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+                let mut pos = 12;
+                let s0 = &payload[pos..pos + s0_len];
+                pos += s0_len;
+                let s1 = &payload[pos..pos + s1_len];
+                pos += s1_len;
+                let s2 = &payload[pos..pos + s2_len];
+                pos += s2_len;
+                let s3 = &payload[pos..];
+                let streams = crate::json_split::JsonStreams {
+                    structural: bwt_mtf_rle_decode(s0),
+                    keys: bwt_mtf_rle_decode(s1),
+                    string_values: bwt_mtf_rle_decode(s2),
+                    numbers: bwt_mtf_rle_decode(s3),
+                };
+                crate::json_split::merge(&streams, orig_len)
+                    .unwrap_or_else(|_| crate::json_split::merge_naive(&streams, orig_len))
             }
         }
     }
@@ -452,6 +500,9 @@ pub struct BwtPathResult {
 /// smallest transformed output is chosen. Only the **pipeline** and **size** are
 /// returned; the caller re-encodes with the chosen pipeline. For blocks < 256 KB,
 /// the caller can skip the BWT encode and pass the raw data directly.
+///
+/// If the block looks like JSON and is large enough, a fourth path (JSON split) is
+/// also tried: the block is split into 4 streams and each is BWT-trialed independently.
 pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
     if data.len() < 256 * 1024 {
         return BwtPathResult {
@@ -469,14 +520,33 @@ pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
     let path_c = BwtPipeline::LzpBwtMtf.encode(data);
     let path_c_size = path_c.len();
 
-    let (best_pipeline, best_size, is_bwt) =
+    // For JSON-like data, try stream splitting as Path D.
+    let mut json_split_size: Option<usize> = None;
+    if crate::json_split::looks_like_json(data) {
+        let json_encoded = BwtPipeline::JsonSplit.encode(data);
+        json_split_size = Some(json_encoded.len());
+    }
+
+    let (best_pipeline, best_size, is_bwt) = if let Some(json_size) = json_split_size {
+        // Compare all four paths.
+        if json_size <= path_a_size && json_size <= path_b_size && json_size <= path_c_size {
+            (BwtPipeline::JsonSplit, json_size, true)
+        } else if path_b_size <= path_a_size && path_b_size <= path_c_size {
+            (BwtPipeline::BwtMtfRle, path_b_size, true)
+        } else if path_c_size <= path_a_size && path_c_size <= path_b_size {
+            (BwtPipeline::LzpBwtMtf, path_c_size, true)
+        } else {
+            (BwtPipeline::RawCm, path_a_size, false)
+        }
+    } else {
         if path_b_size <= path_a_size && path_b_size <= path_c_size {
             (BwtPipeline::BwtMtfRle, path_b_size, true)
         } else if path_c_size <= path_a_size && path_c_size <= path_b_size {
             (BwtPipeline::LzpBwtMtf, path_c_size, true)
         } else {
             (BwtPipeline::RawCm, path_a_size, false)
-        };
+        }
+    };
 
     BwtPathResult {
         pipeline: best_pipeline,

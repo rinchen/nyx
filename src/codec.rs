@@ -82,6 +82,8 @@ pub const METHOD_EXEC: u8 = 4;
 pub const METHOD_BWT_MTF_RLE: u8 = 5;
 /// Text BWT path: LZP(4MB) → BWT → MTF → CM (no RLE0).
 pub const METHOD_LZP_BWT_MTF: u8 = 6;
+/// Text JSON split path: split JSON into 4 streams → 4× BWT → CM.
+pub const METHOD_JSON_SPLIT: u8 = 7;
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
 /// weight structure per block boundary, smoothly transferring context without
@@ -138,6 +140,7 @@ where
                 bwt::BwtPipeline::RawCm => METHOD_TEXT,
                 bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
                 bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
+                bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
             };
             // Transform the block data through the chosen pipeline, then CM-encode.
             let transformed = trial.pipeline.encode(block_data);
@@ -685,6 +688,9 @@ where
                     let mtf = bwt::bwt_mtf_decode(&decoded);
                     bwt::lzp_decode(&mtf, entry.orig_len as usize)
                 }
+                METHOD_JSON_SPLIT => {
+                    bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
+                }
                 _ => decoded,
             }
         };
@@ -713,7 +719,7 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         METHOD_CM | METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
-        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF => Ok(crate::classify::BlockKind::Text),
+        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT => Ok(crate::classify::BlockKind::Text),
         _ => Err(NyxError::InvalidContainer(format!(
             "unknown method {}",
             method
