@@ -32,12 +32,16 @@
 //! ## Two-pass CM residual (experimental, behind `two_pass` feature)
 //!
 //! When the `two_pass` feature is enabled, nyx runs a forward LZP match pre-pass
-//! and emits explicit `(len, dist)` records for long matches (≥ 8 bytes).
-//! The `Two-pass CM residual` feature adds an SsmMixer (8-dim Mamba-style state-space
-//! model) and a Byte-Pair Re-Pair dictionary to the word model as additional base
-//! models. NOTE: measured on the 5-file Silesia subset, the SSM + Re-Pair + match
-//! side-stream combination caused a net regression (nci 20.9%→33.3%, webster 45.1%→57.6%,
-//! etc.), so it is behind a feature flag and off by default.
+//! with **DP optimal parsing** and emits explicit `(len, dist)` records for long
+//! matches (≥ 16 bytes). Matched bytes are **skipped** in the rANS stream —
+//! only literals (non-matched bytes) are CM-encoded. The decoder reconstructs
+//! matched bytes by copying from history.
+//!
+//! Match selection cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost,
+//! where residual_cost is estimated as len × AVG_BITS_PER_BYTE (CM cost per byte).
+//! A match is taken when its overhead (33 bits) is less than the CM cost of the
+//! matched bytes (len × 4 bits), i.e., len > 8.25. With MATCH_MIN_LEN=16, matches
+//! always save net bits.
 //!
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
@@ -56,11 +60,12 @@ use crate::model::lzp::Lzp;
 use crate::model::ssm::SsmMixer;
 
 #[cfg(feature = "two_pass")]
-const MATCH_MIN_LEN: usize = 8;
+const MATCH_MIN_LEN: usize = 16;
 
 #[cfg(feature = "two_pass")]
 #[derive(Debug, Clone, Copy)]
 struct MatchRun {
+    pos: usize,
     len: usize,
     dist: usize,
 }
@@ -344,9 +349,10 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) 
 
 /// Compress one block.
 ///
-/// With `two_pass` feature: runs a match pre-pass, emits (len, dist) side-stream, then
-/// rANS-encodes ALL bytes (Stage 1 — match records present but not yet used for residual
-/// skipping, since Stage 2 decoder is blocked on state synchronization).
+/// With `two_pass` feature: runs DP-optimal LZP match pre-pass, emits (len, dist, pos)
+/// side-stream records, then rANS-encodes only **literal** (non-matched) bytes.
+/// Matched bytes are reconstructed by the decoder from the side-stream.
+///
 /// Without `two_pass`: plain CM encoding of all bytes.
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
@@ -420,34 +426,82 @@ fn encode_block_with_matches(
         m.prepare_block(block);
     }
 
-    // Match side-stream
+    // Match side-stream: [num_runs:u32][pos:u32][len:u8][dist:u24] per record
     out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
     for r in runs {
+        out.extend_from_slice(&(r.pos as u32).to_le_bytes());
         out.push(r.len as u8);
-        out.extend_from_slice(&(r.dist as u32).to_le_bytes());
+        // Store dist as 3 bytes (u24, max 16MB window)
+        out.push((r.dist >> 16) as u8);
+        out.push((r.dist >> 8) as u8);
+        out.push(r.dist as u8);
     }
 
+    // Build a position→length map for matched regions.
+    let mut match_len_at: Vec<usize> = vec![0; block.len()];
+    for r in runs {
+        if r.pos < block.len() && match_len_at[r.pos] < r.len {
+            match_len_at[r.pos] = r.len;
+        }
+    }
+
+    // rANS-encode only literal bytes (skip matched regions).
     let mut enc = BitEncoder::new();
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
     let lzp_conf_default = 2048u16;
 
-    for &byte in block {
-        for bit_idx in (0..8).rev() {
-            let bit = (byte >> bit_idx) & 1u8 == 1u8;
-            let bit_pos = bit_idx as u8;
-            for (j, m) in models.iter().enumerate() {
-                probs[j] = m.predict();
+    // Helper closure: feed a byte through models+mixer WITHOUT rANS encoding.
+    // Used for matched bytes — they must update context state but not produce
+    // rANS bits (the decoder reconstructs them from match records).
+    macro_rules! skip_byte {
+        ($byte:expr) => {{
+            let byte = $byte;
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1u8 == 1u8;
+                let bit_pos = bit_idx as u8;
+                for (j, m) in models.iter().enumerate() {
+                    probs[j] = m.predict();
+                }
+                let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                for m in models.iter_mut() {
+                    m.update(bit);
+                }
             }
-            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
-            enc.encode_bit(bit, p);
-            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
-            for m in models.iter_mut() {
-                m.update(bit);
+            mixer.push_byte(byte);
+        }};
+    }
+
+    let mut i = 0usize;
+    while i < block.len() {
+        if match_len_at[i] > 0 {
+            // Matched region: feed bytes for context, skip rANS encoding.
+            let len = match_len_at[i];
+            for j in 0..len {
+                skip_byte!(block[i + j]);
             }
+            i += len;
+        } else {
+            // Literal: encode through rANS.
+            let byte = block[i];
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1u8 == 1u8;
+                let bit_pos = bit_idx as u8;
+                for (j, m) in models.iter().enumerate() {
+                    probs[j] = m.predict();
+                }
+                let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+                let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
+                enc.encode_bit(bit, p);
+                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                for m in models.iter_mut() {
+                    m.update(bit);
+                }
+            }
+            mixer.push_byte(byte);
+            i += 1;
         }
-        mixer.push_byte(byte);
     }
     out.extend(enc.finish());
     out
@@ -456,24 +510,104 @@ fn encode_block_with_matches(
 #[cfg(feature = "two_pass")]
 fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     let mut lzp = Lzp::new();
-    let mut runs: Vec<MatchRun> = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < block.len() {
+    let n = block.len();
+
+    // AVG_BITS_PER_BYTE: estimated CM cost per byte for residual cost calculation.
+    // A well-trained CM predicts ~3-4 bits/byte on structured data. We use 4.0
+    // as a conservative estimate: matches must save more than this in CM cost.
+    const AVG_BITS_PER_BYTE: f64 = 4.0;
+    // Match record overhead: 1 (flag) + 8 (len) + 24 (dist) = 33 bits.
+    const MATCH_OVERHEAD_BITS: f64 = 33.0;
+    let window = 4 * 1024 * 1024;
+
+    // Phase 1: pre-compute the best match at every position.
+    // best_match[i] = Some((len, dist)) if a match of >= MATCH_MIN_LEN exists at position i.
+    let mut best_match: Vec<Option<(usize, usize)>> = vec![None; n];
+    for i in 0..n {
         lzp.train_at(block, i);
-        if i + 1 >= 16 {
-            if let Some(raw_len) = lzp.longest_match(block, i + 1) {
-                let len = raw_len.min(255);
-                let dist = find_match_distance(block, i + 1, len);
-                if dist > 0 && dist <= 4 * 1024 * 1024 && len >= MATCH_MIN_LEN {
-                    runs.push(MatchRun { len, dist });
-                    i += len;
-                    continue;
+        if i + 1 >= 16 && i + MATCH_MIN_LEN <= n {
+            if let Some(raw_len) = lzp.longest_match(block, i) {
+                if raw_len >= MATCH_MIN_LEN {
+                    let len = raw_len.min(255);
+                    if let Some(dist) = find_match_with_len(block, i, len, window) {
+                        if dist > 0 && dist <= window {
+                            best_match[i] = Some((len, dist));
+                        }
+                    }
                 }
             }
         }
-        i += 1;
     }
+
+    // Phase 2: DP optimal parse.
+    // dp[i] = minimum total cost to encode from position i to the end.
+    // cost(literal) = AVG_BITS_PER_BYTE (1 byte × predicted bits)
+    // cost(match len,dist) = MATCH_OVERHEAD_BITS + (len * AVG_BITS_PER_BYTE)
+    //   — the matched bytes still get CM-encoded (for now), so residual_cost = len * AVG_BITS_PER_BYTE
+    //   — but the match flag/len/dist overhead is constant per match.
+    // A match is chosen when:
+    //   MATCH_OVERHEAD_BITS + len * AVG_BITS_PER_BYTE < len * AVG_BITS_PER_BYTE (literal cost)
+    //   i.e., when the match doesn't add overhead compared to literals.
+    // Actually: literal cost = len * AVG_BITS_PER_BYTE
+    // Match cost = MATCH_OVERHEAD_BITS + 0 (skip CM for matched bytes)
+    // So match is better when: MATCH_OVERHEAD_BITS < len * AVG_BITS_PER_BYTE
+    // i.e., len > MATCH_OVERHEAD_BITS / AVG_BITS_PER_BYTE = 33/4 = 8.25
+    // With threshold 16, matches of 16+ bytes save 16*4 - 33 = 31 bits. Take them.
+    let mut dp: Vec<f64> = vec![f64::INFINITY; n + 1];
+    let mut choice: Vec<bool> = vec![false; n]; // true = match taken, false = literal
+    dp[n] = 0.0;
+
+    for i in (0..n).rev() {
+        // Option 1: literal (cost = residual cost of 1 byte)
+        let literal_cost = AVG_BITS_PER_BYTE + dp[i + 1];
+        dp[i] = literal_cost;
+        choice[i] = false;
+
+        // Option 2: match (if available)
+        if let Some((len, dist)) = best_match[i] {
+            let match_cost = MATCH_OVERHEAD_BITS + dp[i + len];
+            if match_cost < dp[i] {
+                dp[i] = match_cost;
+                choice[i] = true;
+            }
+        }
+    }
+
+    // Phase 3: backtrack to extract match runs (with positions).
+    let mut runs: Vec<MatchRun> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if choice[i] {
+            if let Some((len, dist)) = best_match[i] {
+                runs.push(MatchRun { pos: i, len, dist });
+                i += len;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
     runs
+}
+
+#[cfg(feature = "two_pass")]
+/// Find the match distance for a match of exactly `len` bytes at position `pos`.
+/// Searches backwards from `pos - len` to find the matching position.
+fn find_match_with_len(data: &[u8], pos: usize, len: usize, window: usize) -> Option<usize> {
+    if pos < len || len == 0 || pos + len > data.len() {
+        return None;
+    }
+    let needle = &data[pos..pos + len];
+    let start = pos.saturating_sub(window);
+    // Search backwards for the closest match (greedy within DP framework).
+    for back in (start..=pos - len).rev() {
+        if data[back..back + len] == *needle {
+            return Some(pos - back);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "two_pass")]
@@ -553,6 +687,7 @@ fn decode_block_plain(
 }
 
 #[cfg(feature = "two_pass")]
+#[cfg(feature = "two_pass")]
 fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
@@ -567,11 +702,18 @@ fn decode_block_with_matches(
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
+
+    // Read all match records.
+    let mut runs: Vec<MatchRun> = Vec::with_capacity(num_runs);
     for _ in 0..num_runs {
-        if offset + 5 > comp.len() {
+        if offset + 8 > comp.len() {
             return Err(NyxError::InvalidContainer("truncated match record".into()));
         }
-        offset += 5;
+        let pos = u32::from_le_bytes([comp[offset], comp[offset + 1], comp[offset + 2], comp[offset + 3]]) as usize;
+        let len = comp[offset + 4] as usize;
+        let dist = ((u32::from(comp[offset + 5]) << 16) | (u32::from(comp[offset + 6]) << 8) | u32::from(comp[offset + 7])) as usize;
+        offset += 8;
+        runs.push(MatchRun { pos, len, dist });
     }
 
     let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| NyxError::Entropy(e.to_string()))?;
@@ -580,28 +722,73 @@ fn decode_block_with_matches(
     let n = models.len();
     let lzp_conf_default = 2048u16;
 
-    while out.len() < orig_len {
-        let mut byte = 0u8;
-        for bit_idx in (0..8).rev() {
-            let bit_pos = bit_idx as u8;
-            for (i, m) in models.iter().enumerate() {
-                probs[i] = m.predict();
+    // Walk through the original block, interleaving matched and literal bytes.
+    let mut match_idx = 0usize;
+    let mut i = 0usize; // current position in the output (decoded) stream
+
+    // Helper closure: feed a byte through models+mixer WITHOUT rANS decoding.
+    macro_rules! skip_byte {
+        ($byte:expr) => {{
+            let byte = $byte;
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1u8 == 1u8;
+                let bit_pos = bit_idx as u8;
+                for (j, m) in models.iter().enumerate() {
+                    probs[j] = m.predict();
+                }
+                let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                for m in models.iter_mut() {
+                    m.update(bit);
+                }
             }
-            let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
-            let bit = dec
-                .decode_bit(p)
-                .map_err(|e| NyxError::Entropy(e.to_string()))?;
-            mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
-            for m in models.iter_mut() {
-                m.update(bit);
+            mixer.push_byte(byte);
+        }};
+    }
+
+    while i < orig_len {
+        // Check if a match starts at the current position.
+        if match_idx < runs.len() && runs[match_idx].pos == i {
+            let run = runs[match_idx];
+            // Copy `len` bytes from history: out.len() - dist .. out.len() - dist + len
+            // But we need to be careful about overlapping copies.
+            let dist = run.dist;
+            for j in 0..run.len {
+                let byte = if i + j < orig_len && dist <= out.len() {
+                    out[out.len() - dist]
+                } else {
+                    0u8
+                };
+                skip_byte!(byte);
+                out.push(byte);
             }
-            if bit {
-                byte |= 1 << bit_idx;
+            i += run.len;
+            match_idx += 1;
+        } else {
+            // Literal: rANS-decode a byte.
+            let mut byte = 0u8;
+            for bit_idx in (0..8).rev() {
+                let bit_pos = bit_idx as u8;
+                for (j, m) in models.iter().enumerate() {
+                    probs[j] = m.predict();
+                }
+                let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
+                let p = mixer.mix(&probs[..n], bit_pos, lzp_conf);
+                let bit = dec
+                    .decode_bit(p)
+                    .map_err(|e| NyxError::Entropy(e.to_string()))?;
+                mixer.update(&probs[..n], bit, bit_pos, lzp_conf);
+                for m in models.iter_mut() {
+                    m.update(bit);
+                }
+                if bit {
+                    byte |= 1 << bit_idx;
+                }
             }
+            out.push(byte);
+            mixer.push_byte(byte);
+            i += 1;
         }
-        out.push(byte);
-        mixer.push_byte(byte);
     }
     Ok(out)
 }
