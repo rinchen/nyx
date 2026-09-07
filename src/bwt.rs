@@ -410,6 +410,8 @@ pub enum BwtPipeline {
     LzpBwtMtf,
     /// Path D: JSON stream split → 4× independent BWT trials → CM.
     JsonSplit,
+    /// Path E: XWRT dictionary → BWT → MTF → RLE0 → CM.
+    XwrtBwtMtfRle,
 }
 
 impl BwtPipeline {
@@ -508,6 +510,19 @@ impl BwtPipeline {
                 out.extend_from_slice(&nums_encoded);
                 out
             }
+            BwtPipeline::XwrtBwtMtfRle => {
+                // Build dictionary from original data and apply XWRT transform.
+                let dict = crate::model::word::XwrtDictionary::build_from_data(data);
+                let xwrt = dict.transform(data);
+                let encoded = bwt_mtf_rle_encode(&xwrt);
+                let dict_bytes = dict.to_bytes();
+                let mut out = Vec::with_capacity(4 + 4 + encoded.len() + dict_bytes.len());
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&encoded);
+                out.extend_from_slice(&dict_bytes);
+                out
+            }
         }
     }
 
@@ -567,6 +582,22 @@ impl BwtPipeline {
                     numbers: decode_stream(s3, s3_pipe),
                 };
                 crate::json_split::merge(&streams, orig_len).unwrap_or_default()
+            }
+            BwtPipeline::XwrtBwtMtfRle => {
+                // Layout: [orig_len:u32][encoded_len:u32][bwt_mtf_rle_encoded][dictionary_bytes]
+                if payload.len() < 8 {
+                    return Vec::new();
+                }
+                let orig_len =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                let encoded_len =
+                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                if payload.len() < 8 + encoded_len {
+                    return Vec::new();
+                }
+                let mtf = bwt_mtf_rle_decode(&payload[8..8 + encoded_len]);
+                let dict_data = &payload[8 + encoded_len..];
+                crate::model::word::xwrt_inverse_with_dict(&mtf, orig_len, dict_data)
             }
         }
     }
@@ -880,6 +911,16 @@ mod tests {
         let text = b"{\"name\":\"John\",\"age\":42,\"city\":\"New York\"}\n".repeat(500);
         let encoded = BwtPipeline::JsonSplit.encode(&text);
         let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len());
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn bwt_pipeline_xwrt_round_trip() {
+        let text = b"hello world hello world hello world".to_vec();
+        let encoded = BwtPipeline::XwrtBwtMtfRle.encode(&text);
+        eprintln!("XWRT encode len={} content={:?}", encoded.len(), encoded);
+        let decoded = BwtPipeline::XwrtBwtMtfRle.decode(&encoded, text.len());
+        eprintln!("XWRT decode len={} content={:?}", decoded.len(), decoded);
         assert_eq!(decoded, text);
     }
 }

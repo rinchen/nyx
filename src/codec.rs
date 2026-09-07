@@ -90,6 +90,8 @@ pub const METHOD_BWT_MTF_RLE: u8 = 5;
 pub const METHOD_LZP_BWT_MTF: u8 = 6;
 /// Text JSON split path: split JSON into 4 streams → 4× BWT → CM.
 pub const METHOD_JSON_SPLIT: u8 = 7;
+/// Text XWRT path: XWRT dictionary → BWT → MTF → RLE0 → CM.
+pub const METHOD_XWRT_BWT_MTF_RLE: u8 = 13;
 /// Byte-level CM (fast path): orders 0–2 count models + byte rANS.
 pub const METHOD_BYTE_CM: u8 = 8;
 /// Text BWT+RLE0 path, byte-coded (fast).
@@ -98,6 +100,10 @@ pub const METHOD_BYTE_BWT_MTF_RLE: u8 = 9;
 pub const METHOD_BYTE_LZP_BWT_MTF: u8 = 10;
 /// Text JSON split path, byte-coded (fast).
 pub const METHOD_BYTE_JSON_SPLIT: u8 = 11;
+/// Text XWRT→BWT→MTF→RLE0 path, byte-coded (fast).
+pub const METHOD_BYTE_XWRT_BWT_MTF_RLE: u8 = 12;
+/// Exec E8E9 transform, byte-coded (fast).
+pub const METHOD_BYTE_EXEC_E8E9: u8 = 14;
 
 /// Encoding strategy for [`compress_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,10 +247,23 @@ fn encode_block_fast(
                 crate::bytecodec::compress_block(&transformed),
                 METHOD_BYTE_JSON_SPLIT,
             ),
+            bwt::BwtPipeline::XwrtBwtMtfRle => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_XWRT_BWT_MTF_RLE,
+            ),
         };
         (comp, method, transformed.len())
+    } else if kind == crate::classify::BlockKind::Exec {
+        // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
+        // making them much more compressible.
+        let transformed = crate::model::e8e9::e8e9_transform(block_data);
+        (
+            crate::bytecodec::compress_block(&transformed),
+            METHOD_BYTE_EXEC_E8E9,
+            transformed.len(),
+        )
     } else {
-        // Binary / Exec: raw byte CM.
+        // Binary: raw byte CM.
         (
             crate::bytecodec::compress_block(block_data),
             METHOD_BYTE_CM,
@@ -274,6 +293,7 @@ fn encode_block_slow(
             bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
             bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
             bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
+            bwt::BwtPipeline::XwrtBwtMtfRle => METHOD_XWRT_BWT_MTF_RLE,
         };
         // Transform the block data through the chosen pipeline, then CM-encode.
         let transformed = trial.pipeline.encode(block_data);
@@ -282,8 +302,14 @@ fn encode_block_slow(
         // during BWT reversal; correctness is verified by CRC.
         let comp = compress_block(models, mixer, lzp_idx, &transformed);
         (comp, method, transformed.len())
+    } else if kind == crate::classify::BlockKind::Exec {
+        // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
+        // making them much more compressible.
+        let transformed = crate::model::e8e9::e8e9_transform(block_data);
+        let comp = compress_block(models, mixer, lzp_idx, &transformed);
+        (comp, METHOD_EXEC, transformed.len())
     } else {
-        // Binary / Exec: raw CM with the existing stack.
+        // Binary: raw CM with the existing stack.
         let comp = compress_block(models, mixer, lzp_idx, block_data);
         (comp, method_for_kind(kind), block_data.len())
     }
@@ -948,6 +974,8 @@ where
                 | METHOD_BYTE_BWT_MTF_RLE
                 | METHOD_BYTE_LZP_BWT_MTF
                 | METHOD_BYTE_JSON_SPLIT
+                | METHOD_BYTE_XWRT_BWT_MTF_RLE
+                | METHOD_BYTE_EXEC_E8E9
         ) {
             // Byte-level (fast) path: one rANS symbol per byte.
             let decoded = crate::bytecodec::decompress_block(comp, entry.orig_len as usize)
@@ -964,6 +992,10 @@ where
                 METHOD_BYTE_JSON_SPLIT => {
                     bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
                 }
+                METHOD_BYTE_XWRT_BWT_MTF_RLE => {
+                    bwt::BwtPipeline::XwrtBwtMtfRle.decode(&decoded, entry.orig_len as usize)
+                }
+                METHOD_BYTE_EXEC_E8E9 => crate::model::e8e9::e8e9_inverse(&decoded),
                 _ => decoded,
             }
         } else {
@@ -996,6 +1028,10 @@ where
                 METHOD_JSON_SPLIT => {
                     bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
                 }
+                METHOD_XWRT_BWT_MTF_RLE => {
+                    bwt::BwtPipeline::XwrtBwtMtfRle.decode(&decoded, entry.orig_len as usize)
+                }
+                METHOD_EXEC => crate::model::e8e9::e8e9_inverse(&decoded),
                 _ => decoded,
             }
         };
@@ -1024,11 +1060,13 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         METHOD_CM | METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
-        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT => Ok(crate::classify::BlockKind::Text),
+        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT | METHOD_XWRT_BWT_MTF_RLE => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_CM
         | METHOD_BYTE_BWT_MTF_RLE
         | METHOD_BYTE_LZP_BWT_MTF
-        | METHOD_BYTE_JSON_SPLIT => Ok(crate::classify::BlockKind::Text),
+        | METHOD_BYTE_JSON_SPLIT
+        | METHOD_BYTE_XWRT_BWT_MTF_RLE => Ok(crate::classify::BlockKind::Text),
+        METHOD_BYTE_EXEC_E8E9 => Ok(crate::classify::BlockKind::Exec),
         _ => Err(NyxError::InvalidContainer(format!(
             "unknown method {}",
             method

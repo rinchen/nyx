@@ -5,6 +5,7 @@
 //! [`mixer::LogisticMixer`](super::model::mixer::LogisticMixer).
 
 pub mod ctable;
+pub mod e8e9;
 pub mod exec;
 pub mod indirect_dmc;
 pub mod lazy_lzp;
