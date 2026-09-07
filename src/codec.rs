@@ -29,9 +29,9 @@
 //!   original CM path. This is also the decoder default for any future method value,
 //!   so old streams remain valid.
 //!
-//! ## Two-pass CM residual (experimental, behind `two_pass` feature)
+//! ## DP-optimal LZP match pre-pass (default)
 //!
-//! When the `two_pass` feature is enabled, nyx runs a forward LZP match pre-pass
+//! nyx runs a forward LZP match pre-pass
 //! with **DP optimal parsing** and emits explicit `(len, dist)` records for long
 //! matches (≥ 16 bytes). Matched bytes are **skipped** in the rANS stream —
 //! only literals (non-matched bytes) are CM-encoded. The decoder reconstructs
@@ -53,17 +53,10 @@ use crate::error::{NyxError, Result};
 use crate::model::mixer_bank::MixerBank;
 use crate::model::sse_apm::SseApmCascade;
 use crate::model::BitModel;
-
-#[cfg(feature = "two_pass")]
 use crate::model::lzp::Lzp;
 
-#[cfg(feature = "two_pass")]
-use crate::model::ssm::SsmMixer;
-
-#[cfg(feature = "two_pass")]
 const MATCH_MIN_LEN: usize = 16;
 
-#[cfg(feature = "two_pass")]
 #[derive(Debug, Clone, Copy)]
 struct MatchRun {
     pos: usize,
@@ -359,103 +352,50 @@ pub fn build_stack_for_kind(
             let models: Vec<Box<dyn BitModel>> = vec![];
             (models, MixerBank::new(0), None)
         }
-        crate::classify::BlockKind::Text => {
-            #[cfg(feature = "two_pass")]
-            {
-// Text-optimized stack WITHOUT SSM (DP-optimal LZP parse promoted to default)
-let n = 8;
-let models: Vec<Box<dyn BitModel>> = vec![
-    Box::new(crate::model::order::OrderN::new(0)),
-    Box::new(crate::model::order::OrderN::new(1)),
-    Box::new(crate::model::order::OrderN::new(2)),
-    Box::new(crate::model::sparse::Sparse::new()),
-    Box::new(crate::model::exec::Exec::new()),
-    Box::new(crate::model::lzp::Lzp::new()),
-    Box::new(crate::model::ppm::PpmModel::new(3)),
-    Box::new(crate::model::word::WordModel::new()),
-];
-                (models, MixerBank::new(n), Some(5))
-            }
-            #[cfg(not(feature = "two_pass"))]
-            {
-                // Text-optimized stack (best configuration, no SSM/Re-Pair).
-                // NOTE: LazyLzp removed — its `history.drain` was O(n²) on text
-                // (92% of encode time) and always predicted neutral (2048).
-                let n = 8;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                    Box::new(crate::model::word::WordModel::new()),
-                ];
-                (models, MixerBank::new(n), Some(5))
-            }
+crate::classify::BlockKind::Text => {
+            // Text-optimized stack WITHOUT SSM (DP-optimal LZP parse promoted to default)
+            // with orders 0-2, Sparse, Exec, LZP, PpmModel order-3, WordModel
+            let n = 8;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::exec::Exec::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::word::WordModel::new()),
+            ];
+            (models, MixerBank::new(n), Some(5))
         }
         crate::classify::BlockKind::Binary => {
-            #[cfg(feature = "two_pass")]
-            {
-// Binary stack (best configuration, no SSM).
-let n = 7;
-let models: Vec<Box<dyn BitModel>> = vec![
-    Box::new(crate::model::order::OrderN::new(0)),
-    Box::new(crate::model::order::OrderN::new(1)),
-    Box::new(crate::model::order::OrderN::new(2)),
-    Box::new(crate::model::sparse::Sparse::new()),
-    Box::new(crate::model::exec::Exec::new()),
-    Box::new(crate::model::lzp::Lzp::new()),
-    Box::new(crate::model::ppm::PpmModel::new(3)),
-];
-                (models, MixerBank::new(n), Some(5))
-            }
-            #[cfg(not(feature = "two_pass"))]
-            {
-                // Binary stack (best configuration, no SSM).
-                let n = 7;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                ];
-                (models, MixerBank::new(n), Some(5))
-            }
+            // Binary stack (best configuration, no SSM).
+            // with orders 0-2, Sparse, Exec, LZP, PPM order-3
+            let n = 7;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::exec::Exec::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+            ];
+            (models, MixerBank::new(n), Some(5))
         }
         crate::classify::BlockKind::Exec => {
-            #[cfg(feature = "two_pass")]
-            {
-// Exec stack (best configuration, no SSM).
-let n = 6;
-let models: Vec<Box<dyn BitModel>> = vec![
-    Box::new(crate::model::order::OrderN::new(0)),
-    Box::new(crate::model::order::OrderN::new(1)),
-    Box::new(crate::model::order::OrderN::new(2)),
-    Box::new(crate::model::sparse::Sparse::new()),
-    Box::new(crate::model::lzp::Lzp::new()),
-    Box::new(crate::model::ppm::PpmModel::new(3)),
-];
-                (models, MixerBank::new(n), Some(4))
-            }
-            #[cfg(not(feature = "two_pass"))]
-            {
-                // Exec stack (best configuration, no SSM).
-                let n = 6;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                ];
-                (models, MixerBank::new(n), Some(4))
-            }
+            // Exec stack (best configuration, no SSM).
+            // with orders 0-2, Sparse, LZP, PPM order-3; no Exec model
+            let n = 6;
+            let models: Vec<Box<dyn BitModel>> = vec![
+                Box::new(crate::model::order::OrderN::new(0)),
+                Box::new(crate::model::order::OrderN::new(1)),
+                Box::new(crate::model::order::OrderN::new(2)),
+                Box::new(crate::model::sparse::Sparse::new()),
+                Box::new(crate::model::lzp::Lzp::new()),
+                Box::new(crate::model::ppm::PpmModel::new(3)),
+            ];
+            (models, MixerBank::new(n), Some(4))
         }
     }
 }
@@ -468,26 +408,17 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) 
 
 /// Compress one block.
 ///
-/// With `two_pass` feature: runs DP-optimal LZP match pre-pass, emits (len, dist, pos)
+/// Runs DP-optimal LZP match pre-pass, emits (len, dist, pos)
 /// side-stream records, then rANS-encodes only **literal** (non-matched) bytes.
 /// Matched bytes are reconstructed by the decoder from the side-stream.
-///
-/// Without `two_pass`: plain CM encoding of all bytes.
 fn compress_block(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     block: &[u8],
 ) -> Vec<u8> {
-    #[cfg(feature = "two_pass")]
-    {
-        let runs = scan_matches(block);
-        encode_block_with_matches(models, mixer, lzp_idx, block, &runs)
-    }
-    #[cfg(not(feature = "two_pass"))]
-    {
-        encode_block_plain(models, mixer, lzp_idx, block)
-    }
+    let runs = scan_matches(block);
+    encode_block_with_matches(models, mixer, lzp_idx, block, &runs)
 }
 
 /// Plain CM encoding (no match side-stream).
@@ -538,7 +469,6 @@ fn encode_block_plain(
     out
 }
 
-#[cfg(feature = "two_pass")]
 fn encode_block_with_matches(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut MixerBank,
@@ -639,7 +569,6 @@ fn encode_block_with_matches(
     out
 }
 
-#[cfg(feature = "two_pass")]
 fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     let mut lzp = Lzp::new();
     let n = block.len();
@@ -722,7 +651,6 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     runs
 }
 
-#[cfg(feature = "two_pass")]
 fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
     if pos < len || len == 0 {
         return 0;
@@ -740,8 +668,7 @@ fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
 
 /// Decode a block.
 ///
-/// With `two_pass`: reads match side-stream (validates records), then rANS-decodes all bytes.
-/// Without `two_pass`: plain CM decode of all bytes.
+/// Reads match side-stream (validates records), then rANS-decodes all bytes.
 fn decode_block(
     comp: &[u8],
     orig_len: usize,
@@ -749,14 +676,7 @@ fn decode_block(
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
-    #[cfg(feature = "two_pass")]
-    {
-        decode_block_with_matches(comp, orig_len, models, mixer, lzp_idx)
-    }
-    #[cfg(not(feature = "two_pass"))]
-    {
-        decode_block_plain(comp, orig_len, models, mixer, lzp_idx)
-    }
+    decode_block_with_matches(comp, orig_len, models, mixer, lzp_idx)
 }
 
 fn decode_block_plain(
@@ -802,8 +722,6 @@ fn decode_block_plain(
     Ok(out)
 }
 
-#[cfg(feature = "two_pass")]
-#[cfg(feature = "two_pass")]
 fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
@@ -1189,8 +1107,7 @@ mod tests {
         assert_eq!(back, original, "JSON round-trip mismatch");
     }
 
-    #[cfg(feature = "two_pass")]
-    #[test]
+        #[test]
     fn scan_matches_finds_repeats() {
         let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
         let runs = scan_matches(data);
@@ -1201,8 +1118,7 @@ mod tests {
         assert!(runs[0].len >= MATCH_MIN_LEN);
     }
 
-    #[cfg(feature = "two_pass")]
-    #[test]
+        #[test]
     fn scan_matches_empty_on_unique() {
         let mut data = vec![0u8; 256];
         let mut x = 0x1234_5678u32;
@@ -1216,8 +1132,7 @@ mod tests {
         assert!(runs.is_empty(), "expected no matches in random data");
     }
 
-    #[cfg(feature = "two_pass")]
-    #[test]
+        #[test]
     fn find_match_distance_correct() {
         let data = b"abcabcabcabc";
         let d = find_match_distance(data, 6, 3);

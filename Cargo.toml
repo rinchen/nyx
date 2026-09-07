@@ -14,7 +14,7 @@ ans = "0.4.0"
 divsufsort = "2"
 
 [features]
-default = []
+default = ["two_pass"]
 two_pass = []
 
 [dev-dependencies]
