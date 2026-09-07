@@ -171,7 +171,7 @@ impl PpmdSsm {
     fn sparse_ctx(&self, pattern_idx: usize) -> u64 {
         let pattern = SPARSE_PATTERNS[pattern_idx];
         let asm = &self.sparse_asm[pattern_idx];
-        let n = asm.bytes_len();
+        let _n = asm.bytes_len();
         // Hash the relevant bytes together with the bit position.
         let mut k = 0u64;
         for &offset in pattern.iter() {

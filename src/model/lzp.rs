@@ -268,7 +268,7 @@ impl Lzp {
         let idx = self.hash_from_ring();
         let mut cur = self.heads[idx];
         let mut best = 0usize;
-        let mut best_pos = 0usize;
+        let mut _best_pos = 0usize;
         let limit = self.current_pos.saturating_sub(self.window);
         let mut walked = 0usize;
         while cur != 0 && walked < MAX_CHAIN {
@@ -281,7 +281,7 @@ impl Lzp {
             }
             if self.current_pos - p > best {
                 best = self.current_pos - p;
-                best_pos = p;
+                _best_pos = p;
                 if best == 255 {
                     break;
                 }
