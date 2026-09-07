@@ -46,11 +46,12 @@
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
 
-use crate::bwt::{self, BwtPathResult, BwtPipeline};
+use crate::bwt::{self,};
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{NyxError, Result};
 use crate::model::mixer_bank::MixerBank;
+use crate::model::sse_apm::SseApmCascade;
 use crate::model::BitModel;
 
 #[cfg(feature = "two_pass")]
@@ -335,19 +336,18 @@ pub fn build_stack_for_kind(
         crate::classify::BlockKind::Text => {
             #[cfg(feature = "two_pass")]
             {
-                // Text-optimized stack WITH SSM + Re-Pair word model (experimental).
-                let n = 9;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                    Box::new(crate::model::word::WordModel::new()),
-                    Box::new(crate::model::ssm::SsmMixer::new()),
-                ];
+// Text-optimized stack WITHOUT SSM (DP-optimal LZP parse promoted to default)
+let n = 8;
+let models: Vec<Box<dyn BitModel>> = vec![
+    Box::new(crate::model::order::OrderN::new(0)),
+    Box::new(crate::model::order::OrderN::new(1)),
+    Box::new(crate::model::order::OrderN::new(2)),
+    Box::new(crate::model::sparse::Sparse::new()),
+    Box::new(crate::model::exec::Exec::new()),
+    Box::new(crate::model::lzp::Lzp::new()),
+    Box::new(crate::model::ppm::PpmModel::new(3)),
+    Box::new(crate::model::word::WordModel::new()),
+];
                 (models, MixerBank::new(n), Some(5))
             }
             #[cfg(not(feature = "two_pass"))]
@@ -372,18 +372,17 @@ pub fn build_stack_for_kind(
         crate::classify::BlockKind::Binary => {
             #[cfg(feature = "two_pass")]
             {
-                // Binary stack WITH SSM (experimental).
-                let n = 8;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::exec::Exec::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                    Box::new(crate::model::ssm::SsmMixer::new()),
-                ];
+// Binary stack (best configuration, no SSM).
+let n = 7;
+let models: Vec<Box<dyn BitModel>> = vec![
+    Box::new(crate::model::order::OrderN::new(0)),
+    Box::new(crate::model::order::OrderN::new(1)),
+    Box::new(crate::model::order::OrderN::new(2)),
+    Box::new(crate::model::sparse::Sparse::new()),
+    Box::new(crate::model::exec::Exec::new()),
+    Box::new(crate::model::lzp::Lzp::new()),
+    Box::new(crate::model::ppm::PpmModel::new(3)),
+];
                 (models, MixerBank::new(n), Some(5))
             }
             #[cfg(not(feature = "two_pass"))]
@@ -405,17 +404,16 @@ pub fn build_stack_for_kind(
         crate::classify::BlockKind::Exec => {
             #[cfg(feature = "two_pass")]
             {
-                // Exec stack WITH SSM (experimental).
-                let n = 7;
-                let models: Vec<Box<dyn BitModel>> = vec![
-                    Box::new(crate::model::order::OrderN::new(0)),
-                    Box::new(crate::model::order::OrderN::new(1)),
-                    Box::new(crate::model::order::OrderN::new(2)),
-                    Box::new(crate::model::sparse::Sparse::new()),
-                    Box::new(crate::model::lzp::Lzp::new()),
-                    Box::new(crate::model::ppm::PpmModel::new(3)),
-                    Box::new(crate::model::ssm::SsmMixer::new()),
-                ];
+// Exec stack (best configuration, no SSM).
+let n = 6;
+let models: Vec<Box<dyn BitModel>> = vec![
+    Box::new(crate::model::order::OrderN::new(0)),
+    Box::new(crate::model::order::OrderN::new(1)),
+    Box::new(crate::model::order::OrderN::new(2)),
+    Box::new(crate::model::sparse::Sparse::new()),
+    Box::new(crate::model::lzp::Lzp::new()),
+    Box::new(crate::model::ppm::PpmModel::new(3)),
+];
                 (models, MixerBank::new(n), Some(4))
             }
             #[cfg(not(feature = "two_pass"))]
@@ -474,6 +472,7 @@ fn encode_block_plain(
     block: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    let mut cascade = SseApmCascade::new();
 
     // Pre-build per-block dictionaries.
     for m in models.iter_mut() {
@@ -484,9 +483,10 @@ fn encode_block_plain(
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
     let lzp_conf_default = 2048u16;
-    let mut enc_bit = |bit: bool, p: u16| enc.encode_bit(bit, p);
 
+    let mut prev_byte = 0u8;
     for &byte in block {
+        cascade.set_context(prev_byte); // Use PREVIOUS byte as context (decoder also sees prev)
         for bit_idx in (0..8).rev() {
             let bit = (byte >> bit_idx) & 1u8 == 1u8;
             let bit_pos = bit_idx as u8;
@@ -494,13 +494,19 @@ fn encode_block_plain(
                 probs[j] = m.predict();
             }
             let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut enc_bit);
+            
+            mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut |encoded_bit, p_mixer| {
+                let p_refined = cascade.refine(p_mixer, bit_pos);
+                enc.encode_bit(encoded_bit, p_refined);
+                cascade.update(encoded_bit, p_mixer, bit_pos);
+            });
             for m in models.iter_mut() {
                 m.update(bit);
             }
         }
         // Feed completed byte to the mixer bank's byte assembler for context.
         mixer.push_byte(byte);
+        prev_byte = byte; // Update for next iteration
     }
     out.extend(enc.finish());
     out
@@ -580,6 +586,8 @@ fn encode_block_with_matches(
         } else {
             // Literal: encode through rANS.
             let byte = block[i];
+            let mut cascade = SseApmCascade::new();
+            cascade.set_context(byte); // Set byte context for SSE/APM cascade
             for bit_idx in (0..8).rev() {
                 let bit = (byte >> bit_idx) & 1u8 == 1u8;
                 let bit_pos = bit_idx as u8;
@@ -587,7 +595,12 @@ fn encode_block_with_matches(
                     probs[j] = m.predict();
                 }
                 let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-                mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut enc_bit);
+                
+                mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut |encoded_bit, p_mixer| {
+                    let p_refined = cascade.refine(p_mixer, bit_pos);
+                    enc.encode_bit(encoded_bit, p_refined);
+                    cascade.update(encoded_bit, p_mixer, bit_pos);
+                });
                 for m in models.iter_mut() {
                     m.update(bit);
                 }
@@ -732,6 +745,7 @@ fn decode_block_plain(
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
     let lzp_conf_default = 2048u16;
+    let mut cascade = SseApmCascade::new();
 
     while out.len() < orig_len {
         let mut byte = 0u8;
@@ -741,11 +755,13 @@ fn decode_block_plain(
                 probs[i] = m.predict();
             }
             let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            let (p, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
+            let (p_mixer, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
+            let p_refined = cascade.refine(p_mixer, bit_pos);
             let bit = dec
-                .decode_bit(p)
+                .decode_bit(p_refined)
                 .map_err(|e| NyxError::Entropy(e.to_string()))?;
             mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
+            cascade.update(bit, p_mixer, bit_pos);
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -754,6 +770,7 @@ fn decode_block_plain(
             }
         }
         out.push(byte);
+        cascade.set_context(byte);
         mixer.push_byte(byte);
     }
     Ok(out)
@@ -840,17 +857,20 @@ fn decode_block_with_matches(
         } else {
             // Literal: rANS-decode a byte.
             let mut byte = 0u8;
+            let mut cascade = SseApmCascade::new();
             for bit_idx in (0..8).rev() {
                 let bit_pos = bit_idx as u8;
                 for (j, m) in models.iter().enumerate() {
                     probs[j] = m.predict();
                 }
                 let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-                let (p, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
+                let (p_mixer, pacc) = mixer.mix_acc(&probs[..n], bit_pos, lzp_conf);
+                let p_refined = cascade.refine(p_mixer, bit_pos);
                 let bit = dec
-                    .decode_bit(p)
+                    .decode_bit(p_refined)
                     .map_err(|e| NyxError::Entropy(e.to_string()))?;
                 mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
+                cascade.update(bit, p_mixer, bit_pos);
                 for m in models.iter_mut() {
                     m.update(bit);
                 }
@@ -859,6 +879,7 @@ fn decode_block_with_matches(
                 }
             }
             out.push(byte);
+            cascade.set_context(byte);
             mixer.push_byte(byte);
             i += 1;
         }
