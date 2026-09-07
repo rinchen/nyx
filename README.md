@@ -196,6 +196,31 @@ priority order:
    to avoid ~11 table re-lookups per bit. Bit-identical, ratio-neutral.
 4. **Wider stride / context model** — increase the number of models or the
    order-2 context size to improve prediction quality on diverse corpora.
+5. **Parallel blocks** — clone decayed state per rayon thread for near-linear
+   speedup on large files (webster 40MB).
+6. **Faster BWT** — replace rotation-based doubled string filter SA with libsais
+   SA-IS O(n) algorithm. 5-10x BWT trial speedup.
+7. **mimalloc allocator** — BWT trial does many Vec allocations; a better
+   allocator reduces overhead.
+
+## Potential ratio improvements
+
+These opportunities have been measured but not yet integrated:
+
+1. **Wire SSE/APM/APM2 cascade** — `SseApmCascade` exists in `src/model/sse_apm.rs`
+   but is not wired into the encode/decode path. Benchmarked: nci −0.9pt, mr −0.8pt,
+   dickens −0.3pt, webster −0.5pt, json −0.1pt. Expected: webster 35.1%→~33%,
+   beating zstd -1 on text without touching slow path.
+2. **Re-benchmark fixed PPMd** — Order-8 PPMd with SEE was measured with broken
+   config. Fair config now matches hybrid_ppm3. Previous +0.8pt webster should
+   be +1.5-2pt.
+3. **XWRT dictionary before BWT** — build top 2k words per Text block, replace
+   with 0x80+id tokens, then BWT→MTF→RLE0→CM. How cmix gets text wins.
+   Expected: 2-4pt on dickens/webster.
+4. **Exec/Binary transforms** — E8E9 filter for Exec blocks (3-5pt on executables),
+   delta/stride detection for Binary (2-4pt).
+
+Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ## License
 
