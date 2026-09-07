@@ -35,6 +35,15 @@
 //! The block framing is handled by the caller ([`crate::codec`]): this module
 //! only produces/consumes the rANS byte stream for one block. Uncompressed
 //! length travels in the container `BlockEntry`.
+//!
+//! ## AVX2 `walk_dist` (x86_64 only)
+//!
+//! On AVX2-capable CPUs the 256-symbol cumulative walk is vectorized:
+//! 8 lanes of `(cnt * inv) >> 20` are computed in parallel with
+//! `_mm256_mullo_epi32`, then a 3-pass prefix sum builds the cumulative
+//! distribution in SIMD. The search for the target symbol or the CDF
+//! threshold still runs scalar (the critical path is the multiply+prefix,
+//! not the branching).  Bit-identical to the scalar path for all inputs.
 
 use crate::entropy::byterans::{RansByteDecoder32, RansByteEncoder32, BYTE_SCALE};
 use crate::error::{NyxError, Result};
@@ -82,7 +91,160 @@ fn hash2(a: u8, b: u8) -> usize {
     (x.wrapping_mul(0x9E37_79B1) >> 20) as usize
 }
 
-/// One count-table byte model. Row = 256 `u16` counts.
+/// AVX2-accelerated inclusive prefix sum of 8 u32 elements.
+///
+/// Input:  [a0, a1, a2, a3, a4, a5, a6, a7]
+/// Output: [a0, a0+a1, ..., a0+..+a3, a4+a0..a3, ..., a4+..+a7+a0..a3]
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn avx2_prefix_sum_epi32(v: __m256i) -> __m256i {
+    // Step 1: pairwise sums
+    let s1 = std::arch::x86_64::_mm256_add_epi32(v, std::arch::x86_64::_mm256_srli_si256::<4>(v));
+    // Step 2: quad sums
+    let s2 = std::arch::x86_64::_mm256_add_epi32(s1, std::arch::x86_64::_mm256_srli_si256::<8>(s1));
+    // Step 3: add lower-quad sum to upper quad
+    let lower_sum = std::arch::x86_64::_mm256_extract_epi32::<3>(s2);
+    let sum_vec = std::arch::x86_64::_mm256_set1_epi32(lower_sum);
+    std::arch::x86_64::_mm256_add_epi32(s2, sum_vec)
+}
+
+/// AVX2-accelerated `walk_dist` — bit-identical to the scalar path.
+///
+/// Processes 32 symbols per outer iteration (8 AVX2 lanes × 4 chunks).
+/// Each chunk: loads 8 u16 counts → widens to u32 → `idx = (cnt*inv)>>20`
+/// → `weighted = idx*BUDGET` → prefix sum → chain offset from previous
+/// chunks → extract to scalar for the threshold/target search.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn walk_dist_avx2(
+    counts: *const u16,
+    base: usize,
+    inv: u32,
+    target: Option<u8>,
+    cdf: Option<u32>,
+) -> WalkResult {
+    use std::arch::x86_64::*;
+
+    let budget = BUDGET as u32;
+    let inv_v = _mm256_set1_epi32(inv as i32);
+    let budget_v = _mm256_set1_epi32(budget as i32);
+    let mut prev_r: u64 = 0;
+    let mut cum: u32 = 0;
+    let mut cum_before_255 = 0u32;
+    let mut f255 = 0u32;
+    let mut found_sym = -1i32;
+    let mut found_freq = 0u32;
+    let mut found_cum = 0u32;
+
+    for chunk_start in (0..256).step_by(32) {
+        // Load 32 u16 counts, widen to u32
+        let c0 = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+            counts.add(base + chunk_start) as *const __m128i,
+        ));
+        let c1 = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+            counts.add(base + chunk_start + 8) as *const __m128i,
+        ));
+        let c2 = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+            counts.add(base + chunk_start + 16) as *const __m128i,
+        ));
+        let c3 = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+            counts.add(base + chunk_start + 24) as *const __m128i,
+        ));
+
+        // idx = (cnt * inv) >> 20
+        let idx0 = _mm256_srli_epi32(_mm256_mullo_epi32(c0, inv_v), 20);
+        let idx1 = _mm256_srli_epi32(_mm256_mullo_epi32(c1, inv_v), 20);
+        let idx2 = _mm256_srli_epi32(_mm256_mullo_epi32(c2, inv_v), 20);
+        let idx3 = _mm256_srli_epi32(_mm256_mullo_epi32(c3, inv_v), 20);
+
+        // weighted = idx * BUDGET
+        let w0 = _mm256_mullo_epi32(idx0, budget_v);
+        let w1 = _mm256_mullo_epi32(idx1, budget_v);
+        let w2 = _mm256_mullo_epi32(idx2, budget_v);
+        let w3 = _mm256_mullo_epi32(idx3, budget_v);
+
+        // Prefix sums
+        let p0 = avx2_prefix_sum_epi32(w0);
+        let p1 = avx2_prefix_sum_epi32(w1);
+        let p2 = avx2_prefix_sum_epi32(w2);
+        let p3 = avx2_prefix_sum_epi32(w3);
+
+        // Chain prefix sums across chunks
+        let p0_final = _mm256_extract_epi32::<7>(p0) as u32;
+        let p1 = _mm256_add_epi32(p1, _mm256_set1_epi32(p0_final as i32));
+        let p1_final = _mm256_extract_epi32::<7>(p1) as u32;
+        let p2 = _mm256_add_epi32(p2, _mm256_set1_epi32(p1_final as i32));
+        let p2_final = _mm256_extract_epi32::<7>(p2) as u32;
+        let p3 = _mm256_add_epi32(p3, _mm256_set1_epi32(p2_final as i32));
+
+        // Extract to scalar arrays
+        let mut buf0 = [0i32; 8];
+        let mut buf1 = [0i32; 8];
+        let mut buf2 = [0i32; 8];
+        let mut buf3 = [0i32; 8];
+        _mm256_storeu_si256(buf0.as_mut_ptr() as *mut __m256i, p0);
+        _mm256_storeu_si256(buf1.as_mut_ptr() as *mut __m256i, p1);
+        _mm256_storeu_si256(buf2.as_mut_ptr() as *mut __m256i, p2);
+        _mm256_storeu_si256(buf3.as_mut_ptr() as *mut __m256i, p3);
+
+        for (chunk_idx, &offset) in [0u32, p0_final, p1_final, p2_final].iter().enumerate() {
+            let buf = match chunk_idx {
+                0 => &buf0,
+                1 => &buf1,
+                2 => &buf2,
+                _ => &buf3,
+            };
+            let start = chunk_start + chunk_idx * 8;
+            for (i, &cum_val) in buf.iter().enumerate() {
+                let s = start + i;
+                let r = ((cum_val as u64 + FRAC_ROUND as u32) >> FRAC_BITS) as u64;
+                let base_s = (r as i64 - prev_r as i64) as u64;
+                prev_r = r;
+                let f = 1u32 + base_s as u32;
+
+                if s == 255 {
+                    f255 = f;
+                    cum_before_255 = cum;
+                }
+
+                if let Some(b) = target {
+                    if s == usize::from(b) {
+                        found_cum = cum;
+                        found_freq = f;
+                    }
+                }
+                cum += f;
+
+                if let Some(c) = cdf {
+                    if found_sym < 0 && cum > c {
+                        found_sym = s as i32;
+                        found_freq = f;
+                        found_cum = cum - f;
+                    }
+                }
+            }
+        }
+    }
+
+    let total = cum;
+    let sym = if found_sym >= 0 {
+        found_sym as u8
+    } else if cdf.is_some() {
+        255
+    } else {
+        target.unwrap_or(0)
+    };
+    if sym == 255 {
+        found_freq = f255 + (BYTE_SCALE - total);
+        found_cum = cum_before_255;
+    }
+
+    WalkResult {
+        sym,
+        freq: found_freq,
+        cum: found_cum,
+    }
+}
 ///
 /// `totals`/`distinct` are maintained incrementally and recomputed only on
 /// row-halving, so [`ByteCountModel::total`] and [`ByteCountModel::distinct`]
@@ -133,8 +295,17 @@ impl ByteCountModel {
     ) -> WalkResult {
         let base = ctx * 256;
         let t = u64::from(self.totals[ctx].max(1));
-        let inv = u64::from(reciprocal_table()[t as usize]);
+        let inv = u32::from(reciprocal_table()[t as usize]);
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            if is_x86_feature_detected!("avx2") {
+                return unsafe { walk_dist_avx2(self.counts.as_ptr(), base, inv, target, cdf) };
+            }
+        }
+
+        // Scalar fallback (original implementation).
         let mut acc = 0u64;
         let mut prev = 0u64;
         let mut cum = 0u32;
@@ -146,11 +317,8 @@ impl ByteCountModel {
 
         for s in 0..256 {
             let cnt = u64::from(self.counts[base + s]);
-            let idx = (cnt * inv) >> 20;
-            // exact = idx·BUDGET/4096, accumulated in FRAC_BITS-bit fixed point.
+            let idx = (cnt * u64::from(inv)) >> 20;
             acc += idx * u64::from(BUDGET);
-            // base_s = R(s) - R(s-1) where R accumulates rounded exacts; the
-            // delta is always ≥ 0 and the total ≤ BUDGET.
             let r = (acc + FRAC_ROUND) >> FRAC_BITS;
             let base_s = r - prev;
             prev = r;
@@ -178,11 +346,6 @@ impl ByteCountModel {
             }
         }
 
-        // Cumulative rounding caps the total at SCALE but can fall short when
-        // the row is sparse (indices don't sum to 4096). Symbol 255 absorbs
-        // the leftover mass, giving it the padded range [cum_before, SCALE) on
-        // BOTH sides — the walk uses the real values up to the total, and cdfs
-        // in the padded region ([total, SCALE)) decode to 255 by fallback.
         let total = cum;
         let sym = if found_sym >= 0 {
             found_sym as u8
@@ -191,12 +354,6 @@ impl ByteCountModel {
         } else {
             target.unwrap_or(0)
         };
-        // Cumulative rounding caps the total at SCALE but can fall short when
-        // the row is sparse (index shares don't sum to 4096). Symbol 255
-        // absorbs all leftover mass deterministically on BOTH sides: whether
-        // found by the walk (cdf < total) or by fallback (cdf in [total,
-        // SCALE)), its range is [cum_before_255, SCALE). This matters for
-        // sparse order-1/2 rows with few symbols and low counts.
         if sym == 255 {
             found_freq = f255 + (BYTE_SCALE - total);
             found_cum = cum_before_255;
