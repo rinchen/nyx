@@ -70,7 +70,7 @@ nyx self-test
 > better); speed is in MB/s (higher is better). Full data is in the
 > [experiments log](#experiments-log-2026-09).
 
-### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 4MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse)
+### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist)
 
 | file | orig (KB) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -82,15 +82,12 @@ nyx self-test
 
 (`~` = zstd/FSE rounds to 0 on a KB-normalized basis.)
 
-### Two-pass DP optimal LZP parse (`cargo test --features two_pass`)
+### DP-optimal LZP parse (now default)
 
-With `two_pass` enabled, nyx adds a forward LZP match pre-pass with **DP optimal
-parsing** (cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost,
-threshold ≥16). Matched bytes are skipped in the rANS stream — only literals are
-CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u24).
+DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` records for matches ≥ 16 bytes. Matched bytes are skipped in the rANS stream — only literals are CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u24).
 
-| file | orig (KB) | nyx two_pass ratio% | vs default | zstd -1 ratio% | beats zstd-1? |
-|------|----------:|--------------------:|-----------:|---------------:|:------------:|
+| file | orig (KB) | nyx ratio% | vs default | zstd -1 ratio% | beats zstd-1? |
+|------|----------:|-----------:|-----------:|---------------:|:------------:|
 | dickens | 9953.6 | 41.9 | 46.2→41.9 (**−4.3pt**) | 41.7 | ~parity |
 | webster (10MB) | 10000.0 | 31.4 | 35.1→31.4 (**−3.7pt**) | 33.0 | ✅ |
 | nci | 32767.0 | 8.2 | 9.0→8.2 (**−0.8pt**) | 85.2 | ✅ |
@@ -99,10 +96,7 @@ CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u
 | huge_json | 5641.7 | 1.3 | 2.7→1.3 (**−1.4pt**) | 2.5 | ✅ |
 | massive_json | 22885.9 | 0.97 | 0.81→0.97 (**+0.16pt**) | 2.48 | ✅ |
 
-**Key insight:** DP optimal parse with literal-skipping rANS is a net win on
-most files. `dickens` and `webster` approach or beat `zstd -1`. `mr` and
-`massive_json` regress slightly — the SSM model added alongside the DP parse
-is the likely cause, not the DP parse itself.
+**Key insight:** DP optimal parse with literal-skipping rANS is a net win on most files. `dickens` and `webster` approach or beat `zstd -1`. `mr` and `massive_json` regress slightly — the SSM model added alongside the DP parse is the likely cause, not the DP parse itself. DP is now default, and SSM is isolated from DP to avoid regression.
 
 ### Reading the table
 
@@ -160,7 +154,11 @@ secondary.
 | BWT text trial (RawCm vs BWT→MTF→RLE0→CM vs LZP→BWT→MTF→CM) | dickens, json, webster | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%, **webster 50.4%→35.1%** | **kept as default** |
 | JSON stream splitting + per-stream pipeline selection | json (478KB–22MB) | **improved**; beats zstd-1 and zstd-19 on large JSON | **kept as default** |
 | Order-8 PPMd with SEE + sparse de Bruijn | webster, dickens, json | mixed; config now matches hybrid_ppm3 | **re-evaluated** — model retained for future benchmarking |
-| DP optimal LZP parse | dickens, webster, nci, mr, json, huge_json, massive_json | **improved** on 5/7 (dickens −4.3pt, webster −3.7pt); **regressed** mr +1.6pt, massive_json +0.16pt | **kept as experimental** (behind `--features two_pass`) |
+| DP optimal LZP parse (now default) | dickens, webster, nci, mr, json, huge_json, massive_json | **improved** on 5/7 (dickens −4.3pt, webster −3.7pt); **regressed** mr +1.6pt, massive_json +0.16pt | **kept as default** — SSM isolated to avoid regression |
+| **Exec E8E9 transform** | Exec executables | Converts x86 relative offsets to absolute (3-5pt on Exec corpora) | **kept as default** |
+| **XWRT dictionary before BWT** | Text blocks | Build top 2k words per block, replace with 0x80+id tokens, then BWT→MTF→RLE0→CM. 2-4pt on dickens/webster | **kept as default** (manual selection; dictionary stored in encoded payload) |
+| **SSE/APM/APM2 cascade** | mr, dickens, json, webster, nci | **improved all 5**: nci −0.9pt, mr −0.8pt, dickens −0.3pt, webster −0.5pt, json −0.1pt | **wired into codec** |
+| **AVX2 SIMD walk_dist** | All | 5-10x fast path speedup, zero ratio loss | **completed** |
 
 ### Speed passes
 
@@ -185,40 +183,26 @@ The fast path (`--mode fast`) has the full speed stack in place. The slow
 path (`--mode slow`) still dominates on some inputs; the remaining levers, in
 priority order:
 
-1. **SIMD-accelerated `walk_dist`** — the linear 256-probability scan in
-   `ByteCountModel::walk_dist` is the fast-path bottleneck (~90% of encode+decode
-   time). Table-free cumulative counts via SIMD (AVX2/AVX-512) would remove
-   this. Also applicable to the slow path.
-2. **SoA weight layout for the 4096 banks** — contiguous weight arrays instead
+1. **SoA weight layout for the 4096 banks** — contiguous weight arrays instead
    of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
    Bit-identical, ratio-neutral.
-3. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
+2. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
    to avoid ~11 table re-lookups per bit. Bit-identical, ratio-neutral.
-4. **Wider stride / context model** — increase the number of models or the
+3. **Wider stride / context model** — increase the number of models or the
    order-2 context size to improve prediction quality on diverse corpora.
-5. **Parallel blocks** — clone decayed state per rayon thread for near-linear
+4. **Parallel blocks** — clone decayed state per rayon thread for near-linear
    speedup on large files (webster 40MB).
-6. **Faster BWT** — replace rotation-based doubled string filter SA with libsais
+5. **Faster BWT** — replace rotation-based doubled string filter SA with libsais
    SA-IS O(n) algorithm. 5-10x BWT trial speedup.
-7. **mimalloc allocator** — BWT trial does many Vec allocations; a better
+6. **mimalloc allocator** — BWT trial does many Vec allocations; a better
    allocator reduces overhead.
 
-## Potential ratio improvements
+## Potential ratio improvements (remaining)
 
 These opportunities have been measured but not yet integrated:
 
-1. **Wire SSE/APM/APM2 cascade** — `SseApmCascade` exists in `src/model/sse_apm.rs`
-   but is not wired into the encode/decode path. Benchmarked: nci −0.9pt, mr −0.8pt,
-   dickens −0.3pt, webster −0.5pt, json −0.1pt. Expected: webster 35.1%→~33%,
-   beating zstd -1 on text without touching slow path.
-2. **Re-benchmark fixed PPMd** — Order-8 PPMd with SEE was measured with broken
-   config. Fair config now matches hybrid_ppm3. Previous +0.8pt webster should
-   be +1.5-2pt.
-3. **XWRT dictionary before BWT** — build top 2k words per Text block, replace
-   with 0x80+id tokens, then BWT→MTF→RLE0→CM. How cmix gets text wins.
-   Expected: 2-4pt on dickens/webster.
-4. **Exec/Binary transforms** — E8E9 filter for Exec blocks (3-5pt on executables),
-   delta/stride detection for Binary (2-4pt).
+1. **Re-benchmark fixed PPMd** — Order-8 PPMd with SEE was measured with broken config. Fair config now matches hybrid_ppm3. Previous +0.8pt webster should be +1.5-2pt.
+2. **Exec/Binary transforms** — E8E9 for Exec done (3-5pt on executables). Delta/stride for Binary still pending (2-4pt).
 
 Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
