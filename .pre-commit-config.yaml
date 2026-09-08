@@ -1,9 +1,15 @@
 repos:
   - repo: local
     hooks:
+      - id: cargo-check
+        name: Compile-check all targets (lib, bins, examples, tests, benches)
+        entry: cargo check --workspace --all-targets --locked
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: cargo-test
         name: Run cargo tests (lib)
-        entry: cargo test --lib
+        entry: cargo test --lib --locked
         language: system
         pass_filenames: false
         always_run: true
