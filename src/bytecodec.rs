@@ -94,25 +94,15 @@ fn hash2(a: u8, b: u8) -> usize {
 /// AVX2-accelerated inclusive prefix sum of 8 u32 elements.
 ///
 /// Input:  [a0, a1, a2, a3, a4, a5, a6, a7]
-/// Output: [a0, a0+a1, ..., a0+..+a3, a4+a0..a3, ..., a4+..+a7+a0..a3]
+/// Output: [a0, a0+a1, a0+a1+a2, a0+a1+a2+a3, a0+...+a4, ..., a0+...+a7]
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 unsafe fn avx2_prefix_sum_epi32(v: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    // Step 1: pairwise sums
-    let s1 = std::arch::x86_64::_mm256_add_epi32(v, std::arch::x86_64::_mm256_srli_si256::<4>(v));
-    // Step 2: quad sums. `_mm256_srli_si256` shifts each 128-bit lane
-    // independently, so after this each lane holds the correct 4-element
-    // prefix *relative to itself*; the upper lane is still missing the lower
-    // lane's total.
-    let s2 = std::arch::x86_64::_mm256_add_epi32(s1, std::arch::x86_64::_mm256_srli_si256::<8>(s1));
-    // Step 3: propagate the lower 128-bit lane's total into the upper lane.
-    // Broadcasting it across ALL lanes (as before) shifted the lower four
-    // cumulative values up by the whole quad sum; combined with a smaller
-    // first value in the upper lane that made `r - prev_r` negative and
-    // `cum += f` overflow in debug builds.
-    let lower_sum = std::arch::x86_64::_mm256_extract_epi32::<3>(s2);
-    let upper_sum = std::arch::x86_64::_mm256_set_epi32(lower_sum, lower_sum, lower_sum, lower_sum, 0, 0, 0, 0);
-    std::arch::x86_64::_mm256_add_epi32(s2, upper_sum)
+    let s1 = std::arch::x86_64::_mm256_add_epi32(v, std::arch::x86_64::_mm256_slli_si256::<4>(v));
+    let s2 = std::arch::x86_64::_mm256_add_epi32(s1, std::arch::x86_64::_mm256_slli_si256::<8>(s1));
+    let zero = std::arch::x86_64::_mm256_setzero_si256();
+    let lower_to_upper = std::arch::x86_64::_mm256_permute2x128_si256(zero, s2, 0x00);
+    std::arch::x86_64::_mm256_add_epi32(s2, lower_to_upper)
 }
 
 /// AVX2-accelerated `walk_dist` — bit-identical to the scalar path.
