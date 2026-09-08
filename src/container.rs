@@ -1,8 +1,11 @@
 //! Self-describing container format for `rcn` (`RCN1`).
 //!
-//! Layout: `[MAGIC(4)][Header(7)][BlockEntry * num_blocks (13 each)][block payloads...]`.
+//! Layout: `[MAGIC(4)][Header(7)][global_dict_len:u32][global_dict_bytes...][BlockEntry * num_blocks (13 each)][block payloads...]`.
 //! Each block payload is preceded by its `BlockEntry` (compressed length, original length,
 //! method, CRC32 of the *original* block).
+//!
+//! Global XWRT dictionary: when present (flags bit 0), the dictionary is stored
+//! right after the header and used for all Text blocks instead of per-block dictionaries.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -10,6 +13,9 @@ use std::io::{Cursor, Read};
 
 pub const MAGIC: &[u8; 4] = b"RCN1";
 pub const VERSION: u8 = 1;
+
+/// Flag: global XWRT dictionary present in container.
+pub const FLAG_GLOBAL_DICT: u8 = 0x01;
 
 /// Container header (7 bytes after the 4-byte magic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +99,40 @@ impl BlockEntry {
             crc32: r.read_u32::<LittleEndian>()?,
         })
     }
+}
+
+/// Read a global XWRT dictionary from `data` starting at `offset`.
+/// Returns `(dict_bytes, new_offset)` if present (flags bit 0 set),
+/// or `(Vec::new(), offset)` if not present.
+pub fn read_global_dict(data: &[u8], offset: usize, flags: u8) -> (Vec<u8>, usize) {
+    if (flags & FLAG_GLOBAL_DICT) == 0 {
+        return (Vec::new(), offset);
+    }
+    if offset + 4 > data.len() {
+        return (Vec::new(), offset);
+    }
+    let dict_len = u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize;
+    let new_offset = offset + 4;
+    if new_offset + dict_len > data.len() {
+        return (Vec::new(), new_offset);
+    }
+    (
+        data[new_offset..new_offset + dict_len].to_vec(),
+        new_offset + dict_len,
+    )
+}
+
+/// Write a global XWRT dictionary to `out`.
+/// Returns the number of bytes written (4 for length prefix + dict_bytes).
+pub fn write_global_dict(out: &mut Vec<u8>, dict_bytes: &[u8]) -> usize {
+    out.extend_from_slice(&(dict_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(dict_bytes);
+    4 + dict_bytes.len()
 }
 
 /// CRC32 of `buf` (used to validate decompressed blocks against corruption).

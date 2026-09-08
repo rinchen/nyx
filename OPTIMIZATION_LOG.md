@@ -1,7 +1,7 @@
 # Rcn Optimization Opportunity Log
 
-Last updated: 2026-09-07
-Test status: 135/135 passing
+Last updated: 2026-09-08
+Test status: 138/138 passing
 
 ---
 
@@ -11,8 +11,9 @@ Test status: 135/135 passing
 |---|--------|-------------|---------------|--------|
 | C1 | Wire SSE/APM/APM2 cascade | `SseApmCascade` exists in `src/model/sse_apm.rs` and is integrated in slow-path encoder/decoder. Measured: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | -2-4pt on text files | Completed |
 | C2 | Re-benchmark fixed PPMd config | Order-8 PPMd with SEE + sparse de Bruijn (CTX_BITS=18, matching hybrid_ppm3). Previous +0.8pt webster was with broken config. | +1.5-2pt on webster | Completed |
-| C3 | XWRT dictionary before BWT | Build top 2k words per Text block, replace with 0x80+id + cap bits, then BWT→MTF→RLE0→CM. How cmix gets text wins. | 2-4pt on dickens/webster | Completed |
+| C3 | XWRT dictionary before BWT | Build top 2k words per Text block, replace with 0x80+id cap bits, then BWT→MTF→RLE0→CM. How cmix gets text wins. | 2-4pt on dickens/webster | Completed |
 | C4 | Exec/Binary transforms | DP-optimal LZP parse promoted to default (isolated from SSM); E8E9 for Exec; delta/stride for Binary | 2-5pt on mr/nci | DP default + E8E9 + delta/stride completed |
+| C5 | **Corpus-wide global XWRT dictionary** | First pass over the whole corpus builds a top-128 word dictionary stored once in the container header (flags bit 0). Every Text-block XWRT trial reuses it — per-block dict bytes removed from payloads. Gated on pure-ASCII blocks (tokens 0x80-0xFF alias high literal bytes). Measured: dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral (byte-identical output), json 458→299B. Also fixed latent serialization bug: `len() as u8` truncated dicts >255 words to zero; word scan now drops >255-byte breakless runs (base64/garbage). | −4-5pt on text | Completed (2026-09-08) |
 
 ---
 
@@ -37,7 +38,8 @@ Test status: 135/135 passing
 - SSE/APM/APM2 cascade refinement
 - Cross-block weight decay (0.995)
 - 32MB LZP window for Text blocks
-- BWT text trial (5 paths: RawCM / BWT+MTF+RLE0+CM / LZP+BWT+MTF+CM / JSON split / XWRT dict+BWT)
+- BWT text trial (6 paths: RawCM / BWT+MTF+RLE0+CM / LZP+BWT+MTF+CM / JSON split / XWRT global-dict+BWT / global XWRT itself)
+- Corpus-wide global XWRT dictionary (top-128 words, stored once in container header; XWRT trial gated on pure-ASCII blocks)
 - Exec E8E9 transform (x86 relative → absolute offsets)
 - rANS bit coder (ans crate)
 - DP-optimal LZP parse (default) — runs forward LZP match pre-pass, emits (len, dist) records for matches ≥ 16 bytes, skips matched bytes in rANS stream
@@ -64,5 +66,6 @@ Test status: 135/135 passing
 | 2026-09-06 | 740f11a | 127/127 pass | All tests green |
 | 2026-09-07 | 6b7bc3c | 132/132 pass | XWRT dict + E8E9 + SIMD walk_dist done |
 | 2026-09-07 | (this session) | 135/135 pass | DP-optimal LZP promoted to default |
+| 2026-09-08 | (uncommitted) | 138/138 pass | Corpus-wide global XWRT dictionary (C5): dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral |
 
 ---

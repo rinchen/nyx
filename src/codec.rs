@@ -46,14 +46,17 @@
 //! Method values:
 //!   0 = copy, 1 = cm (full stack), 2 = text, 3 = binary, 4 = exec.
 
-use crate::bwt::{self,};
-use crate::container::{BlockEntry, Header, VERSION};
+use crate::bwt::{self};
+use crate::container::{
+    read_global_dict, write_global_dict, BlockEntry, Header, FLAG_GLOBAL_DICT, VERSION,
+};
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::error::{RcnError, Result};
+use crate::model::lzp::Lzp;
 use crate::model::mixer_bank::MixerBank;
 use crate::model::sse_apm::SseApmCascade;
+use crate::model::word::XwrtDictionary;
 use crate::model::BitModel;
-use crate::model::lzp::Lzp;
 
 /// Varint encoding: read/write unsigned LEB128. Most values in the match
 /// side-stream (pos deltas, lengths, distances) are small, so varint
@@ -194,6 +197,12 @@ where
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
 
+    // First pass: build a global XWRT dictionary from the entire corpus.
+    // Stored once in the container header and shared by all Text-block XWRT
+    // trials (replaces the per-block dictionary, which costs ~0.5-1pt).
+    let global_dict: Option<XwrtDictionary> =
+        (mode == CodecMode::Slow).then(|| XwrtDictionary::build_from_data(buf));
+
     while offset < buf.len() {
         let block = &buf[offset..];
         let kind = crate::classify::classify(block);
@@ -211,7 +220,14 @@ where
 
         let (comp, method, store_orig_len) = match mode {
             CodecMode::Fast => encode_block_fast(block_data, kind),
-            CodecMode::Slow => encode_block_slow(block_data, kind, &mut models, &mut mixer, lzp_idx),
+            CodecMode::Slow => encode_block_slow(
+                block_data,
+                kind,
+                &mut models,
+                &mut mixer,
+                lzp_idx,
+                global_dict.as_ref(),
+            ),
         };
 
         let entry = BlockEntry {
@@ -233,13 +249,22 @@ where
         }
     }
 
+    // Write container: magic + header + entries + payloads
     let header = Header {
         version: VERSION,
-        flags: 0,
+        flags: if global_dict.is_some() {
+            FLAG_GLOBAL_DICT
+        } else {
+            0
+        },
         block_size_log: DEFAULT_BLOCK_SIZE_LOG,
         num_blocks: entries.len() as u32,
     };
     header.write(&mut out);
+    if let Some(ref dict) = global_dict {
+        let dict_bytes = dict.to_bytes();
+        write_global_dict(&mut out, &dict_bytes);
+    }
     for e in &entries {
         e.write(&mut out);
     }
@@ -248,19 +273,19 @@ where
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
-fn encode_block_fast(
-    block_data: &[u8],
-    kind: crate::classify::BlockKind,
-) -> (Vec<u8>, u8, usize) {
+fn encode_block_fast(block_data: &[u8], kind: crate::classify::BlockKind) -> (Vec<u8>, u8, usize) {
     if kind == crate::classify::BlockKind::Random {
         (block_data.to_vec(), METHOD_COPY, block_data.len())
     } else if kind == crate::classify::BlockKind::Text {
         // Same BWT trial as the bit path; the chosen pipeline's output is then
         // byte-coded (one rANS symbol per byte instead of per bit).
-        let trial = bwt::compress_text_with_trial(block_data);
-        let transformed = trial.pipeline.encode(block_data);
+        let trial = bwt::compress_text_with_trial(block_data, None);
+        let transformed = trial.pipeline.encode(block_data, None);
         let (comp, method) = match trial.pipeline {
-            bwt::BwtPipeline::RawCm => (crate::bytecodec::compress_block(&transformed), METHOD_BYTE_CM),
+            bwt::BwtPipeline::RawCm => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_CM,
+            ),
             bwt::BwtPipeline::BwtMtfRle => (
                 crate::bytecodec::compress_block(&transformed),
                 METHOD_BYTE_BWT_MTF_RLE,
@@ -305,6 +330,7 @@ fn encode_block_slow(
     models: &mut [Box<dyn BitModel>],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
+    global_dict: Option<&crate::model::word::XwrtDictionary>,
 ) -> (Vec<u8>, u8, usize) {
     // Random blocks: store verbatim (method COPY). Don't run CM on
     // entropy-poor data — the rANS path would inflate and the decoder
@@ -313,7 +339,7 @@ fn encode_block_slow(
         (block_data.to_vec(), METHOD_COPY, block_data.len())
     } else if kind == crate::classify::BlockKind::Text {
         // Per-block trial: pick the best BWT pipeline for this Text block.
-        let trial = bwt::compress_text_with_trial(block_data);
+        let trial = bwt::compress_text_with_trial(block_data, global_dict);
         let method = match trial.pipeline {
             bwt::BwtPipeline::RawCm => METHOD_TEXT,
             bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
@@ -322,7 +348,7 @@ fn encode_block_slow(
             bwt::BwtPipeline::XwrtBwtMtfRle => METHOD_XWRT_BWT_MTF_RLE,
         };
         // Transform the block data through the chosen pipeline, then CM-encode.
-        let transformed = trial.pipeline.encode(block_data);
+        let transformed = trial.pipeline.encode(block_data, global_dict);
         // For BWT paths, `orig_len` stores the *transformed* length (what the
         // decoder must decode from rANS). The original length is recovered
         // during BWT reversal; correctness is verified by CRC.
@@ -385,7 +411,7 @@ pub fn build_stack_for_kind(
             let models: Vec<Box<dyn BitModel>> = vec![];
             (models, MixerBank::new(0), None)
         }
-crate::classify::BlockKind::Text => {
+        crate::classify::BlockKind::Text => {
             // Text stack with Order-8 PPMd + SEE + sparse de Bruijn (promoted to default)
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
@@ -483,12 +509,18 @@ fn encode_block_plain(
                 probs[j] = m.predict();
             }
             let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-            
-            mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut |encoded_bit, p_mixer| {
-                let p_refined = cascade.refine(p_mixer, bit_pos);
-                enc.encode_bit(encoded_bit, p_refined);
-                cascade.update(encoded_bit, p_mixer, bit_pos);
-            });
+
+            mixer.mix_and_update(
+                &probs[..n],
+                bit,
+                bit_pos,
+                lzp_conf,
+                &mut |encoded_bit, p_mixer| {
+                    let p_refined = cascade.refine(p_mixer, bit_pos);
+                    enc.encode_bit(encoded_bit, p_refined);
+                    cascade.update(encoded_bit, p_mixer, bit_pos);
+                },
+            );
             for m in models.iter_mut() {
                 m.update(bit);
             }
@@ -585,12 +617,18 @@ fn encode_block_with_matches(
                     probs[j] = m.predict();
                 }
                 let lzp_conf = lzp_idx.map(|i| probs[i]).unwrap_or(lzp_conf_default);
-                
-                mixer.mix_and_update(&probs[..n], bit, bit_pos, lzp_conf, &mut |encoded_bit, p_mixer| {
-                    let p_refined = cascade.refine(p_mixer, bit_pos);
-                    enc.encode_bit(encoded_bit, p_refined);
-                    cascade.update(encoded_bit, p_mixer, bit_pos);
-                });
+
+                mixer.mix_and_update(
+                    &probs[..n],
+                    bit,
+                    bit_pos,
+                    lzp_conf,
+                    &mut |encoded_bit, p_mixer| {
+                        let p_refined = cascade.refine(p_mixer, bit_pos);
+                        enc.encode_bit(encoded_bit, p_refined);
+                        cascade.update(encoded_bit, p_mixer, bit_pos);
+                    },
+                );
                 for m in models.iter_mut() {
                     m.update(bit);
                 }
@@ -775,8 +813,9 @@ fn decode_block_with_matches(
     let mut runs: Vec<MatchRun> = Vec::with_capacity(num_runs);
     let mut prev_pos: usize = 0;
     for _ in 0..num_runs {
-        let (delta_pos, new_offset) = read_varint(comp, offset)
-            .ok_or_else(|| RcnError::InvalidContainer("truncated match record (delta_pos)".into()))?;
+        let (delta_pos, new_offset) = read_varint(comp, offset).ok_or_else(|| {
+            RcnError::InvalidContainer("truncated match record (delta_pos)".into())
+        })?;
         offset = new_offset;
         let (len, new_offset) = read_varint(comp, offset)
             .ok_or_else(|| RcnError::InvalidContainer("truncated match record (len)".into()))?;
@@ -904,6 +943,13 @@ where
             header.version
         )));
     }
+    // Consume the global XWRT dictionary (if present) from between the header
+    // and the BlockEntry table; every XWRT block refers back to it.
+    let (global_dict_bytes, dict_end) =
+        read_global_dict(data, cur.position() as usize, header.flags);
+    cur.set_position(dict_end as u64);
+    let global_dict = XwrtDictionary::from_bytes(&global_dict_bytes);
+
     let mut entries = Vec::with_capacity(header.num_blocks as usize);
     for _ in 0..header.num_blocks {
         entries.push(
@@ -946,12 +992,16 @@ where
                     let mtf = bwt::bwt_mtf_decode(&decoded);
                     bwt::lzp_decode(&mtf, entry.orig_len as usize)
                 }
-                METHOD_BYTE_JSON_SPLIT => {
-                    bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
-                }
-                METHOD_BYTE_XWRT_BWT_MTF_RLE => {
-                    bwt::BwtPipeline::XwrtBwtMtfRle.decode(&decoded, entry.orig_len as usize)
-                }
+                METHOD_BYTE_JSON_SPLIT => bwt::BwtPipeline::JsonSplit.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
+                METHOD_BYTE_XWRT_BWT_MTF_RLE => bwt::BwtPipeline::XwrtBwtMtfRle.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
                 METHOD_BYTE_EXEC_E8E9 => crate::model::e8e9::e8e9_inverse(&decoded),
                 _ => decoded,
             }
@@ -982,12 +1032,16 @@ where
                     let mtf = bwt::bwt_mtf_decode(&decoded);
                     bwt::lzp_decode(&mtf, entry.orig_len as usize)
                 }
-                METHOD_JSON_SPLIT => {
-                    bwt::BwtPipeline::JsonSplit.decode(&decoded, entry.orig_len as usize)
-                }
-                METHOD_XWRT_BWT_MTF_RLE => {
-                    bwt::BwtPipeline::XwrtBwtMtfRle.decode(&decoded, entry.orig_len as usize)
-                }
+                METHOD_JSON_SPLIT => bwt::BwtPipeline::JsonSplit.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
+                METHOD_XWRT_BWT_MTF_RLE => bwt::BwtPipeline::XwrtBwtMtfRle.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
                 METHOD_EXEC => crate::model::e8e9::e8e9_inverse(&decoded),
                 _ => decoded,
             }
@@ -1017,7 +1071,9 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         METHOD_CM | METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
-        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT | METHOD_XWRT_BWT_MTF_RLE => Ok(crate::classify::BlockKind::Text),
+        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT | METHOD_XWRT_BWT_MTF_RLE => {
+            Ok(crate::classify::BlockKind::Text)
+        }
         METHOD_BYTE_CM
         | METHOD_BYTE_BWT_MTF_RLE
         | METHOD_BYTE_LZP_BWT_MTF
@@ -1146,7 +1202,7 @@ mod tests {
         assert_eq!(back, original, "JSON round-trip mismatch");
     }
 
-        #[test]
+    #[test]
     fn scan_matches_finds_repeats() {
         let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
         let runs = scan_matches(data);
@@ -1157,7 +1213,7 @@ mod tests {
         assert!(runs[0].len >= MATCH_MIN_LEN);
     }
 
-        #[test]
+    #[test]
     fn scan_matches_empty_on_unique() {
         let mut data = vec![0u8; 256];
         let mut x = 0x1234_5678u32;
@@ -1171,7 +1227,7 @@ mod tests {
         assert!(runs.is_empty(), "expected no matches in random data");
     }
 
-        #[test]
+    #[test]
     fn find_match_distance_correct() {
         let data = b"abcabcabcabc";
         let d = find_match_distance(data, 6, 3);

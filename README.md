@@ -45,7 +45,7 @@ per byte than those, in exchange for better ratio on the right inputs.
 ### Compression - beat zstd -19
 - ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted to default for Text blocks in `src/codec.rs:371`
 - ✅ **Compress the match side-stream** – implemented varint encoding (delta_pos, len, dist) in `src/codec.rs:484-495`; saves 30-40% side-stream
-- **Global XWRT dictionary** – train one dictionary across whole corpus first pass, store once in container header. Long-range word repeats across 4MB blocks become local tokens. +1-2pt on dickens/webster, free decode.
+- ✅ **Global XWRT dictionary** – one corpus-wide pass builds a global top-128 dictionary stored once in the container header; every Text-block XWRT trial reuses it (per-block dictionaries removed). Measured: dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral
 
 ### Speed - achieve 20+ MB/s
 - **Interleaved rANS** – already wired: fast path 8-10 MB/s → 20-30 MB/s
@@ -78,9 +78,9 @@ by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 ## TODO - Remaining Optimization Tasks (priority order)
 
 ### Compression - beat zstd -19
-- **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – currently retained for future benchmarking; with fixed config that keeps WordModel + 8k banks + 32MB window + XWRT: +1.5-2pt on text
-- **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream; saves 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
-- **Global XWRT dictionary** – train one dictionary across whole corpus first pass, store once in container header; long-range word repeats across 4MB blocks become local tokens: +1-2pt on dickens/webster, free decode
+- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted; with fixed config keeps WordModel + 8k banks + 32MB window + XWRT
+- ✅ **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream; saves 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
+- ✅ **Global XWRT dictionary** – one corpus-wide pass builds a global top-128 dictionary stored once in the container header; dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral
 
 ### Speed - achieve 20+ MB/s
 - **Interleaved rANS** – already wired; fast path 8-10 MB/s → 20-30 MB/s
@@ -152,7 +152,7 @@ rcn self-test
 > better); speed is in MB/s (higher is better). Full data is in the
 > [experiments log](#experiments-log-2026-09).
 
-### Current (hybrid_ppm3 + two-level 8k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary + mimalloc allocator)
+### Current (hybrid_ppm3 + two-level 8k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + corpus-wide global XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary + mimalloc allocator)
 
 | file | orig (KB) | rcn ratio% | rcn cmp MB/s | rcn dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -239,7 +239,8 @@ secondary.
 | Order-8 PPMd with SEE + sparse de Bruijn | webster, dickens, json | mixed; config now matches hybrid_ppm3 | **promoted to default** — fixed config retains WordModel, 8k banks, 32MB window, XWRT |
 | DP optimal LZP parse (now default) | dickens, webster, nci, mr, json, huge_json, massive_json | **improved** on 5/7 (dickens −4.3pt, webster −3.7pt); **regressed** mr +1.6pt, massive_json +0.16pt | **kept as default** — SSM isolated to avoid regression |
 | **Exec E8E9 transform** | Exec executables | Converts x86 relative offsets to absolute (3-5pt on Exec corpora) | **kept as default** |
-| **XWRT dictionary before BWT** | Text blocks | Build top 2k words per block, replace with 0x80+id tokens, then BWT→MTF→RLE0→CM. 2-4pt on dickens/webster | **kept as default** (manual selection; dictionary stored in encoded payload) |
+| **XWRT dictionary before BWT** | Text blocks | Build top 2k words per block, replace with 0x80+id tokens, then BWT→MTF→RLE0→CM. 2-4pt on dickens/webster | **per-block superseded by global** (single-byte tokens only hold 128 ids; word-scan now caps at 128 + rejects >255-byte breakless runs) |
+| **Global XWRT dictionary** | dickens, webster, nci, mr, json | One corpus-wide first pass builds a top-128 dictionary stored once in the container header; every Text-block XWRT trial reuses it (no per-block dict bytes). Measured: dickens −4.6pt (45.9→41.3), webster −4.0pt (34.1→30.1), nci −1.5pt (8.9→7.4), mr neutral, json 458→299B | **kept as default** — gated on pure-ASCII blocks (tokens alias ≥0x80 literal bytes) |
 | **SSE/APM/APM2 cascade** | mr, dickens, json, webster, nci | **improved all 5**: nci −0.9pt, mr −0.8pt, dickens −0.3pt, webster −0.5pt, json −0.1pt | **wired into codec** |
 | **AVX2 SIMD walk_dist** | All | 5-10x fast path speedup, zero ratio loss | **completed** |
 
@@ -282,9 +283,9 @@ priority order:
 
 ## Potential ratio improvements (remaining)
 
-All compression tickets (C1-C4) are now completed. The only remaining
-optimization is S6 (Faster BWT with libsais SA-IS), which is deferred
-due to implementation complexity.
+All compression tickets (C1-C4) and the corpus-wide global XWRT dictionary are
+now completed. The only remaining optimization is S6 (Faster BWT with libsais
+SA-IS), which is deferred due to implementation complexity.
 
 Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 

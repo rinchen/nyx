@@ -419,7 +419,12 @@ impl BwtPipeline {
     /// compress. For `RawCm`, the payload IS the original data.
     ///
     /// For `JsonSplit`, the payload is: `[4×4-byte stream lengths][4 BWT-encoded streams]`.
-    pub fn encode(self, data: &[u8]) -> Vec<u8> {
+    /// For `XwrtBwtMtfRle`, if `global_dict` is Some, it's used instead of building a per-block dictionary.
+    pub fn encode(
+        self,
+        data: &[u8],
+        global_dict: Option<&crate::model::word::XwrtDictionary>,
+    ) -> Vec<u8> {
         match self {
             BwtPipeline::RawCm => data.to_vec(),
             BwtPipeline::BwtMtfRle => bwt_mtf_rle_encode(data),
@@ -511,11 +516,16 @@ impl BwtPipeline {
                 out
             }
             BwtPipeline::XwrtBwtMtfRle => {
-                // Build dictionary from original data and apply XWRT transform.
-                let dict = crate::model::word::XwrtDictionary::build_from_data(data);
-                let xwrt = dict.transform(data);
+                // Use global dictionary if provided (stored once in the container
+                // header), otherwise build + embed a per-block dictionary.
+                let (xwrt, dict_bytes) = match global_dict {
+                    Some(gd) => (gd.transform(data), Vec::new()),
+                    None => {
+                        let d = crate::model::word::XwrtDictionary::build_from_data(data);
+                        (d.transform(data), d.to_bytes())
+                    }
+                };
                 let encoded = bwt_mtf_rle_encode(&xwrt);
-                let dict_bytes = dict.to_bytes();
                 let mut out = Vec::with_capacity(4 + 4 + encoded.len() + dict_bytes.len());
                 out.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -527,7 +537,15 @@ impl BwtPipeline {
     }
 
     /// Decode a payload produced by [`Self::encode`], returning the original data.
-    pub fn decode(self, payload: &[u8], orig_len: usize) -> Vec<u8> {
+    ///
+    /// For `XwrtBwtMtfRle`, a `Some` `global_dict` (stored once in the container
+    /// header) is used instead of an embedded per-block dictionary.
+    pub fn decode(
+        self,
+        payload: &[u8],
+        orig_len: usize,
+        global_dict: Option<&crate::model::word::XwrtDictionary>,
+    ) -> Vec<u8> {
         match self {
             BwtPipeline::RawCm => payload.to_vec(),
             BwtPipeline::BwtMtfRle => bwt_mtf_rle_decode(payload),
@@ -596,8 +614,13 @@ impl BwtPipeline {
                     return Vec::new();
                 }
                 let mtf = bwt_mtf_rle_decode(&payload[8..8 + encoded_len]);
-                let dict_data = &payload[8 + encoded_len..];
-                crate::model::word::xwrt_inverse_with_dict(&mtf, orig_len, dict_data)
+                match global_dict {
+                    Some(gd) => crate::model::word::inverse_with_dict(&mtf, orig_len, gd),
+                    None => {
+                        let dict_data = &payload[8 + encoded_len..];
+                        crate::model::word::xwrt_inverse_with_dict(&mtf, orig_len, dict_data)
+                    }
+                }
             }
         }
     }
@@ -635,7 +658,15 @@ const TRIAL_MAX_SHANNON: f32 = 7.2;
 ///
 /// If the block looks like JSON and is large enough, a fourth path (JSON split) is
 /// also tried: the block is split into 4 streams and each is BWT-trialed independently.
-pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
+///
+/// When `global_dict` is `Some`, a fifth path (`XwrtBwtMtfRle`) is tried: the
+/// corpus-wide word dictionary is applied before BWT. XWRT tokens live in
+/// `0x80..=0xFF`, so the trial is gated on the block being pure ASCII — high
+/// literal bytes would alias tokens and break the round-trip.
+pub fn compress_text_with_trial(
+    data: &[u8],
+    global_dict: Option<&crate::model::word::XwrtDictionary>,
+) -> BwtPathResult {
     let is_json = crate::json_split::looks_like_json(data);
     let small = data.len() < 256 * 1024;
     let medium = (256 * 1024..TRIAL_MIN_LEN).contains(&data.len()) && !is_json;
@@ -651,42 +682,45 @@ pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
     // S5: Parallel blocks — run all pipeline trials concurrently using rayon.
     let path_a_size = data.len();
     let (path_b_size, path_c_size) = rayon::join(
-        || BwtPipeline::BwtMtfRle.encode(data).len(),
-        || BwtPipeline::LzpBwtMtf.encode(data).len(),
+        || BwtPipeline::BwtMtfRle.encode(data, global_dict).len(),
+        || BwtPipeline::LzpBwtMtf.encode(data, global_dict).len(),
     );
     let json_split_size = if is_json {
-        Some(rayon::join(
-            || BwtPipeline::JsonSplit.encode(data).len(),
-            || 0,
-        ).0)
+        Some(
+            rayon::join(
+                || BwtPipeline::JsonSplit.encode(data, global_dict).len(),
+                || 0,
+            )
+            .0,
+        )
+    } else {
+        None
+    };
+    let xwrt_size = if global_dict.is_some() && data.is_ascii() {
+        Some(BwtPipeline::XwrtBwtMtfRle.encode(data, global_dict).len())
     } else {
         None
     };
 
-    let (best_pipeline, best_size, is_bwt) = if let Some(json_size) = json_split_size {
-        if json_size <= path_a_size && json_size <= path_b_size && json_size <= path_c_size {
-            (BwtPipeline::JsonSplit, json_size, true)
-        } else if path_b_size <= path_a_size && path_b_size <= path_c_size {
-            (BwtPipeline::BwtMtfRle, path_b_size, true)
-        } else if path_c_size <= path_a_size && path_c_size <= path_b_size {
-            (BwtPipeline::LzpBwtMtf, path_c_size, true)
-        } else {
-            (BwtPipeline::RawCm, path_a_size, false)
-        }
-    } else {
-        if path_b_size <= path_a_size && path_b_size <= path_c_size {
-            (BwtPipeline::BwtMtfRle, path_b_size, true)
-        } else if path_c_size <= path_a_size && path_c_size <= path_b_size {
-            (BwtPipeline::LzpBwtMtf, path_c_size, true)
-        } else {
-            (BwtPipeline::RawCm, path_a_size, false)
-        }
-    };
+    let mut candidates: Vec<(BwtPipeline, usize)> = vec![(BwtPipeline::RawCm, path_a_size)];
+    candidates.push((BwtPipeline::BwtMtfRle, path_b_size));
+    candidates.push((BwtPipeline::LzpBwtMtf, path_c_size));
+    if let Some(json_size) = json_split_size {
+        candidates.push((BwtPipeline::JsonSplit, json_size));
+    }
+    if let Some(xwrt_size) = xwrt_size {
+        candidates.push((BwtPipeline::XwrtBwtMtfRle, xwrt_size));
+    }
+
+    let (best_pipeline, best_size) = candidates
+        .into_iter()
+        .min_by_key(|&(_, size)| size)
+        .unwrap();
 
     BwtPathResult {
         pipeline: best_pipeline,
         encoded_size: best_size,
-        is_bwt,
+        is_bwt: best_pipeline != BwtPipeline::RawCm,
     }
 }
 
@@ -886,8 +920,8 @@ mod tests {
     #[test]
     fn bwt_pipeline_lzp_bwt_round_trip() {
         let text = b"the quick brown fox. \n".repeat(500);
-        let encoded = BwtPipeline::LzpBwtMtf.encode(&text);
-        let decoded = BwtPipeline::LzpBwtMtf.decode(&encoded, text.len());
+        let encoded = BwtPipeline::LzpBwtMtf.encode(&text, None);
+        let decoded = BwtPipeline::LzpBwtMtf.decode(&encoded, text.len(), None);
         assert_eq!(decoded, text);
     }
 
@@ -895,7 +929,7 @@ mod tests {
     fn compress_text_with_trial_selects_smallest() {
         // Repetitive text should favor BWT path.
         let text = b"banana ".repeat(5000);
-        let result = compress_text_with_trial(&text);
+        let result = compress_text_with_trial(&text, None);
         println!(
             "Trial result: {:?}, size={}",
             result.pipeline, result.encoded_size
@@ -906,17 +940,17 @@ mod tests {
     #[test]
     fn bwt_pipeline_json_split_round_trip() {
         let text = b"{\"name\":\"John\",\"age\":42,\"city\":\"New York\"}\n".repeat(500);
-        let encoded = BwtPipeline::JsonSplit.encode(&text);
-        let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len());
+        let encoded = BwtPipeline::JsonSplit.encode(&text, None);
+        let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len(), None);
         assert_eq!(decoded, text);
     }
 
     #[test]
     fn bwt_pipeline_xwrt_round_trip() {
         let text = b"hello world hello world hello world".to_vec();
-        let encoded = BwtPipeline::XwrtBwtMtfRle.encode(&text);
+        let encoded = BwtPipeline::XwrtBwtMtfRle.encode(&text, None);
         eprintln!("XWRT encode len={} content={:?}", encoded.len(), encoded);
-        let decoded = BwtPipeline::XwrtBwtMtfRle.decode(&encoded, text.len());
+        let decoded = BwtPipeline::XwrtBwtMtfRle.decode(&encoded, text.len(), None);
         eprintln!("XWRT decode len={} content={:?}", decoded.len(), decoded);
         assert_eq!(decoded, text);
     }

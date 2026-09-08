@@ -387,19 +387,68 @@ mod tests {
             "dictionary should have at least one entry after frequent pairs"
         );
     }
+
+    #[test]
+    fn xwrt_dictionary_serialization_caps_at_128() {
+        // A corpus with hundreds of distinct words must serialize only the
+        // top 128 (token space 0x80-0xFF); the prior `len() as u8` cast
+        // truncated dicts >255 words to zero. Regression test.
+        let mut text = Vec::new();
+        for i in 0..300 {
+            text.extend_from_slice(format!("word{i} ").as_bytes());
+        }
+        let dict = XwrtDictionary::build_from_data(&text);
+        let bytes = dict.to_bytes();
+        assert_eq!(bytes[0], 128, "dict must serialize exactly 128 words");
+        let back = XwrtDictionary::from_bytes(&bytes).expect("parses");
+        assert_eq!(back.id_to_word.len(), 128);
+    }
+
+    #[test]
+    fn xwrt_global_dict_transform_round_trip() {
+        let text = b"the quick brown fox jumps over the lazy dog\n\
+the quick brown fox jumps over the lazy dog\n\
+the quick brown fox jumps over the lazy dog\n"
+            .to_vec();
+        let dict = XwrtDictionary::build_from_data(&text);
+        let xwrt = dict.transform(&text);
+        assert!(xwrt.len() < text.len(), "frequent words should shrink");
+        let back = inverse_with_dict(&xwrt, text.len(), &dict);
+        assert_eq!(back, text);
+    }
+
+    #[test]
+    fn xwrt_skips_breakless_runs() {
+        // No word breaks in the stream: the whole run is one >maxlen "word",
+        // which the scanner drops. Transform must be an identity passthrough.
+        let text = b"rcnrcnrcn".repeat(5000);
+        let dict = XwrtDictionary::build_from_data(&text);
+        let bytes = dict.to_bytes();
+        assert_eq!(bytes[0], 0, "no real words -> empty dict");
+        let xwrt = dict.transform(&text);
+        assert_eq!(xwrt, text, "empty dict is identity");
+    }
 }
 
 /// XWRT: eXtended Word Replacement Transform.
 ///
-/// Builds a static dictionary of the top 2048 words in the input text,
-/// then replaces each word occurrence with a token 0x80 + word_id.
+/// Builds a static dictionary of the top words in the input text, then
+/// replaces each word occurrence with a single token in `0x80..=0xFF`
+/// (token space is 128 values, so only the top [`MAX_XWRT_WORDS`] words
+/// are encoded; everything else passes through as literals).
 /// Non-word bytes (including word break chars) pass through unchanged.
 ///
 /// The encoder and decoder both build the dictionary identically by
 /// scanning the input in a single pass to count word frequencies,
-/// then keeping the top 2048 by frequency (tie-break by first appearance).
+/// then keeping the top [`MAX_XWRT_WORDS`] by frequency (tie-break by
+/// first appearance).
 ///
-/// Returns: Vec<u8> where word tokens are in range [0x80, 0x80+2047].
+/// Returns: Vec<u8> where word tokens are in range [0x80, 0xFF].
+pub const MAX_XWRT_WORDS: usize = 128;
+/// Longest word kept by the XWRT scanner. Also the max that fits the
+/// `u8` length byte in [`XwrtDictionary::to_bytes`]; anything longer is a
+/// breakless run (base64/hex/garbage) rather than a real word.
+pub const MAX_XWRT_WORD_LEN: usize = 255;
 pub fn xwrt_transform(data: &[u8]) -> Vec<u8> {
     // First pass: count word frequencies and remember first appearance
     let mut scanner = WordScanner::new(2048); // keep top 2K words
@@ -433,7 +482,11 @@ pub fn xwrt_transform(data: &[u8]) -> Vec<u8> {
         let mut matched = false;
         for word in &dictionary.words {
             if i + word.len() <= data.len() && &data[i..i + word.len()] == word.as_slice() {
-                let id = dictionary.word_to_id.get(String::from_utf8_lossy(word).as_ref()).copied().unwrap_or(0);
+                let id = dictionary
+                    .word_to_id
+                    .get(String::from_utf8_lossy(word).as_ref())
+                    .copied()
+                    .unwrap_or(0);
                 out.push(0x80 + (id as u8));
                 i += word.len();
                 matched = true;
@@ -503,43 +556,49 @@ pub fn xwrt_inverse_transform(data: &[u8], orig_len: usize) -> Vec<u8> {
 
 /// Helper: scans text to find the top N words by frequency.
 #[derive(Debug)]
-struct WordScanner {
+pub(crate) struct WordScanner {
     /// Minimum word length to consider
     min_word_len: usize,
     /// Maximum number of words to keep in dictionary
     max_words: usize,
+    /// Maximum word length kept (words longer than this are literal noise)
+    max_word_len: usize,
     /// All words seen with their frequency and first position
     word_freq: Vec<(String, usize, usize)>,
+    /// word -> index into `word_freq` (O(1) frequency updates)
+    index: std::collections::HashMap<String, usize>,
 }
 impl WordScanner {
-    fn new(max_words: usize) -> Self {
+    pub(crate) fn new(max_words: usize) -> Self {
         Self {
             min_word_len: 2, // ignore single-letter words
             max_words,
+            max_word_len: MAX_XWRT_WORD_LEN,
             word_freq: Vec::new(),
+            index: std::collections::HashMap::new(),
         }
     }
     /// Add a word occurrence
-    fn add_word(&mut self, word: &[u8]) {
-        if word.len() < self.min_word_len {
+    pub(crate) fn add_word(&mut self, word: &[u8]) {
+        if word.len() < self.min_word_len || word.len() > self.max_word_len {
             return;
         }
         let word_str = String::from_utf8_lossy(word).to_string();
-        if let Some(pos) = self.word_freq.iter().position(|(w, _, _)| w == &word_str) {
-            // Increment frequency
-            let (_, freq, _) = &mut self.word_freq[pos];
-            *freq += 1;
+        if let Some(&idx) = self.index.get(&word_str) {
+            // Increment frequency in place without a linear scan.
+            self.word_freq[idx].1 += 1;
         } else {
             // New word
-            self.word_freq.push((word_str, 1, self.word_freq.len()));
+            let idx = self.word_freq.len();
+            self.index.insert(word_str.clone(), idx);
+            self.word_freq.push((word_str, 1, idx));
         }
     }
     /// Build dictionary: top max_words by frequency, tie-break by first appearance
-    fn build_dictionary(&mut self) -> XwrtDictionary {
+    pub(crate) fn build_dictionary(&mut self) -> XwrtDictionary {
         // Sort by frequency descending, then by first appearance ascending
-        self.word_freq.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2))
-        });
+        self.word_freq
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
         // Keep only top max_words
         self.word_freq.truncate(self.max_words);
         // Build lookup tables
@@ -549,7 +608,11 @@ impl WordScanner {
             word_to_id.insert(word.clone(), idx);
             id_to_word.push(word.clone());
         }
-        let words: Vec<Vec<u8>> = self.word_freq.iter().map(|(w, _, _)| w.as_bytes().to_vec()).collect();
+        let words: Vec<Vec<u8>> = self
+            .word_freq
+            .iter()
+            .map(|(w, _, _)| w.as_bytes().to_vec())
+            .collect();
         XwrtDictionary {
             words,
             word_to_id,
@@ -591,6 +654,10 @@ impl XwrtDictionary {
     }
 
     /// Apply XWRT transform to data using this dictionary.
+    ///
+    /// Only the top [`MAX_XWRT_WORDS`] words are encoded: tokens span
+    /// `0x80..=0xFF` (128 values), so words beyond the top 128 are emitted as
+    /// literals to keep the transform lossless.
     pub fn transform(&self, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         let mut i = 0usize;
@@ -601,9 +668,13 @@ impl XwrtDictionary {
                 continue;
             }
             let mut matched = false;
-            for word in &self.words {
+            for word in self.words.iter().take(MAX_XWRT_WORDS) {
                 if i + word.len() <= data.len() && &data[i..i + word.len()] == word.as_slice() {
-                    let id = self.word_to_id.get(String::from_utf8_lossy(word).as_ref()).copied().unwrap_or(0);
+                    let id = self
+                        .word_to_id
+                        .get(String::from_utf8_lossy(word).as_ref())
+                        .copied()
+                        .unwrap_or(0);
                     out.push(0x80 + (id as u8));
                     i += word.len();
                     matched = true;
@@ -646,8 +717,10 @@ impl XwrtDictionary {
     /// Serialize dictionary to bytes for storage in the encoded stream.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        // Limit to 255 words per stream (token range 0x80-0xFF)
-        let n = (self.id_to_word.len() as u8).min(255);
+        // Limit to MAX_XWRT_WORDS (token range 0x80-0xFF holds 128 ids).
+        // Cast AFTER capping: `id_to_word.len() as u8` would truncate for
+        // dicts larger than 255 words.
+        let n = self.id_to_word.len().min(MAX_XWRT_WORDS) as u8;
         out.push(n);
         for i in 0..n as usize {
             let word = &self.id_to_word[i];
@@ -691,12 +764,45 @@ impl XwrtDictionary {
 }
 /// Check if a byte is a word break character.
 #[inline]
-fn is_word_break(b: u8) -> bool {
-    matches!(b,
-        b' ' | b'\t' | b'\n' | b'\r' | b'\x00' |
-        b'!' | b'"' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b'-' | b'.' | b'/' |
-        b':' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' |
-        b'[' | b'\\' | b']' | b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~'
+pub(crate) fn is_word_break(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'\x00'
+            | b'!'
+            | b'"'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b'-'
+            | b'.'
+            | b'/'
+            | b':'
+            | b';'
+            | b'<'
+            | b'='
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'['
+            | b'\\'
+            | b']'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'~'
     )
 }
 
@@ -709,7 +815,7 @@ pub fn xwrt_inverse_with_dict(data: &[u8], orig_len: usize, dict_data: &[u8]) ->
     inverse_with_dict(data, orig_len, &dict)
 }
 
-fn inverse_with_dict(data: &[u8], orig_len: usize, dict: &XwrtDictionary) -> Vec<u8> {
+pub(crate) fn inverse_with_dict(data: &[u8], orig_len: usize, dict: &XwrtDictionary) -> Vec<u8> {
     let mut out = Vec::with_capacity(orig_len);
     let mut i = 0usize;
     while i < data.len() {
