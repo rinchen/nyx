@@ -1,9 +1,11 @@
 [package]
-name = "nyx"
+name = "rcn"
 version = "0.1.0"
 edition = "2021"
-description = "Nyx: adaptive staged context-mixing compressor"
-license = "MIT OR Apache-2.0"
+description = "Rust bit-mixer + BWT + DP-LZP compressor beating zstd -1 on text"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/rinchen/rcn"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -30,7 +32,7 @@ panic = "abort"
 strip = "symbols"
 
 [[bin]]
-name = "nyx"
+name = "rcn"
 path = "src/main.rs"
 
 [[bench]]

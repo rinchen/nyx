@@ -1,4 +1,4 @@
-//! `nyx bench:configs` — compare multiple model-stack configs on one corpus.
+//! `rcn bench:configs` — compare multiple model-stack configs on one corpus.
 //!
 //! Usage:
 //!   cargo run --bin `bench_configs` -- bench-configs <`corpus_dir`>
@@ -17,13 +17,13 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use nyx::codec;
+use rcn::codec;
 
 #[derive(Parser)]
 #[command(
-    name = "nyx",
+    name = "rcn",
     version,
-    about = "Nyx: adaptive staged context-mixing compressor"
+    about = "Rcn: adaptive staged context-mixing compressor"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -53,7 +53,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("nyx: error: {e}");
+        eprintln!("rcn: error: {e}");
         std::process::exit(1);
     }
 }
@@ -121,7 +121,7 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
         if !path.is_file() {
             continue;
         }
-        if path.extension().is_some_and(|e| e == "nyx") {
+        if path.extension().is_some_and(|e| e == "rcn") {
             continue;
         }
         let Ok(data) = fs::read(&path) else {
@@ -170,10 +170,10 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
 fn measure_buf<F>(label: &str, data: &[u8], mut build: F) -> (usize, usize, f64, f64, f64)
 where
     F: FnMut(
-        nyx::classify::BlockKind,
+        rcn::classify::BlockKind,
     ) -> (
-        Vec<Box<dyn nyx::model::BitModel>>,
-        nyx::model::mixer_bank::MixerBank,
+        Vec<Box<dyn rcn::model::BitModel>>,
+        rcn::model::mixer_bank::MixerBank,
         Option<usize>,
     ),
 {
@@ -221,7 +221,7 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
         if !path.is_file() {
             continue;
         }
-        if path.extension().is_some_and(|e| e == "nyx") {
+        if path.extension().is_some_and(|e| e == "rcn") {
             continue;
         }
         let Ok(data) = fs::read(&path) else {
@@ -232,21 +232,21 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
         }
 
         let baseline_ratio =
-            measure_buf("baseline", &data, |_| nyx::stacks::BaselineBuilder::build()).2;
+            measure_buf("baseline", &data, |_| rcn::stacks::BaselineBuilder::build()).2;
 
         let configs: [(
             &str,
             fn() -> (
-                Vec<Box<dyn nyx::model::BitModel>>,
-                nyx::model::mixer_bank::MixerBank,
+                Vec<Box<dyn rcn::model::BitModel>>,
+                rcn::model::mixer_bank::MixerBank,
                 Option<usize>,
             ),
         ); 5] = [
-            ("baseline", nyx::stacks::BaselineBuilder::build),
-            ("ppm3", || nyx::stacks::PpmBuilder::new(3).build()),
-            ("ppm4", || nyx::stacks::PpmBuilder::new(4).build()),
-            ("hybrid_ppm3", nyx::stacks::HybridPpm3Builder::build),
-            ("ppmd_ssm", nyx::stacks::PpmdSsmBuilder::build),
+            ("baseline", rcn::stacks::BaselineBuilder::build),
+            ("ppm3", || rcn::stacks::PpmBuilder::new(3).build()),
+            ("ppm4", || rcn::stacks::PpmBuilder::new(4).build()),
+            ("hybrid_ppm3", rcn::stacks::HybridPpm3Builder::build),
+            ("ppmd_ssm", rcn::stacks::PpmdSsmBuilder::build),
         ];
 
         for (label, builder) in &configs {

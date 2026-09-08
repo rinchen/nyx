@@ -1,4 +1,4 @@
-//! `nyx` command-line interface.
+//! `rcn` command-line interface.
 //!
 //! Subcommands: `compress`, `decompress`, `bench` (vs a corpus directory), and
 //! `self-test` (runs the library's `#[test]` suite). The codec is currently
@@ -19,13 +19,13 @@ use std::process::Command;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use nyx::codec::{self, decompress, CodecMode};
+use rcn::codec::{self, decompress, CodecMode};
 
 #[derive(Parser)]
 #[command(
-    name = "nyx",
+    name = "rcn",
     version,
-    about = "Nyx: adaptive staged context-mixing compressor"
+    about = "Rcn: adaptive staged context-mixing compressor"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,7 +42,7 @@ enum ModeArg {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Compress a file into a .nyx (NYX1) container.
+    /// Compress a file into a .rcn (RCN1) container.
     Compress {
         input: PathBuf,
         output: PathBuf,
@@ -53,9 +53,9 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ModeArg::Slow)]
         mode: ModeArg,
     },
-    /// Decompress a .nyx (NYX1) container back to a file.
+    /// Decompress a .rcn (RCN1) container back to a file.
     Decompress { input: PathBuf, output: PathBuf },
-    /// Benchmark nyx over every file in a corpus directory.
+    /// Benchmark rcn over every file in a corpus directory.
     Bench {
         corpus: PathBuf,
         /// Reserved for SOTA comparison (see `scripts/bench_vs_sota.sh`).
@@ -71,7 +71,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("nyx: error: {e}");
+        eprintln!("rcn: error: {e}");
         std::process::exit(1);
     }
 }
@@ -159,8 +159,8 @@ fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool) -> Result<(), Strin
             continue;
         }
         // Skip our own container output so re-running against a corpus dir that
-        // accidentally contains .nyx files doesn't benchmark the wrapper.
-        if path.extension().is_some_and(|e| e == "nyx") {
+        // accidentally contains .rcn files doesn't benchmark the wrapper.
+        if path.extension().is_some_and(|e| e == "rcn") {
             continue;
         }
         let Ok(data) = fs::read(&path) else {

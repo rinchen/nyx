@@ -3,12 +3,12 @@
 //! byte extraction) are exact here.
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-use nyx::classify::classify;
-use nyx::codec::{compress, decompress};
+use rcn::classify::classify;
+use rcn::codec::{compress, decompress};
 
 fn main() {
     // Small reproducible input first
-    let small = b"nyxnyxnyxnyxnyxnyxnyxnyxnyxnyx";
+    let small = b"rcnrcnrcnrcnrcnrcnrcnrcnrcnrcn";
     println!("small input len = {}", small.len());
     println!("  classify = {:?}", classify(small));
     let c = compress(small).unwrap();
@@ -19,7 +19,7 @@ fn main() {
     // Larger repetitive
     let mut reps = Vec::new();
     for _ in 0..20_000 {
-        reps.extend_from_slice(b"nyxnyxnyx");
+        reps.extend_from_slice(b"rcnrcnrcn");
     }
     println!("\nreps input len = {}", reps.len());
     println!("  classify = {:?}", classify(&reps));

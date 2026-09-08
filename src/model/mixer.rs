@@ -1,4 +1,4 @@
-//! Online logistic mixer — the novel core of `nyx`.
+//! Online logistic mixer — the novel core of `rcn`.
 //!
 //! Each base model emits a 12-bit probability of bit==1. The mixer fuses them with a
 //! weighted sum in the logistic domain (stretch → linear combination → squash) and adapts

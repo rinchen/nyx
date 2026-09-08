@@ -1,12 +1,12 @@
-//! Error type for `nyx` compression/decompression.
+//! Error type for `rcn` compression/decompression.
 
 use thiserror::Error;
 
-/// Errors produced by the `nyx` codec.
+/// Errors produced by the `rcn` codec.
 #[derive(Debug, Error)]
-pub enum NyxError {
+pub enum RcnError {
     /// The container magic or structure was not valid.
-    #[error("invalid nyx container: {0}")]
+    #[error("invalid rcn container: {0}")]
     InvalidContainer(String),
 
     /// A block payload was truncated or the entropy stream was corrupt.
@@ -31,4 +31,4 @@ pub enum NyxError {
 }
 
 /// Convenience alias for codec results.
-pub type Result<T> = std::result::Result<T, NyxError>;
+pub type Result<T> = std::result::Result<T, RcnError>;

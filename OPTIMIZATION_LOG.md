@@ -1,4 +1,4 @@
-# Nyx Optimization Opportunity Log
+# Rcn Optimization Opportunity Log
 
 Last updated: 2026-09-07
 Test status: 135/135 passing

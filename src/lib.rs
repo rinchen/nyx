@@ -1,4 +1,4 @@
-// nyx library root
+// rcn library root
 
 // The bit-probability / entropy math performs deliberate numeric casts (u16/u32 <-> f32/f64,
 // usize position -> u32 table index). These are exact at our magnitudes (12-bit probs,

@@ -46,7 +46,7 @@
 //! not the branching).  Bit-identical to the scalar path for all inputs.
 
 use crate::entropy::byterans::{RansByteDecoder32, RansByteEncoder32, BYTE_SCALE};
-use crate::error::{NyxError, Result};
+use crate::error::{RcnError, Result};
 
 /// Hashed order-2 contexts. 4 096 rows × 256 × u16 = 2 MB.
 const ORDER2_CTX: usize = 1 << 12;
@@ -465,7 +465,7 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns [`NyxError::CorruptBlock`] if the stream is truncated (fewer than
+/// Returns [`RcnError::CorruptBlock`] if the stream is truncated (fewer than
 /// the 4-byte rANS state tail).
 pub fn decompress_block(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
     let big = orig_len >= 256 * 1024;
@@ -475,7 +475,7 @@ pub fn decompress_block(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
     let mut dec = RansByteDecoder32::new(comp, orig_len)
-        .map_err(|_| NyxError::CorruptBlock("short rANS stream".into()))?;
+        .map_err(|_| RcnError::CorruptBlock("short rANS stream".into()))?;
 
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;

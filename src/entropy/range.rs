@@ -1,6 +1,6 @@
-//! Entropy backend for `nyx`: a **bit coder** built on the audited [`ans`] rANS crate.
+//! Entropy backend for `rcn`: a **bit coder** built on the audited [`ans`] rANS crate.
 //!
-//! `nyx` models data bit-by-bit (the logistic mixer emits a probability per bit), so
+//! `rcn` models data bit-by-bit (the logistic mixer emits a probability per bit), so
 //! this module exposes a stream of bits where each bit is entropy-coded against a 2-symbol
 //! rANS frequency table derived from the predicted probability. Using `ans` for the
 //! primitive keeps the entropy stage correct and battle-tested; the novel work lives in

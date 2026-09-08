@@ -195,12 +195,12 @@ pub fn split(data: &[u8]) -> JsonStreams {
 ///
 /// # Errors
 ///
-/// Returns `NyxError::JsonSplitError` if a stream is exhausted prematurely
+/// Returns `RcnError::JsonSplitError` if a stream is exhausted prematurely
 /// or the structural stream contains a malformed marker.
 pub fn merge(
     streams: &JsonStreams,
     original_len: usize,
-) -> Result<Vec<u8>, crate::error::NyxError> {
+) -> Result<Vec<u8>, crate::error::RcnError> {
     let mut out = Vec::with_capacity(original_len);
     let mut ki = 0usize;
     let mut vi = 0usize;
@@ -218,7 +218,7 @@ pub fn merge(
         if b == MARK_PREFIX {
             // Read 4-byte LE length + 1-byte channel tag.
             if si + 5 >= s.len() {
-                return Err(crate::error::NyxError::JsonSplitError(format!(
+                return Err(crate::error::RcnError::JsonSplitError(format!(
                     "truncated marker at structural offset {si}"
                 )));
             }
@@ -243,7 +243,7 @@ pub fn merge(
                     ni += len;
                 }
                 _ => {
-                    return Err(crate::error::NyxError::JsonSplitError(format!(
+                    return Err(crate::error::RcnError::JsonSplitError(format!(
                         "unknown channel byte {channel} at structural offset {si}"
                     )));
                 }
@@ -255,7 +255,7 @@ pub fn merge(
     }
 
     if out.len() != original_len {
-        return Err(crate::error::NyxError::JsonSplitError(format!(
+        return Err(crate::error::RcnError::JsonSplitError(format!(
             "merge produced {} bytes, expected {}",
             out.len(),
             original_len
@@ -271,9 +271,9 @@ fn check_bounds(
     len: usize,
     total: usize,
     name: &str,
-) -> Result<(), crate::error::NyxError> {
+) -> Result<(), crate::error::RcnError> {
     if start + len > total {
-        Err(crate::error::NyxError::JsonSplitError(format!(
+        Err(crate::error::RcnError::JsonSplitError(format!(
             "stream '{name}' exhausted: need {len} bytes at offset {start}, only {} remaining",
             total.saturating_sub(start)
         )))

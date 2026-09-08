@@ -1,6 +1,6 @@
 //! Per-block data-type classifier.
 //!
-//! Before compressing a block, `nyx` estimates its character with a cheap order-0 Shannon
+//! Before compressing a block, `rcn` estimates its character with a cheap order-0 Shannon
 //! entropy over the block and a few structural signals. This chooses which predictor stack
 //! to run (and whether to just copy random data), which is what keeps speed near `zstd`
 //! while allowing CM-quality prediction only where it pays off.

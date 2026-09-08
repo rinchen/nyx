@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 #
-# bench_vs_sota.sh — compare `nyx` against reference compressors on a corpus.
+# bench_vs_sota.sh — compare `rcn` against reference compressors on a corpus.
 #
-# Builds nyx (release), then for every regular file in the corpus directory runs
-# zstd -19, xz -9, brotli -11, lz4 -9 (skipping any not installed) and nyx,
+# Builds rcn (release), then for every regular file in the corpus directory runs
+# zstd -19, xz -9, brotli -11, lz4 -9 (skipping any not installed) and rcn,
 # tabulating (name, orig_kb, comp_kb, ratio%, cmp_MBps, dec_MBps).
 #
-# Usage: scripts/bench_vs_sota.sh <corpus_dir> [nyx_bin]
+# Usage: scripts/bench_vs_sota.sh <corpus_dir> [rcn_bin]
 #   corpus_dir  directory of files to compress (subdirs are skipped)
-#   nyx_bin     optional path to a nyx binary (default: ./target/release/nyx)
+#   rcn_bin     optional path to a rcn binary (default: ./target/release/rcn)
 
 set -u
 
 CORPUS="${1:-}"
-NYX="${2:-./target/release/nyx}"
+RCN="${2:-./target/release/rcn}"
 
 if [[ -z "$CORPUS" || ! -d "$CORPUS" ]]; then
-    echo "usage: $0 <corpus_dir> [nyx_bin]" >&2
+    echo "usage: $0 <corpus_dir> [rcn_bin]" >&2
     exit 1
 fi
 
-# Build nyx in release mode unless a binary was handed in.
-if [[ ! -x "$NYX" ]]; then
-    echo "building nyx (release)..." >&2
-    cargo build --release --bin nyx || { echo "nyx build failed" >&2; exit 1; }
+# Build rcn in release mode unless a binary was handed in.
+if [[ ! -x "$RCN" ]]; then
+    echo "building rcn (release)..." >&2
+    cargo build --release --bin rcn || { echo "rcn build failed" >&2; exit 1; }
 fi
 
 WORK="$(mktemp -d)"
@@ -63,13 +63,13 @@ for f in "$CORPUS"/*; do
     [[ "$orig" -eq 0 ]] && continue
     okb="$(awk -v b="$orig" 'BEGIN { printf "%.1f", b/1024 }')"
 
-    # --- nyx ---
-    if [[ -x "$NYX" ]]; then
-        t="$(run_and_time "$WORK/n.nyx" "$NYX" compress "$f" "$WORK/n.nyx")"
-        c="$(wc -c <"$WORK/n.nyx")"
-        t2="$(run_and_time "$WORK/n.out" "$NYX" decompress "$WORK/n.nyx" "$WORK/n.out")"
+    # --- rcn ---
+    if [[ -x "$RCN" ]]; then
+        t="$(run_and_time "$WORK/n.rcn" "$RCN" compress "$f" "$WORK/n.rcn")"
+        c="$(wc -c <"$WORK/n.rcn")"
+        t2="$(run_and_time "$WORK/n.out" "$RCN" decompress "$WORK/n.rcn" "$WORK/n.out")"
         r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
-        fmt "nyx" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
+        fmt "rcn" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
     fi
 
     # --- zstd -19 ---

@@ -1,7 +1,7 @@
 //! SSE (Secondary Similarity Estimator) + APM (Adaptive Probability Mapping) cascade.
 //!
 //! PAQ8 and CMIX use a multi-stage probability refinement pipeline after the
-//! logistic mixer. Nyx stops after the mixer — this cascade adds the missing
+//! logistic mixer. Rcn stops after the mixer — this cascade adds the missing
 //! stages:
 //!
 //!   1. Logistic mixer   → p (fused per-bit probability)
