@@ -325,7 +325,11 @@ impl ByteCountModel {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            let use_avx2 = is_x86_feature_detected!("avx2") && (inv >> 31) == 0;
+            // AVX2 path is bit-identical to scalar only when `cnt * inv < 2^32`.
+            // inv = floor(2^32/t). Wrap occurs iff t is a power of two and cnt == t
+            // (single symbol dominates the context). Guard: disable AVX2 for power-of-two totals.
+            let t = u64::from(self.totals[ctx].max(1));
+            let use_avx2 = is_x86_feature_detected!("avx2") && !t.is_power_of_two();
             if use_avx2 {
                 return unsafe { walk_dist_avx2(self.counts.as_ptr(), base, inv, target, cdf) };
             }
