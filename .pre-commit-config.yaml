@@ -1,6 +1,12 @@
 repos:
   - repo: local
     hooks:
+      - id: cargo-build
+        name: Build the crate (mirrors CI rust.yml build step)
+        entry: cargo build --locked
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: cargo-check
         name: Compile-check all targets (lib, bins, examples, tests, benches)
         entry: cargo check --workspace --all-targets --locked
@@ -8,8 +14,8 @@ repos:
         pass_filenames: false
         always_run: true
       - id: cargo-test
-        name: Run cargo tests (lib)
-        entry: cargo test --lib --locked
+        name: Run cargo tests (mirrors CI rust.yml test step)
+        entry: cargo test --locked
         language: system
         pass_filenames: false
         always_run: true
