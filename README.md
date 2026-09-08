@@ -199,10 +199,9 @@ priority order:
 
 ## Potential ratio improvements (remaining)
 
-These opportunities have been measured but not yet integrated:
-
-1. **Re-benchmark fixed PPMd** — Order-8 PPMd with SEE was measured with broken config. Fair config now matches hybrid_ppm3. Previous +0.8pt webster should be +1.5-2pt.
-2. **Exec/Binary transforms** — E8E9 for Exec done (3-5pt on executables). Delta/stride for Binary done (2-4pt).
+All compression tickets (C1-C4) are now completed. The only remaining
+optimization is S6 (Faster BWT with libsais SA-IS), which is deferred
+due to implementation complexity.
 
 Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 

@@ -12,7 +12,7 @@ Test status: 135/135 passing
 | C1 | Wire SSE/APM/APM2 cascade | `SseApmCascade` exists in `src/model/sse_apm.rs` and is integrated in slow-path encoder/decoder. Measured: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | -2-4pt on text files | Completed |
 | C2 | Re-benchmark fixed PPMd config | Order-8 PPMd with SEE + sparse de Bruijn (CTX_BITS=18, matching hybrid_ppm3). Previous +0.8pt webster was with broken config. | +1.5-2pt on webster | Completed |
 | C3 | XWRT dictionary before BWT | Build top 2k words per Text block, replace with 0x80+id + cap bits, then BWT→MTF→RLE0→CM. How cmix gets text wins. | 2-4pt on dickens/webster | Completed |
-| C4 | Exec/Binary transforms | DP-optimal LZP parse promoted to default (isolated from SSM); E8E9 for Exec | 2-5pt on mr/nci | DP default + E8E9 done |
+| C4 | Exec/Binary transforms | DP-optimal LZP parse promoted to default (isolated from SSM); E8E9 for Exec; delta/stride for Binary | 2-5pt on mr/nci | DP default + E8E9 + delta/stride completed |
 
 ---
 
