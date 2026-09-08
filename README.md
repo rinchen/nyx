@@ -70,7 +70,7 @@ nyx self-test
 > better); speed is in MB/s (higher is better). Full data is in the
 > [experiments log](#experiments-log-2026-09).
 
-### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist)
+### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary)
 
 | file | orig (KB) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
