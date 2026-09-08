@@ -97,7 +97,7 @@ fn hash2(a: u8, b: u8) -> usize {
 /// Output: [a0, a0+a1, ..., a0+..+a3, a4+a0..a3, ..., a4+..+a7+a0..a3]
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
-unsafe fn avx2_prefix_sum_epi32(v: __m256i) -> __m256i {
+unsafe fn avx2_prefix_sum_epi32(v: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     // Step 1: pairwise sums
     let s1 = std::arch::x86_64::_mm256_add_epi32(v, std::arch::x86_64::_mm256_srli_si256::<4>(v));
     // Step 2: quad sums
@@ -197,7 +197,7 @@ unsafe fn walk_dist_avx2(
             let start = chunk_start + chunk_idx * 8;
             for (i, &cum_val) in buf.iter().enumerate() {
                 let s = start + i;
-                let r = ((cum_val as u64 + FRAC_ROUND as u32) >> FRAC_BITS) as u64;
+                let r = ((cum_val as u64 + FRAC_ROUND) >> FRAC_BITS);
                 let base_s = (r as i64 - prev_r as i64) as u64;
                 prev_r = r;
                 let f = 1u32 + base_s as u32;

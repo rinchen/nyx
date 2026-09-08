@@ -1,4 +1,4 @@
-//! Self-describing container format for `nyx` (`NYX1`).
+//! Self-describing container format for `rcn` (`RCN1`).
 //!
 //! Layout: `[MAGIC(4)][Header(7)][BlockEntry * num_blocks (13 each)][block payloads...]`.
 //! Each block payload is preceded by its `BlockEntry` (compressed length, original length,
@@ -8,7 +8,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use std::io::{Cursor, Read};
 
-pub const MAGIC: &[u8; 4] = b"NYX1";
+pub const MAGIC: &[u8; 4] = b"RCN1";
 pub const VERSION: u8 = 1;
 
 /// Container header (7 bytes after the 4-byte magic).
@@ -55,7 +55,7 @@ impl Header {
         if &m != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "bad nyx magic",
+                "bad rcn magic",
             ));
         }
         Ok(Self {
@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn crc32_is_deterministic() {
-        assert_eq!(crc32(b"nyx"), crc32(b"nyx"));
-        assert_ne!(crc32(b"nyx"), crc32(b"xxx"));
+        assert_eq!(crc32(b"rcn"), crc32(b"rcn"));
+        assert_ne!(crc32(b"rcn"), crc32(b"xxx"));
     }
 
     #[test]

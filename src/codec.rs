@@ -1,5 +1,5 @@
 //! Core codec: glue the classifier, bit models, two-level logistic mixer, rANS backend,
-//! and the `NYX1` container into `compress` / `decompress`.
+//! and the `RCN1` container into `compress` / `decompress`.
 //!
 //! ## Two-level mixer hierarchy
 //!
@@ -31,7 +31,7 @@
 //!
 //! ## DP-optimal LZP match pre-pass (default)
 //!
-//! nyx runs a forward LZP match pre-pass
+//! rcn runs a forward LZP match pre-pass
 //! with **DP optimal parsing** and emits explicit `(len, dist)` records for long
 //! matches (≥ 16 bytes). Matched bytes are **skipped** in the rANS stream —
 //! only literals (non-matched bytes) are CM-encoded. The decoder reconstructs
@@ -49,7 +49,7 @@
 use crate::bwt::{self,};
 use crate::container::{BlockEntry, Header, VERSION};
 use crate::entropy::range::{BitDecoder, BitEncoder};
-use crate::error::{NyxError, Result};
+use crate::error::{RcnError, Result};
 use crate::model::mixer_bank::MixerBank;
 use crate::model::sse_apm::SseApmCascade;
 use crate::model::BitModel;
@@ -145,11 +145,11 @@ pub enum CodecMode {
 /// hard-clearing (which would defeat the 4k-bank specialization).
 const BLOCK_DECAY: f32 = 0.995;
 
-/// Compress `buf` into a `NYX1` container using classifier-aware stacks.
+/// Compress `buf` into a `RCN1` container using classifier-aware stacks.
 ///
 /// # Errors
 ///
-/// Returns [`NyxError`] if an entropy primitive fails.
+/// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
     compress_mode(buf, CodecMode::Slow)
 }
@@ -158,7 +158,7 @@ pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns [`NyxError`] if an entropy primitive fails.
+/// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress_fast(buf: &[u8]) -> Result<Vec<u8>> {
     compress_mode(buf, CodecMode::Fast)
 }
@@ -175,7 +175,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`NyxError`] if an entropy primitive fails.
+/// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress_mode(buf: &[u8], mode: CodecMode) -> Result<Vec<u8>> {
     compress_impl(buf, mode, &mut build_stack_for_kind)
 }
@@ -720,7 +720,7 @@ fn decode_block_plain(
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
-    let mut dec = BitDecoder::new(comp).map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(comp).map_err(|e| RcnError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -739,7 +739,7 @@ fn decode_block_plain(
             let p_refined = cascade.refine(p_mixer, bit_pos);
             let bit = dec
                 .decode_bit(p_refined)
-                .map_err(|e| NyxError::Entropy(e.to_string()))?;
+                .map_err(|e| RcnError::Entropy(e.to_string()))?;
             mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
             cascade.update(bit, p_mixer, bit_pos);
             for m in models.iter_mut() {
@@ -764,7 +764,7 @@ fn decode_block_with_matches(
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
     if comp.len() < 4 {
-        return Err(NyxError::InvalidContainer(
+        return Err(RcnError::InvalidContainer(
             "match side-stream too short".into(),
         ));
     }
@@ -776,20 +776,20 @@ fn decode_block_with_matches(
     let mut prev_pos: usize = 0;
     for _ in 0..num_runs {
         let (delta_pos, new_offset) = read_varint(comp, offset)
-            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (delta_pos)".into()))?;
+            .ok_or_else(|| RcnError::InvalidContainer("truncated match record (delta_pos)".into()))?;
         offset = new_offset;
         let (len, new_offset) = read_varint(comp, offset)
-            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (len)".into()))?;
+            .ok_or_else(|| RcnError::InvalidContainer("truncated match record (len)".into()))?;
         offset = new_offset;
         let (dist, new_offset) = read_varint(comp, offset)
-            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (dist)".into()))?;
+            .ok_or_else(|| RcnError::InvalidContainer("truncated match record (dist)".into()))?;
         offset = new_offset;
         let pos = prev_pos.wrapping_add(delta_pos);
         prev_pos = pos;
         runs.push(MatchRun { pos, len, dist });
     }
 
-    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| NyxError::Entropy(e.to_string()))?;
+    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| RcnError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -851,7 +851,7 @@ fn decode_block_with_matches(
                 let p_refined = cascade.refine(p_mixer, bit_pos);
                 let bit = dec
                     .decode_bit(p_refined)
-                    .map_err(|e| NyxError::Entropy(e.to_string()))?;
+                    .map_err(|e| RcnError::Entropy(e.to_string()))?;
                 mixer.update_acc(&probs[..n], bit, bit_pos, pacc);
                 cascade.update(bit, p_mixer, bit_pos);
                 for m in models.iter_mut() {
@@ -870,16 +870,16 @@ fn decode_block_with_matches(
     Ok(out)
 }
 
-/// Decompress a `NYX1` container back to the original bytes.
+/// Decompress a `RCN1` container back to the original bytes.
 ///
 /// # Errors
 ///
-/// Returns [`NyxError`] on a malformed container, corrupt block, or CRC mismatch.
+/// Returns [`RcnError`] on a malformed container, corrupt block, or CRC mismatch.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     decompress_impl(data, &mut build_stack_for_kind)
 }
 
-/// Decompress a `NYX1` container using a custom model-stack builder.
+/// Decompress a `RCN1` container using a custom model-stack builder.
 ///
 /// This mirrors [`compress_with`] on the decode side: the `build_stack` closure
 /// must match the one used for compression, otherwise rANS decoding will produce
@@ -897,9 +897,9 @@ where
 {
     use std::io::Cursor;
     let mut cur = Cursor::new(data);
-    let header = Header::read(&mut cur).map_err(|e| NyxError::InvalidContainer(e.to_string()))?;
+    let header = Header::read(&mut cur).map_err(|e| RcnError::InvalidContainer(e.to_string()))?;
     if header.version != VERSION {
-        return Err(NyxError::InvalidContainer(format!(
+        return Err(RcnError::InvalidContainer(format!(
             "unsupported version {}",
             header.version
         )));
@@ -907,7 +907,7 @@ where
     let mut entries = Vec::with_capacity(header.num_blocks as usize);
     for _ in 0..header.num_blocks {
         entries.push(
-            BlockEntry::read(&mut cur).map_err(|e| NyxError::InvalidContainer(e.to_string()))?,
+            BlockEntry::read(&mut cur).map_err(|e| RcnError::InvalidContainer(e.to_string()))?,
         );
     }
     let payload_start = cur.position() as usize;
@@ -937,7 +937,7 @@ where
             // Byte-level (fast) path: one rANS symbol per byte.
             let decoded = crate::bytecodec::decompress_block(comp, entry.orig_len as usize)
                 .map_err(|e| match e {
-                    NyxError::CorruptBlock(s) => NyxError::CorruptBlock(s),
+                    RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
                     other => other,
                 })?;
             match entry.method {
@@ -972,7 +972,7 @@ where
                 lzp_idx,
             )
             .map_err(|e| match e {
-                NyxError::Entropy(s) => NyxError::CorruptBlock(s),
+                RcnError::Entropy(s) => RcnError::CorruptBlock(s),
                 other => other,
             })?;
             // Reverse BWT transforms for method 5/6, mirroring the encoder's trial.
@@ -994,7 +994,7 @@ where
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
-            return Err(NyxError::CrcMismatch(
+            return Err(RcnError::CrcMismatch(
                 bi,
                 crate::container::crc32(&block),
                 entry.crc32,
@@ -1024,7 +1024,7 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         | METHOD_BYTE_JSON_SPLIT
         | METHOD_BYTE_XWRT_BWT_MTF_RLE => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_EXEC_E8E9 => Ok(crate::classify::BlockKind::Exec),
-        _ => Err(NyxError::InvalidContainer(format!(
+        _ => Err(RcnError::InvalidContainer(format!(
             "unknown method {}",
             method
         ))),
@@ -1046,7 +1046,7 @@ mod tests {
         for _ in 0..2000 {
             v.extend_from_slice(text);
         }
-        let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
+        let json = b"{\"name\":\"rcn\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
         for _ in 0..500 {
             v.extend_from_slice(json);
         }
@@ -1077,7 +1077,7 @@ mod tests {
     fn compressed_is_smaller_on_redundant_input() {
         let mut input = Vec::new();
         for _ in 0..50_000 {
-            input.extend_from_slice(b"nyxnyxnyx");
+            input.extend_from_slice(b"rcnrcnrcn");
         }
         let comp = compress(&input).expect("compress");
         assert!(
@@ -1135,7 +1135,7 @@ mod tests {
 
     #[test]
     fn json_round_trips() {
-        let json = b"{\"name\":\"nyx\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
+        let json = b"{\"name\":\"rcn\",\"level\":3,\"models\":[\"order0\",\"order1\",\"order2\",\"sparse\",\"exec\",\"lzp\"],\"ratio\":0.42}\n";
         let original: Vec<u8> = std::iter::repeat(json.as_ref())
             .take(4000)
             .flatten()
