@@ -71,7 +71,7 @@ by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 > **Status: actively improving.** Rcn ships two entropy paths:
 > `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
 > 4k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
-> coder + byte rANS). The benchmark target is ratio parity with `zstd -1` on
+> coder + byte rANS). The benchmark target is beating `zstd -19` on
 > text + mixed corpora, with `FSE` as a secondary reference. See
 > [Benchmarks](#benchmarks) for the numbers.
 
@@ -185,8 +185,9 @@ DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` r
 - **Ratio:** lower % is better. rcn wins on `nci`, `mr`, and `json` (see the
   **ratio winner** column); it is close to zstd -1 on webster (35.1% vs zstd-1's
   33.5% — BWT trial narrows the gap from 50.4%→35.1%). zstd `-19` still dominates
-  on text and high-redundancy structured data. `zstd -1` is the fast/low-level
-  reference against which the current optimization stage is measured.
+  on text and high-redundancy structured data, so the current optimization stage
+  is measured against `zstd -19`; `zstd -1` remains a fast/low-level secondary
+  reference.
 
   Note: `json` now achieves 0.1% ratio (vs 3.0% with raw CM) because BWT turns
   long-range word repeats into local MTF zero-runs that RLE0 + CM compress to
@@ -205,7 +206,7 @@ DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` r
 
 ### New optimization target (2026-09)
 
-Beat `zstd -1` on ratio for text + mixed corpora while keeping the existing
+Beat `zstd -19` on ratio for text + mixed corpora while keeping the existing
 `nci`/`mr` wins. `FSE` is tracked as a secondary reference. Speed remains
 secondary.
 

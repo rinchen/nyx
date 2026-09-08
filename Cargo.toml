@@ -2,7 +2,7 @@
 name = "rcn"
 version = "0.1.0"
 edition = "2021"
-description = "Rust bit-mixer + BWT + DP-LZP compressor beating zstd -1 on text"
+description = "Rust bit-mixer + BWT + DP-LZP compressor aiming to beat zstd -19 on text"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/rinchen/rcn"
