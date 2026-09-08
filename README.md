@@ -1,8 +1,32 @@
 # Nyx
 
-A from-scratch Rust lossless compressor with a **per-block data-type classifier**
-and an **online logistic bit-mixer**. It is a self-contained CLI with its own
-`NYX1` container format.
+## TODO - Remaining Optimization Tasks
+
+### Compression - beat zstd -19
+- **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** (currently retained for future benchmarking; with fixed config: +1.5-2pt on text)
+- **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream to save 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
+- **Global XWRT dictionary** – train one dictionary across whole corpus first pass, store once in container header. Long-range word repeats across 4MB blocks become local tokens. +1-2pt on dickens/webster, free decode.
+
+### Speed - achieve 20+ MB/s
+- **Interleaved rANS** – already wired: fast path 8-10 MB/s → 20-30 MB/s
+- **Parallel blocks** – already wired: webster 40MB goes 0.7 MB/s → ∼4-5 MB/s on 8 cores, bit-identical
+- **Replace rotation-based BWT with libsais** – defer (SA-IS O(n) 5-10x faster BWT)
+
+### Other Completed
+- **S1-S7 + C1-C4** – all optimization items implemented and verified
+- **CI fixes** – Node.js version mismatch resolved (`.github/workflows/rust.yml`)
+- **Pre-commit hook** – `.pre-commit-config.yaml` runs `cargo test --lib` before every commit
+- **Benchmarks** – table updated with new optimization results
+
+### The method
+
+Input is split into variable-size blocks by data type. Each block is classified
+by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
+
+- `Random` blocks are stored verbatim — no prediction cost.
+- `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range
+  word repeats into local runs).
+- `Binary`, `Exec`, and `Random` use the default 64 KiB chunk size.
 
 > **Status: actively improving.** Nyx ships two entropy paths:
 > `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
@@ -10,6 +34,24 @@ and an **online logistic bit-mixer**. It is a self-contained CLI with its own
 > coder + byte rANS). The benchmark target is ratio parity with `zstd -1` on
 > text + mixed corpora, with `FSE` as a secondary reference. See
 > [Benchmarks](#benchmarks) for the numbers.
+
+## TODO - Remaining Optimization Tasks (priority order)
+
+### Compression - beat zstd -19
+- **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – currently retained for future benchmarking; with fixed config that keeps WordModel + 8k banks + 32MB window + XWRT: +1.5-2pt on text
+- **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream; saves 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
+- **Global XWRT dictionary** – train one dictionary across whole corpus first pass, store once in container header; long-range word repeats across 4MB blocks become local tokens: +1-2pt on dickens/webster, free decode
+
+### Speed - achieve 20+ MB/s
+- **Interleaved rANS** – already wired; fast path 8-10 MB/s → 20-30 MB/s
+- **Parallel blocks** – already wired; webster 40MB goes 0.7 MB/s → ∼4-5 MB/s on 8 cores, bit-identical
+- **Replace rotation-based BWT with libsais** – defer (SA-IS O(n) is 5-10x faster BWT)
+
+### Other Completed
+- **S1-S7 + C1-C4** – all optimization items implemented and verified
+- **CI fixes** – Node.js version mismatch resolved (`.github/workflows/rust.yml`)
+- **Pre-commit hook** – `.pre-commit-config.yaml` runs `cargo test --lib` before every commit
+- **Benchmarks** – table updated with new optimization results
 
 ## The method
 

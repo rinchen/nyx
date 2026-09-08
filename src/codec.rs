@@ -55,6 +55,39 @@ use crate::model::sse_apm::SseApmCascade;
 use crate::model::BitModel;
 use crate::model::lzp::Lzp;
 
+/// Varint encoding: read/write unsigned LEB128. Most values in the match
+/// side-stream (pos deltas, lengths, distances) are small, so varint
+/// encoding saves space over fixed-width fields.
+fn read_varint(data: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    let mut result: usize = 0;
+    let mut shift: usize = 0;
+    while offset < data.len() {
+        let byte = data[offset];
+        result |= ((byte & 0x7F) as usize) << shift;
+        offset += 1;
+        if (byte & 0x80) == 0 {
+            return Some((result, offset));
+        }
+        shift += 7;
+        // Safety: prevent infinite loop on malformed data.
+        if shift > 35 {
+            return None;
+        }
+    }
+    None
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: usize) {
+    loop {
+        if value < 0x80 {
+            out.push(value as u8);
+            return;
+        }
+        out.push(((value & 0x7F) | 0x80) as u8);
+        value >>= 7;
+    }
+}
+
 const MATCH_MIN_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
@@ -353,8 +386,7 @@ pub fn build_stack_for_kind(
             (models, MixerBank::new(0), None)
         }
 crate::classify::BlockKind::Text => {
-            // Text-optimized stack WITHOUT SSM (DP-optimal LZP parse promoted to default)
-            // with orders 0-2, Sparse, Exec, LZP, PpmModel order-3, WordModel
+            // Text stack with Order-8 PPMd + SEE + sparse de Bruijn (promoted to default)
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
@@ -363,7 +395,7 @@ crate::classify::BlockKind::Text => {
                 Box::new(crate::model::sparse::Sparse::new()),
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
+                Box::new(crate::model::ppmd_ssm::PpmdSsm::new()),
                 Box::new(crate::model::word::WordModel::new()),
             ];
             (models, MixerBank::new(n), Some(5))
@@ -482,15 +514,17 @@ fn encode_block_with_matches(
         m.prepare_block(block);
     }
 
-    // Match side-stream: [num_runs:u32][pos:u32][len:u8][dist:u24] per record
+    // Match side-stream (varint-encoded): [num_runs:u32] then each record as
+    // delta_pos (varint), len (varint), dist (varint).
+    // Positions are delta-encoded so most values are small.
     out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    let mut prev_pos: usize = 0;
     for r in runs {
-        out.extend_from_slice(&(r.pos as u32).to_le_bytes());
-        out.push(r.len as u8);
-        // Store dist as 3 bytes (u24, max 16MB window)
-        out.push((r.dist >> 16) as u8);
-        out.push((r.dist >> 8) as u8);
-        out.push(r.dist as u8);
+        let delta_pos = r.pos.wrapping_sub(prev_pos);
+        write_varint(&mut out, delta_pos);
+        write_varint(&mut out, r.len);
+        write_varint(&mut out, r.dist);
+        prev_pos = r.pos;
     }
 
     // Build a position→length map for matched regions.
@@ -737,16 +771,21 @@ fn decode_block_with_matches(
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
     let mut offset = 4;
 
-    // Read all match records.
+    // Read all match records (varint-encoded delta positions).
     let mut runs: Vec<MatchRun> = Vec::with_capacity(num_runs);
+    let mut prev_pos: usize = 0;
     for _ in 0..num_runs {
-        if offset + 8 > comp.len() {
-            return Err(NyxError::InvalidContainer("truncated match record".into()));
-        }
-        let pos = u32::from_le_bytes([comp[offset], comp[offset + 1], comp[offset + 2], comp[offset + 3]]) as usize;
-        let len = comp[offset + 4] as usize;
-        let dist = ((u32::from(comp[offset + 5]) << 16) | (u32::from(comp[offset + 6]) << 8) | u32::from(comp[offset + 7])) as usize;
-        offset += 8;
+        let (delta_pos, new_offset) = read_varint(comp, offset)
+            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (delta_pos)".into()))?;
+        offset = new_offset;
+        let (len, new_offset) = read_varint(comp, offset)
+            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (len)".into()))?;
+        offset = new_offset;
+        let (dist, new_offset) = read_varint(comp, offset)
+            .ok_or_else(|| NyxError::InvalidContainer("truncated match record (dist)".into()))?;
+        offset = new_offset;
+        let pos = prev_pos.wrapping_add(delta_pos);
+        prev_pos = pos;
         runs.push(MatchRun { pos, len, dist });
     }
 
