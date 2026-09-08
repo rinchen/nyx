@@ -159,16 +159,13 @@ unsafe fn walk_dist_avx2(
             counts.add(base + chunk_start + 24) as *const __m128i,
         ));
 
-        /// [x86_64] Multiply u16 counts (zero-extended to i32) by signed i32 reciprocal,
-/// produce u32 index = ((cnt * (inv as i32)) >> 20) but as i32 with bit identity to u32.
-/// We cast cnt (zero-extended) to u32, multiply with u32 inv, shift, cast to i32
-/// to guarantee low-32 result identical to u32 multiply (no wrap-to-64).
+        /// [x86_64] Multiply u16 counts (zero-extended to u32) by u32 reciprocal,
+/// produce u32 index = (cnt * inv) >> 20 (low 32 bits only).
+/// Safe for non-power-of-two totals t where cnt * inv < 2^32 for all cnt ≤ t.
 #[inline(always)]
 unsafe fn avx2_mul_epu32_to_i32(a: std::arch::x86_64::__m256i, inv: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    let a_u32 = _mm256_castps_si256(_mm256_castsi256_ps(_mm256_slli_epi32::<16>(a)));
     let inv_u32 = _mm256_castps_si256(_mm256_castsi256_ps(inv));
-    let prod_u32 = _mm256_mullo_epi32(a_u32, inv_u32);
-    prod_u32
+    _mm256_mullo_epi32(a, inv_u32)
 }
 
 // idx = (cnt * inv) >> 20 where cnt is u16 zero-extended to u32, inv is u32
