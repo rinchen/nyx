@@ -202,11 +202,11 @@ let idx3 = _mm256_srli_epi32(avx2_mul_epu32_to_i32(c3, inv_v), 20);
         let p3_final = _mm256_extract_epi32::<7>(p3) as u32;
         running_total = p3_final;
 
-        // Extract to scalar arrays
-        let mut buf0 = [0i32; 8];
-        let mut buf1 = [0i32; 8];
-        let mut buf2 = [0i32; 8];
-        let mut buf3 = [0i32; 8];
+        // Extract to scalar arrays (u32: cumulative values can exceed 2^31)
+        let mut buf0 = [0u32; 8];
+        let mut buf1 = [0u32; 8];
+        let mut buf2 = [0u32; 8];
+        let mut buf3 = [0u32; 8];
         _mm256_storeu_si256(buf0.as_mut_ptr() as *mut __m256i, p0);
         _mm256_storeu_si256(buf1.as_mut_ptr() as *mut __m256i, p1);
         _mm256_storeu_si256(buf2.as_mut_ptr() as *mut __m256i, p2);
