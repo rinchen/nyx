@@ -187,7 +187,7 @@ priority order:
    of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
    Bit-identical, ratio-neutral.
 2. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
-   to avoid ~11 table re-lookups per bit. Bit-identical, ratio-neutral.
+   to avoid ~11 table re-lookups per bit. **Completed**.
 3. **Wider stride / context model** — increase the number of models or the
    order-2 context size to improve prediction quality on diverse corpora.
 4. **Parallel blocks** — clone decayed state per rayon thread for near-linear
@@ -202,7 +202,7 @@ priority order:
 These opportunities have been measured but not yet integrated:
 
 1. **Re-benchmark fixed PPMd** — Order-8 PPMd with SEE was measured with broken config. Fair config now matches hybrid_ppm3. Previous +0.8pt webster should be +1.5-2pt.
-2. **Exec/Binary transforms** — E8E9 for Exec done (3-5pt on executables). Delta/stride for Binary still pending (2-4pt).
+2. **Exec/Binary transforms** — E8E9 for Exec done (3-5pt on executables). Delta/stride for Binary done (2-4pt).
 
 Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
