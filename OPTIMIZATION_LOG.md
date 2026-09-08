@@ -23,17 +23,17 @@ Test status: 135/135 passing
 | S1 | SIMD-accelerated `walk_dist` | Linear 256-probability scan in `ByteCountModel::walk_dist` is fast-path bottleneck (~90% of encode+decode time). AVX2/AVX-512 cumulative counts. Also applicable to slow path. | 5-10x on fast path | Completed |
 | S2 | SoA weight layout for 4096 banks | Contiguous weight arrays instead of per-bank `Vec`, single cache line fetch. Bit-identical, ratio-neutral. | 10-20% slow path | Not started |
 | S3 | Stretch-value reuse | Precompute stretch values in `mix_acc`/`update_from_acc` to avoid 11 table re-lookups per bit. | Small improvement | Completed |
-| S4 | Wider stride / context model | Increase number of models or order-2 context size. | Unknown | Not started |
-| S5 | Parallel blocks | Clone decayed state per rayon thread - near-linear speedup on webster 40MB. | Near-linear | Not started |
+| S4 | Wider stride / context model | Increase number of models or order-2 context size. | Known gain | Completed |
+| S5 | Parallel blocks | Clone decayed state per rayon thread - near-linear speedup on webster 40MB. | Near-linear | Completed |
 | S6 | Faster BWT (libsais SA-IS) | Replace rotation-based doubled string filter SA with SA-IS O(n). | 5-10x BWT trial | Deferred |
-| S7 | Allocator (mimalloc) | BWT trial does many Vec allocations. | Small | Not started |
+| S7 | Allocator (mimalloc) | BWT trial does many Vec allocations. | Small | Completed |
 
 ---
 
 ## Current Stack (What Works)
 
 ### Slow Path (`--mode slow`, default)
-- 8-9 bit models + two-level 4k-bank mixer hierarchy + master mixer
+- 8-9 bit models + two-level 8k-bank mixer hierarchy + master mixer
 - SSE/APM/APM2 cascade refinement
 - Cross-block weight decay (0.995)
 - 32MB LZP window for Text blocks

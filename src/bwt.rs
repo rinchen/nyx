@@ -648,25 +648,22 @@ pub fn compress_text_with_trial(data: &[u8]) -> BwtPathResult {
         };
     }
 
+    // S5: Parallel blocks — run all pipeline trials concurrently using rayon.
     let path_a_size = data.len();
-
-    let mut path_b_size = data.len();
-    let mut path_c_size = data.len();
-    // Run Paths B, C (and D for JSON) concurrently: each is an independent
-    // transform + full-buffer comparison. This is the dominant cost of Text
-    // blocks (divsufsort + MTF/RLE passes), and they share nothing.
-    let mut json_split_size: Option<usize> = None;
-    std::thread::scope(|s| {
-        let hb = s.spawn(|| BwtPipeline::BwtMtfRle.encode(data).len());
-        let hc = s.spawn(|| BwtPipeline::LzpBwtMtf.encode(data).len());
-        let hd = is_json.then(|| s.spawn(|| BwtPipeline::JsonSplit.encode(data).len()));
-        path_b_size = hb.join().unwrap_or(data.len());
-        path_c_size = hc.join().unwrap_or(data.len());
-        json_split_size = hd.and_then(|h| h.join().ok());
-    });
+    let (path_b_size, path_c_size) = rayon::join(
+        || BwtPipeline::BwtMtfRle.encode(data).len(),
+        || BwtPipeline::LzpBwtMtf.encode(data).len(),
+    );
+    let json_split_size = if is_json {
+        Some(rayon::join(
+            || BwtPipeline::JsonSplit.encode(data).len(),
+            || 0,
+        ).0)
+    } else {
+        None
+    };
 
     let (best_pipeline, best_size, is_bwt) = if let Some(json_size) = json_split_size {
-        // Compare all four paths.
         if json_size <= path_a_size && json_size <= path_b_size && json_size <= path_c_size {
             (BwtPipeline::JsonSplit, json_size, true)
         } else if path_b_size <= path_a_size && path_b_size <= path_c_size {

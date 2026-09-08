@@ -1,26 +1,26 @@
 //! Two-level context-mixing hierarchy: bank mixers → global mixer → master mixer.
 //!
 //! CMIX / PAQ8 use a multi-layer mixer stack:
-//!   1. **Bank mixers** (4096 instances): each selected by a context hash of
+//!   1. **Bank mixers** (8192 instances): each selected by a context hash of
 //!      order-1 / order-2 / word-context + bit position. One logistic mixer
 //!      saturates at ~50% on repetitive corpora (dickens); per-context banks
 //!      avoid this by specializing weights per context.
 //!   2. **Global mixer**: a single shared logistic mixer over the same models,
 //!      providing a context-agnostic fallback prediction.
 //!   3. **Master mixer**: blends `[p_bank, p_global, p_lzp]` in logistic space.
-//!      Only the master + the selected bank are trained per bit — never all 4096.
+//!      Only the master + the selected bank are trained per bit — never all 8192.
 //!
 //! Cross-block persistence: bank and master weights are **decayed** (not reset)
 //! at block boundaries, preserving learned structure across the stream.
 //!
-//! Memory: 4096 mixers × 8 models × (1 base + 8 pos) × 4 bytes ≈ 1.1 MB for the
-//! banks, plus 2 mixers (global + master) ≈ 1.1 MB total.
+//! Memory: 8192 mixers × 8 models × (1 base + 8 pos) × 4 bytes ≈ 2.2 MB for the
+//! banks, plus 2 mixers (global + master) ≈ 2.2 MB total.
 
 use crate::model::mixer::LogisticMixer;
 use crate::model::ByteAssembler;
 
-/// Number of mixer instances in the bank. 4096 gives 12 bits of context selection.
-pub const NUM_MIXERS: usize = 4096;
+/// Number of mixer instances in the bank. 8192 gives 13 bits of context selection.
+pub const NUM_MIXERS: usize = 8192;
 
 /// Byte classes for mixer selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,7 @@ impl ByteClass {
 
 /// Compute the bank ID from context.
 ///
-/// Uses a 12-bit hash: `(byte_class << 9) | (bit_pos << 6) | (order1 << 3) | word_hash`
+/// Uses a 13-bit hash: `(byte_class << 10) | (bit_pos << 7) | (order1 << 5) | (order2 << 3) | word_hash`
 ///
 /// The bit position is folded into the bank ID so each (context, bit-position) pair
 /// gets its own weight vector — this is why the per-bit-position win worked:
@@ -70,8 +70,8 @@ pub fn mixer_id(
     let bp = (bit_pos as usize) & 0x7;
     let o1 = (order1_byte as usize) & 0x7;
     let o2 = (order2_byte as usize) & 0x7;
-    let wh = (word_hash as usize) & 0x3;
-    ((class_bits << 9) | (bp << 6) | (o1 << 4) | (o2 << 2) | wh) & 0xFFF
+    let wh = (word_hash as usize) & 0x1;
+    ((class_bits << 10) | (bp << 7) | (o1 << 5) | (o2 << 3) | wh) & 0x1FFF
 }
 
 /// Reusable per-bit accumulator state from [`MixerBank::mix_acc`].
@@ -88,7 +88,7 @@ pub struct MixerAcc {
     master_probs: [u16; 3],
 }
 
-/// Two-level mixer: 4096 bank mixers + a global mixer + a master mixer.
+/// Two-level mixer: 8192 bank mixers + a global mixer + a master mixer.
 ///
 /// - `mixers`: context-specific bank selected by `mixer_id`. Only the selected
 ///   bank is trained per bit.
@@ -100,7 +100,7 @@ pub struct MixerAcc {
 /// for context hashing; it is deterministic from the coded bit stream, so
 /// both sides stay in sync.
 pub struct MixerBank {
-    /// 4096 context-specific logistic mixers.
+    /// 8192 context-specific logistic mixers.
     mixers: Vec<LogisticMixer>,
     /// Global context-agnostic mixer (same n_models).
     global_mixer: LogisticMixer,

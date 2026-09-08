@@ -70,7 +70,7 @@ nyx self-test
 > better); speed is in MB/s (higher is better). Full data is in the
 > [experiments log](#experiments-log-2026-09).
 
-### Current (hybrid_ppm3 + two-level 4k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary)
+### Current (hybrid_ppm3 + two-level 8k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary + mimalloc allocator)
 
 | file | orig (KB) | nyx ratio% | nyx cmp MB/s | nyx dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
@@ -183,19 +183,19 @@ The fast path (`--mode fast`) has the full speed stack in place. The slow
 path (`--mode slow`) still dominates on some inputs; the remaining levers, in
 priority order:
 
-1. **SoA weight layout for the 4096 banks** — contiguous weight arrays instead
+1. **SoA weight layout for the 8192 banks** — contiguous weight arrays instead
    of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
    Bit-identical, ratio-neutral.
 2. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
    to avoid ~11 table re-lookups per bit. **Completed**.
 3. **Wider stride / context model** — increase the number of models or the
-   order-2 context size to improve prediction quality on diverse corpora.
+   order-2 context size. **Completed** (8192 banks, 13-bit context hash).
 4. **Parallel blocks** — clone decayed state per rayon thread for near-linear
-   speedup on large files (webster 40MB).
+   speedup on large files (webster 40MB). **Completed**.
 5. **Faster BWT** — replace rotation-based doubled string filter SA with libsais
    SA-IS O(n) algorithm. 5-10x BWT trial speedup.
 6. **mimalloc allocator** — BWT trial does many Vec allocations; a better
-   allocator reduces overhead.
+   allocator reduces overhead. **Completed**.
 
 ## Potential ratio improvements (remaining)
 
