@@ -137,6 +137,7 @@ unsafe fn walk_dist_avx2(
     let budget_v = _mm256_set1_epi32(budget as i32);
     let mut prev_r: u64 = 0;
     let mut cum: u32 = 0;
+    let mut running_total: u32 = 0;
     let mut cum_before_255 = 0u32;
     let mut f255 = 0u32;
     let mut found_sym = -1i32;
@@ -158,11 +159,23 @@ unsafe fn walk_dist_avx2(
             counts.add(base + chunk_start + 24) as *const __m128i,
         ));
 
-        // idx = (cnt * inv) >> 20
-        let idx0 = _mm256_srli_epi32(_mm256_mullo_epi32(c0, inv_v), 20);
-        let idx1 = _mm256_srli_epi32(_mm256_mullo_epi32(c1, inv_v), 20);
-        let idx2 = _mm256_srli_epi32(_mm256_mullo_epi32(c2, inv_v), 20);
-        let idx3 = _mm256_srli_epi32(_mm256_mullo_epi32(c3, inv_v), 20);
+        /// [x86_64] Multiply u16 counts (zero-extended to i32) by signed i32 reciprocal,
+/// produce u32 index = ((cnt * (inv as i32)) >> 20) but as i32 with bit identity to u32.
+/// We cast cnt (zero-extended) to u32, multiply with u32 inv, shift, cast to i32
+/// to guarantee low-32 result identical to u32 multiply (no wrap-to-64).
+#[inline(always)]
+unsafe fn avx2_mul_epu32_to_i32(a: std::arch::x86_64::__m256i, inv: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    let a_u32 = _mm256_castps_si256(_mm256_castsi256_ps(_mm256_slli_epi32::<16>(a)));
+    let inv_u32 = _mm256_castps_si256(_mm256_castsi256_ps(inv));
+    let prod_u32 = _mm256_mullo_epi32(a_u32, inv_u32);
+    prod_u32
+}
+
+// idx = (cnt * inv) >> 20 where cnt is u16 zero-extended to u32, inv is u32
+let idx0 = _mm256_srli_epi32(avx2_mul_epu32_to_i32(c0, inv_v), 20);
+let idx1 = _mm256_srli_epi32(avx2_mul_epu32_to_i32(c1, inv_v), 20);
+let idx2 = _mm256_srli_epi32(avx2_mul_epu32_to_i32(c2, inv_v), 20);
+let idx3 = _mm256_srli_epi32(avx2_mul_epu32_to_i32(c3, inv_v), 20);
 
         // weighted = idx * BUDGET
         let w0 = _mm256_mullo_epi32(idx0, budget_v);
@@ -172,6 +185,9 @@ unsafe fn walk_dist_avx2(
 
         // Prefix sums
         let p0 = avx2_prefix_sum_epi32(w0);
+        // Continue the cumulative from the previous 32-symbol outer iteration so
+        // `r - prev_r` never goes negative across chunk_start boundaries.
+        let p0 = _mm256_add_epi32(p0, _mm256_set1_epi32(running_total as i32));
         let p1 = avx2_prefix_sum_epi32(w1);
         let p2 = avx2_prefix_sum_epi32(w2);
         let p3 = avx2_prefix_sum_epi32(w3);
@@ -183,6 +199,8 @@ unsafe fn walk_dist_avx2(
         let p2 = _mm256_add_epi32(p2, _mm256_set1_epi32(p1_final as i32));
         let p2_final = _mm256_extract_epi32::<7>(p2) as u32;
         let p3 = _mm256_add_epi32(p3, _mm256_set1_epi32(p2_final as i32));
+        let p3_final = _mm256_extract_epi32::<7>(p3) as u32;
+        running_total = p3_final;
 
         // Extract to scalar arrays
         let mut buf0 = [0i32; 8];
@@ -194,7 +212,7 @@ unsafe fn walk_dist_avx2(
         _mm256_storeu_si256(buf2.as_mut_ptr() as *mut __m256i, p2);
         _mm256_storeu_si256(buf3.as_mut_ptr() as *mut __m256i, p3);
 
-        for (chunk_idx, &offset) in [0u32, p0_final, p1_final, p2_final].iter().enumerate() {
+        for (chunk_idx, &_offset) in [0u32, p0_final, p1_final, p2_final].iter().enumerate() {
             let buf = match chunk_idx {
                 0 => &buf0,
                 1 => &buf1,
@@ -307,7 +325,8 @@ impl ByteCountModel {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            if is_x86_feature_detected!("avx2") {
+            let use_avx2 = is_x86_feature_detected!("avx2") && (inv >> 31) == 0;
+            if use_avx2 {
                 return unsafe { walk_dist_avx2(self.counts.as_ptr(), base, inv, target, cdf) };
             }
         }

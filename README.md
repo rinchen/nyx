@@ -43,57 +43,29 @@ per byte than those, in exchange for better ratio on the right inputs.
 ## TODO - Remaining Optimization Tasks
 
 ### Compression - beat zstd -19
-- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted to default for Text blocks in `src/codec.rs:371`
-- ✅ **Compress the match side-stream** – implemented varint encoding (delta_pos, len, dist) in `src/codec.rs:484-495`; saves 30-40% side-stream
+- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted to default for Text blocks; fixed config keeps WordModel + 8k banks + 32MB window + XWRT
+- ✅ **Compress the match side-stream** – implemented varint encoding (delta_pos, len, dist) packed into the stream; saves 30-40% of the side-stream = ~0.5-1pt back on mr/massive_json
 - ✅ **Global XWRT dictionary** – one corpus-wide pass builds a global top-128 dictionary stored once in the container header; every Text-block XWRT trial reuses it (per-block dictionaries removed). Measured: dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral
 
 ### Speed - achieve 20+ MB/s
-- **Interleaved rANS** – already wired: fast path 8-10 MB/s → 20-30 MB/s
-- **Parallel blocks** – already wired: webster 40MB goes 0.7 MB/s → ∼4-5 MB/s on 8 cores, bit-identical
-- **Replace rotation-based BWT with libsais** – defer (SA-IS O(n) 5-10x faster BWT)
+- **Interleaved rANS** – wired into the fast path (`RansByteEncoder32`/`Decoder32`). Speed pass #4 found no gain while `walk_dist`'s linear scan dominated; that scan is now AVX2 SIMD, so the win is unverified — re-bench
+- **Parallel blocks** – wired: webster 40MB goes ~0.7 MB/s → ~4-5 MB/s on 8 cores, bit-identical
+- **Replace rotation-based BWT with libsais** – deferred (SA-IS O(n) would be 5-10x faster BWT); the last remaining speed lever for Text blocks
 
 ### Other Completed
-- **S1-S7 + C1-C4** – all optimization items implemented and verified
-- **CI fixes** – Node.js version mismatch resolved (`.github/workflows/rust.yml`)
-- **Pre-commit hook** – `.pre-commit-config.yaml` runs `cargo test --lib` before every commit
-- **Benchmarks** – table updated with new optimization results
-
-### The method
-
-Input is split into variable-size blocks by data type. Each block is classified
-by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
-
-- `Random` blocks are stored verbatim — no prediction cost.
-- `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range
-  word repeats into local runs).
-- `Binary`, `Exec`, and `Random` use the default 64 KiB chunk size.
-
-> **Status: actively improving.** Rcn ships two entropy paths:
-> `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
-> 4k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
-> coder + byte rANS). The benchmark target is beating `zstd -19` on
-> text + mixed corpora, with `FSE` as a secondary reference. See
-> [Benchmarks](#benchmarks) for the numbers.
-
-## TODO - Remaining Optimization Tasks (priority order)
-
-### Compression - beat zstd -19
-- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted; with fixed config keeps WordModel + 8k banks + 32MB window + XWRT
-- ✅ **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream; saves 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
-- ✅ **Global XWRT dictionary** – one corpus-wide pass builds a global top-128 dictionary stored once in the container header; dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral
-
-### Speed - achieve 20+ MB/s
-- **Interleaved rANS** – already wired; fast path 8-10 MB/s → 20-30 MB/s
-- **Parallel blocks** – already wired; webster 40MB goes 0.7 MB/s → ∼4-5 MB/s on 8 cores, bit-identical
-- **Replace rotation-based BWT with libsais** – defer (SA-IS O(n) is 5-10x faster BWT)
-
-### Other Completed
-- **S1-S7 + C1-C4** – all optimization items implemented and verified
-- **CI fixes** – Node.js version mismatch resolved (`.github/workflows/rust.yml`)
-- **Pre-commit hook** – `.pre-commit-config.yaml` runs `cargo test --lib` before every commit
+- **S1-S7, C1-C4, C5 (global XWRT)** – all optimization items implemented and verified
+- **CI fixes** – Node 20 deprecation resolved (`actions/checkout@v5`); bytecodec AVX2 prefix-sum repaired (x86_64-only debug overflow)
+- **Pre-commit hook** – `.pre-commit-config.yaml` mirrors the CI gate (`cargo build` + `cargo test`) plus an all-targets check
 - **Benchmarks** – table updated with new optimization results
 
 ## The method
+
+> **Status: actively improving.** Rcn ships two entropy paths:
+> `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
+> 8k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
+> coder + byte rANS). The benchmark target is beating `zstd -19` on
+> text + mixed corpora, with `FSE` as a secondary reference. See
+> [Benchmarks](#benchmarks) for the numbers.
 
 Input is split into variable-size blocks by data type. Each block is classified
 by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
@@ -105,14 +77,14 @@ by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 
 The bit-level path runs an **online logistic mixer hierarchy**:
 
-1. **Bank mixers** (4096 instances): selected by a context hash of byte-class,
+1. **Bank mixers** (8192 instances): selected by a context hash of byte-class,
    bit-position, order-1/order-2 bytes, and word-hash. Each bank specializes
    weights to its context, avoiding the ~50% saturation a single mixer hits
    on repetitive corpora.
 2. **Global mixer**: a context-agnostic fallback over the same models.
 3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
 
-Only the selected bank + global + master are trained per bit — never all 4096.
+Only the selected bank + global + master are trained per bit — never all 8192.
 At block boundaries, weights are **decayed** (not reset), preserving learned
 structure across the stream. The fused probability drives an rANS bit coder
 (via the audited [`ans`](https://crates.io/crates/ans) crate).
@@ -141,6 +113,21 @@ rcn bench path/to/corpus
 # Run the full test suite and report PASS/FAIL
 rcn self-test
 ```
+
+### Installation
+`rcn` is installed via `cargo install --locked rcn` or downloaded as a binary release from
+[crates.io](https://crates.io/crates/rcn). The package requires Rust toolchain ≥1.70 and
+an x86_64 (AVX2) or arm64 (scalar) processor.
+
+### Compression levels
+The CLI currently offers two modes (`--mode slow` / `--mode fast`) representing the
+bit-level and byte-level entropy paths respectively. Future work includes numbered
+compression levels (`-1` fastest / `-9` strongest) analogous to `zstd`.
+
+### Streaming / `--stdout`
+The `compress` and `decompress` subcommands accept `-` as input/output path for
+stdin/stdout piping. Per-block progress/stats (`--verbose`) are planned for a
+future release.
 
 ## Benchmarks
 
@@ -197,12 +184,10 @@ DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` r
   zstd -1 and even zstd -19** (json 5.4MB: rcn 2.7% vs zstd-1 2.5% vs zstd-19 1.8%;
   json 22MB: rcn 0.81% vs zstd-1 2.48% vs zstd-19 1.35%).
 
-- **Speed:** higher MB/s is better. rcn is **~0.5–0.7 MB/s** compress /
-  **~0.4–0.5 MB/s** decode (slow path, bit-level CM). The fast path
-  (`--mode fast`) uses 32-way interleaved byte rANS at ~2-3 MB/s
-  compress / ~8-10 MB/s decode with same ratio. zstd `-1` is **~400–12000 MB/s** compress /
-  **~1000–36000 MB/s** decode; zstd `-19` is **~3–4 MB/s** compress /
-  **~200–900 MB/s** decode; FSE is **~200–1600 MB/s** both ways.
+- **Speed:** higher MB/s is better. **Slow path** (`--mode slow`, bit-level CM):
+  ~0.03 MB/s compress single-threaded (dickens 2 MiB→~54 s wall; 256 KB→10.0 s, 512 KB→20.0 s, 1 MiB→27.9 s).  
+  **Fast path** (`--mode fast`, byte-level CM + 32‑wide interleaved rANS + AVX2 SIMD walk_dist): 2–5 MB/s compress / 8–10 MB/s decode (measured: dickens 2.1/4.2, webster 2.7/5.4, nci 5.1/10.1, mr 2.6/3.9, json 5.2/58.9 MB/s).  
+  zstd `-1` is ~400–12000 MB/s compress / ~1000–36000 MB/s decode; zstd `-19` is ~3–4 MB/s compress / ~200–900 MB/s decode; FSE is ~200–1600 MB/s both ways.
 
 ### New optimization target (2026-09)
 
@@ -227,8 +212,7 @@ secondary.
 | Lazy multi-context LZP (hash chains + longest-match) | mr, dickens, json, webster, nci | neutral (−0.1pt) | kept in place, not adopted |
 | Two-pass CM residual (match records + CM literals) | mr, dickens, json, webster, nci | nci +2.7pt, json/webster regressed | reverted; match overhead too high at 64 KiB |
 | Literal bypass hint model (high-entropy byte bypass) | mr, dickens, json, webster, nci | regressed dickens 56.3%→57.1% | reverted |
-| **SSE/APM/APM2 cascade** (logit-space refinement after mixer) | mr, dickens, json, webster, nci | **improved all 5**: nci −0.9pt, mr −0.8pt, dickens −0.3pt, webster −0.5pt, json −0.1pt | developed but **not wired into codec** — `SseApmCascade` exists in `src/model/sse_apm.rs` but is not integrated into the encode/decode path |
-| **Context-selected 4k mixer banks** (4096 per-context LogisticMixer instances selected by byte-class + order-1/order-2 + word-hash, blended with global + master) | mr, dickens, json, webster, nci | **improved**: json 3.9%→3.0%, dickens 51.7%→51.2% | **kept as default** — two-level bank→global→master hierarchy, cross-block **decay** preserves 4096 vectors, only selected bank + master trained per bit |
+| **Context-selected 8k mixer banks** (8192 per-context LogisticMixer instances selected by byte-class + order-1/order-2 + word-hash, blended with global + master) | mr, dickens, json, webster, nci | **improved**: json 3.9%→3.0%, dickens 51.7%→51.2% | **kept as default** — two-level bank→global→master hierarchy, cross-block **decay** preserves the 8192 vectors, only selected bank + master trained per bit |
 | **Indirect context + DMC models** | mr, dickens, json, webster, nci | regressed dickens +0.7pt, webster +0.4pt; json improved | reverted due to perf cost |
 | **Cross-block persistence + real 4MB LDM window** | json, mr, dickens, nci, webster | **improved**: json 5.5%→3.9%, mr 28.6%→27.3%, dickens 56.0%→51.7%, nci 26.6%→20.9%, webster 50.4%→45.1% | **kept as default** |
 | LZP ring buffer performance fix (O(n) drain→O(1) ring) | all files | performance fix, no ratio change | kept |
@@ -251,7 +235,7 @@ secondary.
 | #1 | LazyLzp removal (O(n²) memmove per byte over 1MB; match-extension loop dead). Model rewritten with fixed-capacity ring buffer + causal extension loop. | dickens, webster | **3× encode speedup on text, zero ratio change** (dickens 2MB: 10.9s→3.3s, byte-identical) | removed from all default stacks |
 | #2 | Byte-level "fast" path (`--mode fast`): PPM-style single-context count coder (deterministic order-0/1/2 selector + fused 256-symbol cumulative walk_dist + byte rANS). No mixer/softmax. | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** (fast 1.15s/0.279x vs slow 2.97s/0.470x; round-trip verified; 127/127 tests) | kept as `--mode fast` |
 | #3 | Single-pass acc-merge across the mixer chain (`MixerBank::mix_acc`/`update_acc`/`mix_and_update` + `LogisticMixer::mix_acc`/`update_from_acc`). Also: Q16 fixed-point mixer (i32 Q16 weights, i16 Q10 stretch, i64 accumulator; SGD grad scaled ×64 so per-bit deltas are meaningful). | dickens 2MB (slow) | **~10% encode speedup, ratio flat** (3.28s→2.81s user; 0.470x → 0.470x, 986560 vs 986551 B). Q8 attempt reverted (ratio +0.8pt, gradients rounded to 0) | kept as default |
-| #4 | 32-way interleaved byte rANS (32 independent lane states, per-symbol-position `p % 32` lanes). | dickens 2MB (fast) | **no measurable speedup** (1.15s→1.17s user). Profiling: rANS is ~10% of fast path; `walk_dist`'s linear 256-probability scan dominates and stays serial under byte-interleaving | kept in-tree, not wired out |
+| #4 | 32-way interleaved byte rANS (32 independent lane states, per-symbol-position `p % 32` lanes). | dickens 2MB (fast) | **no measurable speedup** (1.15s→1.17s user). Profiling: rANS is ~10% of fast path; `walk_dist`'s linear 256-probability scan dominates and stays serial under byte-interleaving | **wired into the fast path** — `bytecodec` uses `RansByteEncoder32`/`Decoder32`; re-bench now that `walk_dist` is AVX2 SIMD |
 
 ### Code-quality / correctness notes
 

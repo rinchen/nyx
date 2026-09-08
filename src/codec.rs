@@ -131,6 +131,42 @@ pub const METHOD_BYTE_LZP_BWT_MTF: u8 = 10;
 pub const METHOD_BYTE_JSON_SPLIT: u8 = 11;
 /// Text XWRT→BWT→MTF→RLE0 path, byte-coded (fast).
 pub const METHOD_BYTE_XWRT_BWT_MTF_RLE: u8 = 12;
+
+/// One block's compression summary, reported by [`compress_mode_diag`] for
+/// `--verbose` progress output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockDiag {
+    /// Classifier label for the block.
+    pub kind: String,
+    /// Raw [`METHOD_*`] byte written to the container.
+    pub method: u8,
+    /// Uncompressed size of the block.
+    pub size_in: usize,
+    /// Compressed size of the block.
+    pub size_out: usize,
+}
+
+/// Human-readable label for a [`METHOD_*`] byte.
+#[must_use]
+pub fn method_label(method: u8) -> &'static str {
+    match method {
+        METHOD_COPY => "COPY",
+        METHOD_CM => "CM",
+        METHOD_TEXT => "CM(text)",
+        METHOD_BINARY => "CM(binary)",
+        METHOD_EXEC => "CM(exec)",
+        METHOD_BWT_MTF_RLE => "BWT→MTF→RLE0→CM",
+        METHOD_LZP_BWT_MTF => "LZP→BWT→MTF→CM",
+        METHOD_JSON_SPLIT => "JSON-split→BWT→CM",
+        METHOD_XWRT_BWT_MTF_RLE => "XWRT→BWT→MTF→RLE0→CM",
+        METHOD_BYTE_CM => "byte-CM",
+        METHOD_BYTE_BWT_MTF_RLE => "byte-BWT→MTF→RLE0",
+        METHOD_BYTE_LZP_BWT_MTF => "byte-LZP→BWT→MTF",
+        METHOD_BYTE_JSON_SPLIT => "byte-JSON-split→BWT",
+        METHOD_BYTE_XWRT_BWT_MTF_RLE => "byte-XWRT→BWT→MTF→RLE0",
+        _ => "?",
+    }
+}
 /// Exec E8E9 transform, byte-coded (fast).
 pub const METHOD_BYTE_EXEC_E8E9: u8 = 14;
 
@@ -170,7 +206,7 @@ pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
 {
-    compress_impl(buf, CodecMode::Slow, build_stack)
+    Ok(compress_impl(buf, CodecMode::Slow, build_stack)?.0)
 }
 
 /// Compress with an explicit [`CodecMode`]. Both encoder sides of a given
@@ -180,16 +216,31 @@ where
 ///
 /// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress_mode(buf: &[u8], mode: CodecMode) -> Result<Vec<u8>> {
+    Ok(compress_mode_diag(buf, mode)?.0)
+}
+
+/// Compress with an explicit [`CodecMode`], also returning a per-block
+/// [`BlockDiag`] summary suitable for `--verbose` progress output.
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if an entropy primitive fails.
+pub fn compress_mode_diag(buf: &[u8], mode: CodecMode) -> Result<(Vec<u8>, Vec<BlockDiag>)> {
     compress_impl(buf, mode, &mut build_stack_for_kind)
 }
 
-fn compress_impl<F>(buf: &[u8], mode: CodecMode, build_stack: &mut F) -> Result<Vec<u8>>
+fn compress_impl<F>(
+    buf: &[u8],
+    mode: CodecMode,
+    build_stack: &mut F,
+) -> Result<(Vec<u8>, Vec<BlockDiag>)>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
 {
     let mut out = Vec::new();
     let mut entries: Vec<BlockEntry> = Vec::new();
     let mut payloads: Vec<u8> = Vec::new();
+    let mut diags: Vec<BlockDiag> = Vec::new();
     let mut offset = 0usize;
 
     let mut last_kind: Option<crate::classify::BlockKind> = None;
@@ -236,6 +287,12 @@ where
             method,
             crc32: crc32(block_data),
         };
+        diags.push(BlockDiag {
+            kind: format!("{:?}", kind),
+            method,
+            size_in: block_data.len(),
+            size_out: comp.len(),
+        });
         entries.push(entry);
         payloads.extend_from_slice(&comp);
         offset = end;
@@ -268,8 +325,8 @@ where
     for e in &entries {
         e.write(&mut out);
     }
-    out.extend_from_slice(&payloads);
-    Ok(out)
+out.extend_from_slice(&payloads);
+        Ok((out, diags))
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
