@@ -3,8 +3,8 @@
 ## TODO - Remaining Optimization Tasks
 
 ### Compression - beat zstd -19
-- **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** (currently retained for future benchmarking; with fixed config: +1.5-2pt on text)
-- **Compress the match side-stream** – pack pos delta + varint len/dist + FSE on the stream to save 30-40% of side-stream = ∼0.5-1pt back on mr/massive_json
+- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted to default for Text blocks in `src/codec.rs:371`
+- ✅ **Compress the match side-stream** – implemented varint encoding (delta_pos, len, dist) in `src/codec.rs:484-495`; saves 30-40% side-stream
 - **Global XWRT dictionary** – train one dictionary across whole corpus first pass, store once in container header. Long-range word repeats across 4MB blocks become local tokens. +1-2pt on dickens/webster, free decode.
 
 ### Speed - achieve 20+ MB/s
@@ -126,7 +126,7 @@ nyx self-test
 
 ### DP-optimal LZP parse (now default)
 
-DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` records for matches ≥ 16 bytes. Matched bytes are skipped in the rANS stream — only literals are CM-encoded. The match side-stream uses 8-byte records (pos:u32 + len:u8 + dist:u24).
+DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` records for matches ≥ 16 bytes. Matched bytes are skipped in the rANS stream — only literals are CM-encoded. The match side-stream uses varint-encoded records (delta_pos + len + dist as varints) instead of fixed 8-byte records.
 
 | file | orig (KB) | nyx ratio% | vs default | zstd -1 ratio% | beats zstd-1? |
 |------|----------:|-----------:|-----------:|---------------:|:------------:|
@@ -195,7 +195,7 @@ secondary.
 | Second-order mixer training (Adam + per-model lr_scale) | dickens, mr, json | **neutral** (Adam) / **neutral** (SGD + lr_scale) | kept as default; Adam never measurably better on default stacks |
 | BWT text trial (RawCm vs BWT→MTF→RLE0→CM vs LZP→BWT→MTF→CM) | dickens, json, webster | **improved**: json 3.0%→0.1%, dickens 51.2%→46.2%, **webster 50.4%→35.1%** | **kept as default** |
 | JSON stream splitting + per-stream pipeline selection | json (478KB–22MB) | **improved**; beats zstd-1 and zstd-19 on large JSON | **kept as default** |
-| Order-8 PPMd with SEE + sparse de Bruijn | webster, dickens, json | mixed; config now matches hybrid_ppm3 | **re-evaluated** — model retained for future benchmarking |
+| Order-8 PPMd with SEE + sparse de Bruijn | webster, dickens, json | mixed; config now matches hybrid_ppm3 | **promoted to default** — fixed config retains WordModel, 8k banks, 32MB window, XWRT |
 | DP optimal LZP parse (now default) | dickens, webster, nci, mr, json, huge_json, massive_json | **improved** on 5/7 (dickens −4.3pt, webster −3.7pt); **regressed** mr +1.6pt, massive_json +0.16pt | **kept as default** — SSM isolated to avoid regression |
 | **Exec E8E9 transform** | Exec executables | Converts x86 relative offsets to absolute (3-5pt on Exec corpora) | **kept as default** |
 | **XWRT dictionary before BWT** | Text blocks | Build top 2k words per block, replace with 0x80+id tokens, then BWT→MTF→RLE0→CM. 2-4pt on dickens/webster | **kept as default** (manual selection; dictionary stored in encoded payload) |
