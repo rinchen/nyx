@@ -16,7 +16,7 @@
 //! Memory: 8192 mixers × 8 models × (1 base + 8 pos) × 4 bytes ≈ 2.2 MB for the
 //! banks, plus 2 mixers (global + master) ≈ 2.2 MB total.
 
-use crate::model::mixer::LogisticMixer;
+use crate::model::mixer::{LogisticMixer, W_INIT};
 use crate::model::ByteAssembler;
 
 /// Number of mixer instances in the bank. 8192 gives 13 bits of context selection.
@@ -100,8 +100,15 @@ pub struct MixerAcc {
 /// for context hashing; it is deterministic from the coded bit stream, so
 /// both sides stay in sync.
 pub struct MixerBank {
-    /// 8192 context-specific logistic mixers.
-    mixers: Vec<LogisticMixer>,
+    /// Bank mixers in SoA (Structure of Arrays) layout for contiguous memory access:
+    /// - `bank_weights`: all base weights, size NUM_MIXERS * n_models
+    /// - `bank_pos_weights`: all position weights, size NUM_MIXERS * n_models (as [i32; 8])
+    /// - `bank_lr_scales`: all learning rate scales, size NUM_MIXERS * n_models
+    /// - `bank_lr`: shared learning rate for all bank mixers
+    bank_weights: Vec<i32>,
+    bank_pos_weights: Vec<[i32; 8]>,
+    bank_lr_scales: Vec<f32>,
+    bank_lr: f32,
     /// Global context-agnostic mixer (same n_models).
     global_mixer: LogisticMixer,
     /// Master mixer: blends bank + global + lzp_conf (3 inputs).
@@ -119,10 +126,12 @@ impl MixerBank {
     /// lzp_confidence).
     #[must_use]
     pub fn new(n_models: usize) -> Self {
+        let total = NUM_MIXERS * n_models;
         Self {
-            mixers: (0..NUM_MIXERS)
-                .map(|_| LogisticMixer::new(n_models))
-                .collect(),
+            bank_weights: vec![W_INIT; total],
+            bank_pos_weights: vec![[0i32; 8]; total],
+            bank_lr_scales: vec![1.0; total],
+            bank_lr: 0.02,
             global_mixer: LogisticMixer::new(n_models),
             master_mixer: LogisticMixer::new(3), // bank, global, lzp_conf
             n_models,
@@ -133,8 +142,9 @@ impl MixerBank {
     /// Set a per-model learning rate scale (index corresponds to model position).
     pub fn set_lr_scale(&mut self, idx: usize, scale: f32) {
         if idx < self.n_models {
-            for m in &mut self.mixers {
-                m.set_lr_scale(idx, scale);
+            // Bank mixers: flat array at stride n_models
+            for i in (idx..self.bank_lr_scales.len()).step_by(self.n_models) {
+                self.bank_lr_scales[i] = scale;
             }
             self.global_mixer.set_lr_scale(idx, scale);
         }
@@ -183,7 +193,12 @@ impl MixerBank {
     #[inline(always)]
     pub fn mix_acc(&self, probs: &[u16], bit_pos: u8, lzp_conf: u16) -> (u16, MixerAcc) {
         let bank_id = self.current_bank_id(bit_pos);
-        let (acc_bank, q_bank) = self.mixers[bank_id].mix_acc(probs, bit_pos);
+        // SoA: bank_id * n_models gives the offset into the flat arrays
+        let base = bank_id * self.n_models;
+        let (acc_bank, q_bank) = LogisticMixer::mix_acc_from_flat(
+            probs, bit_pos, &self.bank_weights, &self.bank_pos_weights,
+            &self.bank_lr_scales, self.n_models, base,
+        );
         let (acc_global, q_global) = self.global_mixer.mix_acc(probs, bit_pos);
         let master_probs = [q_bank, q_global, lzp_conf];
         let (acc_master, p) = self.master_mixer.mix_acc(&master_probs, 0);
@@ -206,7 +221,11 @@ impl MixerBank {
     #[inline(always)]
     pub fn update_acc(&mut self, probs: &[u16], bit: bool, bit_pos: u8, acc: MixerAcc) {
         let bank_id = self.current_bank_id(bit_pos);
-        self.mixers[bank_id].update_from_acc(probs, bit, bit_pos, acc.acc_bank);
+        let base = bank_id * self.n_models;
+        LogisticMixer::update_from_acc_from_flat(
+            probs, bit, bit_pos, acc.acc_bank, &mut self.bank_weights, &mut self.bank_pos_weights,
+            &self.bank_lr_scales, self.n_models, base,
+        );
         self.global_mixer.update_from_acc(probs, bit, bit_pos, acc.acc_global);
         self.master_mixer
             .update_from_acc(&acc.master_probs, bit, 0, acc.acc_master);
@@ -229,43 +248,43 @@ impl MixerBank {
         self.update_acc(probs, bit, bit_pos, acc);
     }
 
-    /// Train the selected bank mixer, the global mixer, and the master mixer.
+/// Train the selected bank mixer, the global mixer, and the master mixer.
     ///
     /// Only three mixers are touched per bit: the context-selected bank, the
-    /// global, and the master. Not all 4096. This is the key performance
+    /// global, and the master. Not all 8192. This is the key performance
     /// property of the two-level hierarchy.
     ///
     /// Returns the master mixer's predicted probability for this bit.
     #[inline]
     pub fn update(&mut self, probs: &[u16], bit: bool, bit_pos: u8, lzp_conf: u16) -> u16 {
         let bank_id = self.current_bank_id(bit_pos);
-        // `LogisticMixer::update` returns the pre-update probability it fed the
-        // loss, so the master can reuse it as its input without a second dot
-        // product per mixer (previously bank.mix + global.mix re-ran the sums).
-        let q_bank = self.mixers[bank_id].update(probs, bit, bit_pos);
+        let base = bank_id * self.n_models;
+        let q_bank = LogisticMixer::update_from_flat(
+            &mut self.bank_weights, &mut self.bank_pos_weights,
+            &self.bank_lr_scales, self.n_models, base,
+            probs, bit, bit_pos,
+        );
         let q_global = self.global_mixer.update(probs, bit, bit_pos);
-        // Master blends bank + global + lzp_conf.
         self.master_mixer.update(&[q_bank, q_global, lzp_conf], bit, 0)
     }
 
     /// Feed a completed byte so byte-history context advances.
-    ///
-    /// Called by the codec after each full byte is assembled (8 bits done).
-    /// This updates the byte-level context used for bank selection on the
-    /// *next* byte, mirroring how the model `ByteAssembler`s work.
     #[inline]
     pub fn push_byte(&mut self, byte: u8) {
         self.asm.push_byte(byte);
     }
 
     /// Decay all mixer weights toward init (1.0) by `factor`.
-    ///
-    /// Unlike `reset`, this preserves learned structure: weights shrink toward
-    /// 1.0 but never hard-clear. The 4096 bank vectors and the master/global
-    /// mixers all decay uniformly. Called at block boundaries.
     pub fn decay(&mut self, factor: f32) {
-        for m in &mut self.mixers {
-            m.decay(factor);
+        for w in &mut self.bank_weights {
+            let nf = *w as f32 * factor + W_INIT as f32 * (1.0 - factor);
+            *w = nf.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        }
+        for pw in &mut self.bank_pos_weights {
+            for dw in pw.iter_mut() {
+                let nf = *dw as f32 * factor;
+                *dw = nf.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+            }
         }
         self.global_mixer.decay(factor);
         self.master_mixer.decay(factor);
@@ -273,9 +292,16 @@ impl MixerBank {
 
     /// Hard reset (kept for API compatibility, but `decay` is preferred).
     pub fn reset(&mut self) {
-        for m in &mut self.mixers {
-            m.reset();
+        for w in &mut self.bank_weights {
+            *w = W_INIT;
         }
+        for pw in &mut self.bank_pos_weights {
+            pw.fill(0);
+        }
+        for ls in &mut self.bank_lr_scales {
+            *ls = 1.0;
+        }
+        self.bank_lr = 0.02;
         self.global_mixer.reset();
         self.master_mixer.reset();
         self.asm.reset();
@@ -284,7 +310,9 @@ impl MixerBank {
     /// Approximate memory footprint in bytes.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.mixers.len() * std::mem::size_of::<LogisticMixer>()
+        self.bank_weights.len() * std::mem::size_of::<i32>()
+            + self.bank_pos_weights.len() * std::mem::size_of::<[i32; 8]>()
+            + self.bank_lr_scales.len() * std::mem::size_of::<f32>()
             + 2 * std::mem::size_of::<LogisticMixer>()
     }
 }
@@ -392,12 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn memory_under_2mb() {
+    fn memory_under_3mb() {
         let bank = MixerBank::new(8);
         let bytes = bank.memory_bytes();
+        // SoA layout: 8192 banks × 8 models × (4 + 32 + 4) = ~2.5MB for banks,
+        // plus global/master mixers.
         assert!(
-            bytes < 2_000_000,
-            "MixerBank with 8 models should be <2 MB: got {} bytes",
+            bytes < 3_000_000,
+            "MixerBank with 8 models should be <3 MB: got {} bytes",
             bytes
         );
     }

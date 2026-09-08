@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-test
+        name: Run cargo tests (lib)
+        entry: cargo test --lib
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]

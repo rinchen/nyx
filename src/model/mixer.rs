@@ -27,15 +27,15 @@ const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
 /// Base-weight fixed-point scale: 1.0 = `1 << WEIGHT_Q`. Range ≈ ±128 (i32).
-const WEIGHT_Q: i32 = 16;
+pub const WEIGHT_Q: i32 = 16;
 /// Stretch-table scale: 1.0 logit = `1 << STRETCH_Q`.
-const STRETCH_Q: i32 = 10;
+pub const STRETCH_Q: i32 = 10;
 /// Combined exponent: acc_q = Σ w_q16 · stretch_q10 = acc_float · 2^26.
-const ACC_SHIFT: i32 = WEIGHT_Q + STRETCH_Q;
+pub const ACC_SHIFT: i32 = WEIGHT_Q + STRETCH_Q;
 /// Fixed-point init value of a base weight (1.0).
-const W_INIT: i32 = 1 << WEIGHT_Q;
+pub const W_INIT: i32 = 1 << WEIGHT_Q;
 /// Per-bit grad scaling: grad_q16 = lr·scale·err·stretch_q10 · 2^(WEIGHT_Q - STRETCH_Q).
-const GRAD_SCALE: i32 = WEIGHT_Q - STRETCH_Q; // = 6
+pub const GRAD_SCALE: i32 = WEIGHT_Q - STRETCH_Q; // = 6
 
 /// Shared stretch/squash tables (12-bit probability ↔ logit).
 /// These are identical for every mixer instance, so we allocate once globally.
@@ -326,6 +326,93 @@ impl LogisticMixer {
             self.pos_weights[i][b] += d;
         }
 
+        q
+    }
+
+    // -----------------------------------------------------------------------
+    // SoA (Structure-of-Arrays) static methods for MixerBank flat-array layout
+    // -----------------------------------------------------------------------
+
+    /// Mix using SoA flat arrays: `weights[bank_id*n_models + i]` for model `i`.
+    /// Returns `(acc, q)` where `acc` is the logistic accumulator.
+    #[must_use]
+    #[inline(always)]
+    pub fn mix_acc_from_flat(
+        probs: &[u16], bit_pos: u8,
+        weights: &[i32], pos_weights: &[[i32; 8]],
+        lr_scales: &[f32], n_models: usize, base: usize,
+    ) -> (i64, u16) {
+        let b = usize::from(bit_pos.min(7));
+        let mut acc: i64 = 0;
+        let mut stretches = [0i16; 16];
+        for (i, &p) in probs.iter().enumerate().take(16) {
+            stretches[i] = stretch_table()[p as usize];
+        }
+        for (i, &p) in probs.iter().enumerate() {
+            let w = weights[base + i] + pos_weights[base + i][b];
+            acc += i64::from(w) * i64::from(stretches[i]);
+        }
+        (acc, squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize])
+    }
+
+    /// Update using SoA flat arrays. Returns the pre-update squashed probability.
+    #[must_use]
+    #[inline(always)]
+    pub fn update_from_flat(
+        weights: &mut [i32], pos_weights: &mut [[i32; 8]],
+        lr_scales: &[f32], n_models: usize, base: usize,
+        probs: &[u16], bit: bool, bit_pos: u8,
+    ) -> u16 {
+        let b = usize::from(bit_pos.min(7));
+        let target = if bit { 1.0f32 } else { 0.0 };
+        let mut acc: i64 = 0;
+        let mut stretches = [0i16; 16];
+        for (i, &p) in probs.iter().enumerate().take(16) {
+            stretches[i] = stretch_table()[p as usize];
+        }
+        for (i, &p) in probs.iter().enumerate() {
+            let w = weights[base + i] + pos_weights[base + i][b];
+            acc += i64::from(w) * i64::from(stretches[i]);
+        }
+        let q = squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize];
+        let pred = f32::from(q) / 4095.0;
+        let err = target - pred;
+        for (i, &p) in probs.iter().enumerate() {
+            let scale = lr_scales[base + i];
+            let stretch_q10 = i32::from(stretches[i]);
+            let delta = (0.02 * scale * err * stretch_q10 as f32 * (1 << GRAD_SCALE) as f32).round();
+            let d = delta.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+            weights[base + i] += d;
+            pos_weights[base + i][b] += d;
+        }
+        q
+    }
+
+    /// Update using SoA flat arrays with precomputed accumulator.
+    #[must_use]
+    #[inline(always)]
+    pub fn update_from_acc_from_flat(
+        probs: &[u16], bit: bool, bit_pos: u8, acc: i64,
+        weights: &mut [i32], pos_weights: &mut [[i32; 8]],
+        lr_scales: &[f32], n_models: usize, base: usize,
+    ) -> u16 {
+        let b = usize::from(bit_pos.min(7));
+        let target = if bit { 1.0f32 } else { 0.0 };
+        let q = squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize];
+        let pred = f32::from(q) / 4095.0;
+        let err = target - pred;
+        let mut stretches = [0i16; 16];
+        for (i, &p) in probs.iter().enumerate().take(16) {
+            stretches[i] = stretch_table()[p as usize];
+        }
+        for (i, &p) in probs.iter().enumerate() {
+            let scale = lr_scales[base + i];
+            let stretch_q10 = i32::from(stretches[i]);
+            let delta = (0.02 * scale * err * stretch_q10 as f32 * (1 << GRAD_SCALE) as f32).round();
+            let d = delta.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+            weights[base + i] += d;
+            pos_weights[base + i][b] += d;
+        }
         q
     }
 }

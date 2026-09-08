@@ -185,7 +185,7 @@ priority order:
 
 1. **SoA weight layout for the 8192 banks** — contiguous weight arrays instead
    of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
-   Bit-identical, ratio-neutral.
+   Bit-identical, ratio-neutral. **Completed**.
 2. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
    to avoid ~11 table re-lookups per bit. **Completed**.
 3. **Wider stride / context model** — increase the number of models or the

@@ -10,10 +10,10 @@ use std::fs;
 use std::path::PathBuf;
 
 // Use mimalloc as the global allocator for reduced BWT trial allocation overhead
-use mimalloc::GlobalAllocator;
+use mimalloc::MiMalloc;
 
 #[global_allocator]
-static GLOBAL: GlobalAllocator = GlobalAllocator;
+static GLOBAL: MiMalloc = MiMalloc;
 
 use std::process::Command;
 use std::time::Instant;
