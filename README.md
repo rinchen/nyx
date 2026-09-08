@@ -1,5 +1,45 @@
 # Rcn
 
+> **Experimentation: work in progress.** `rcn` — **R**ust **C**ompressor, **N**ew —
+> is an experimental, research-oriented command-line compressor written in Rust. It
+> combines a bit-level logistic mixer, Burrows–Wheeler Transform (BWT), and DP-LZP
+> matching to chase the highest achievable ratio; the benchmark target is beating
+> `zstd -19` on text. Expect rough edges; the container format and CLI are not yet
+> stable.
+
+## Design methodology
+
+`rcn` is built around a simple thesis: *weight above all* — squeeze the last bit
+of redundancy out of the input rather than prioritizing throughput. Its pipeline
+is a sequence of independent, replaceable stages, each optimized and benchmarked
+in isolation:
+
+- **Classify first.** Input is split into variable-size blocks by data type so
+  each block gets the transform it deserves (see [The method](#the-method)).
+- **Transform locally.** Text blocks run BWT trials to turn long-range word
+  repeats into local runs, and a word transform interpolates unknown symbols.
+- **Match with DP-LZP.** A dynamic-programming LZP pre-pass removes the obvious
+  redundancy before entropy coding, leaving the residual for the models.
+- **Mix probabilistically.** An online logistic mixer blends many context models
+  (order-0/1/2, sparse, executable, word, LZP) bit-by-bit to drive a rANS coder.
+
+Because the stages are modular, experiments are cheap: swap a model, re-run a
+benchmark, keep or discard based on measured ratio. The current target is beating
+`zstd -19` on text and mixed corpora.
+
+## Projected use cases
+
+- **Research & education** — a readable, self-contained reference for combining
+  BWT, LZP matching, and context-mixing entropy coding in one pipeline.
+- **Text-centric archival** — corpora with lots of redundancy (dickens, webster,
+  source trees, JSON dumps) where ratio matters more than speed.
+- **Baseline for further work** — a clean staging ground for trying new models,
+  transforms, or entropy backends against a fixed benchmark harness.
+
+It is not aimed at general-purpose, at-rest or on-the-wire compression where
+`zstd -1`/`gzip` speed is the deciding factor — expect `rcn` to be much slower
+per byte than those, in exchange for better ratio on the right inputs.
+
 ## TODO - Remaining Optimization Tasks
 
 ### Compression - beat zstd -19
