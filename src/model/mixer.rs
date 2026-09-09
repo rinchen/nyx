@@ -334,25 +334,27 @@ impl LogisticMixer {
     // -----------------------------------------------------------------------
 
     /// Mix using SoA flat arrays: `weights[bank_id*n_models + i]` for model `i`.
-    /// Returns `(acc, q)` where `acc` is the logistic accumulator.
+    /// Returns `(acc, q, stretches)` where `stretches` are the Q10 stretch LUT
+    /// values for `probs` (reused by [`update_from_acc_from_flat`]).
     #[must_use]
     #[inline(always)]
     pub fn mix_acc_from_flat(
         probs: &[u16], bit_pos: u8,
         weights: &[i32], pos_weights: &[[i32; 8]],
         lr_scales: &[f32], n_models: usize, base: usize,
-    ) -> (i64, u16) {
+    ) -> (i64, u16, [i16; 16]) {
         let b = usize::from(bit_pos.min(7));
         let mut acc: i64 = 0;
         let mut stretches = [0i16; 16];
         for (i, &p) in probs.iter().enumerate().take(16) {
-            stretches[i] = stretch_table()[p as usize];
+            stretches[i] = stretch_table()[(p as usize).clamp(1, 4095)];
         }
-        for (i, &p) in probs.iter().enumerate() {
+        for (i, &_p) in probs.iter().enumerate() {
             let w = weights[base + i] + pos_weights[base + i][b];
             acc += i64::from(w) * i64::from(stretches[i]);
         }
-        (acc, squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize])
+        let q = squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize];
+        (acc, q, stretches)
     }
 
     /// Update using SoA flat arrays. Returns the pre-update squashed probability.
@@ -368,16 +370,16 @@ impl LogisticMixer {
         let mut acc: i64 = 0;
         let mut stretches = [0i16; 16];
         for (i, &p) in probs.iter().enumerate().take(16) {
-            stretches[i] = stretch_table()[p as usize];
+            stretches[i] = stretch_table()[(p as usize).clamp(1, 4095)];
         }
-        for (i, &p) in probs.iter().enumerate() {
+        for (i, &_p) in probs.iter().enumerate() {
             let w = weights[base + i] + pos_weights[base + i][b];
             acc += i64::from(w) * i64::from(stretches[i]);
         }
         let q = squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize];
         let pred = f32::from(q) / 4095.0;
         let err = target - pred;
-        for (i, &p) in probs.iter().enumerate() {
+        for (i, &_p) in probs.iter().enumerate() {
             let scale = lr_scales[base + i];
             let stretch_q10 = i32::from(stretches[i]);
             let delta = (0.02 * scale * err * stretch_q10 as f32 * (1 << GRAD_SCALE) as f32).round();
@@ -388,24 +390,21 @@ impl LogisticMixer {
         q
     }
 
-    /// Update using SoA flat arrays with precomputed accumulator.
+    /// Update using SoA flat arrays with precomputed accumulator and stretch LUT.
     #[must_use]
     #[inline(always)]
     pub fn update_from_acc_from_flat(
         probs: &[u16], bit: bool, bit_pos: u8, acc: i64,
         weights: &mut [i32], pos_weights: &mut [[i32; 8]],
         lr_scales: &[f32], n_models: usize, base: usize,
+        stretches: &[i16; 16],
     ) -> u16 {
         let b = usize::from(bit_pos.min(7));
         let target = if bit { 1.0f32 } else { 0.0 };
         let q = squash_table()[((acc as f32 / ((1i64 << ACC_SHIFT) as f32) + 7.0) / 14.0 * 4095.0).clamp(0.0, 4095.0) as usize];
         let pred = f32::from(q) / 4095.0;
         let err = target - pred;
-        let mut stretches = [0i16; 16];
-        for (i, &p) in probs.iter().enumerate().take(16) {
-            stretches[i] = stretch_table()[p as usize];
-        }
-        for (i, &p) in probs.iter().enumerate() {
+        for (i, &_p) in probs.iter().enumerate() {
             let scale = lr_scales[base + i];
             let stretch_q10 = i32::from(stretches[i]);
             let delta = (0.02 * scale * err * stretch_q10 as f32 * (1 << GRAD_SCALE) as f32).round();

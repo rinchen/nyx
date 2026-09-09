@@ -4,13 +4,13 @@ Optimization tickets, experiment log, CI/testing notes, and roadmaps.
 For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-Last updated: 2026-09-09. Test status: 143/143 passing (`cargo test --lib`).
+Last updated: 2026-09-09. Test status: 162/162 passing (`cargo test --lib`).
 
 ---
 
 ## Completed optimization checklist
 
-Numbered C/S backlog is empty; items below are the closed ticket record.
+Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ### Compression - beat zstd -19
 - ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – WordModel + banks + 32MB window + XWRT
@@ -20,12 +20,16 @@ Numbered C/S backlog is empty; items below are the closed ticket record.
 - ✅ **C7 — Adaptive DP LZP threshold** – Text ≥12; Binary/Exec/Random stay 16 (`≥24` on Binary/Exec regressed mr and was reverted)
 - ✅ **C8 — 16k banks** – `NUM_MIXERS=16384` (14-bit hash). Single IndirectModel tried again; **left out of default Text stack** (prior dickens regression); model remains in-tree
 - ✅ **C9 — FSE-family match side-stream** – order-0 byte rANS on the varint blob when smaller (`[num_runs][flag][len][payload]`)
+- ❌ **C10 — Order-12 Text PPMd** – `PpmdSsm::with_max_order(12)` API kept; default stays `PpmdSsm::new()` (order-8). 2MB dickens: 47.21%→47.21% (−0.003pt) — below keep gate
+- ✅ **C11 — CSV/XML stream splitting** – `csv_split` / `xml_split`; BWT trial pipelines + methods; synthetic round-trips green
 
 ### Speed - achieve 20+ MB/s
 - ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~2–5 MB/s cmp / ~4–10 MB/s dec (see README Benchmarks)
 - ✅ **Parallel BWT trials (S5 partial)** – `rayon::join` for path B/C inside a block trial
 - ✅ **S9 — Optional libsais BWT backend** – `--features bwt_libsais` uses pure-Rust `libsais-rs`; default remains `divsufsort`
 - ✅ **S10 — Classify-ahead pipeline** – `rayon::join` overlaps classify+size of block N+1 with encode of N (encode stays serial / bit-identical)
+- ✅ **S11 — Prefetch + stretch on `MixerAcc`** – bank stretch LUT carried mix→update; x86_64 `_mm_prefetch` for next bit’s bank weights; deterministic compress verified
+- ✅ **S12 — Wider BWT trial parallelism** – `parallel_map_sizes` fans out RawCm / XWRT / JSON / CSV / XML size trials; encode winner once
 
 ### Other Completed
 - **S1–S4, S7, C1–C5** – SIMD walk_dist, SoA banks, stretch reuse, mimalloc, SSE/APM, global XWRT-128, etc.
@@ -57,30 +61,22 @@ Pre-commit: `.pre-commit-config.yaml` runs `cargo build` + `cargo test` (mirrors
 ## Speed roadmap (2026-09)
 
 1. **SoA weight layout** — **Completed**.
-2. **Stretch-value reuse** — **Completed**.
+2. **Stretch-value reuse** — within-call **Completed**; **S11** stretch-on-`MixerAcc` + bank prefetch — **Completed**.
 3. **Wider stride / 16k banks** — **Completed** (16384 banks, 14-bit hash).
-4. **Parallel BWT trials** — intra-block `rayon::join`. **Partial (S5)**.
-5. **S8 — Interleaved rANS re-bench** — **Completed** (wired; see README fast-path table).
-6. **S9 — Optional libsais BWT** — `--features bwt_libsais`. **Completed**.
+4. **Parallel BWT trials** — B‖C **Completed (S5)**; **S12** wider fan-out — **Completed**.
+5. **S8 — Interleaved rANS re-bench** — **Completed**.
+6. **S9 — Optional libsais BWT** — **Completed**.
 7. **S10 — Classify-ahead pipeline** — **Completed**.
 8. **mimalloc** — **Completed**.
 
 ## Ratio research directions
 
-**No open numbered ratio tickets** — C6–C9 are closed (IndirectModel stays
-in-tree, not in the default Text stack). Ticket tables:
-[OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
+**Closed through C11** (C10 Order-12 reverted). IndirectModel stays in-tree, not default.
+Tables: [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-**North star:** beat `zstd -19` on text + mixed corpora while keeping `nci`/`mr`
-wins. `FSE` is a secondary reference; speed remains secondary.
+**North star:** beat `zstd -19` on text + mixed corpora while keeping `nci`/`mr` wins.
 
-Concrete research angles (not scheduled tickets):
-
-- New Text models beyond the current 8-model stack (full DMC previously hurt;
-  Indirect shelved after dickens regression)
-- Stronger text transforms / match modeling — not another XWRT vocab bump
-- Finish the slow 5-file re-bench (webster/nci + mr post-C7 soften) so gaps vs
-  `-19` are honest before claiming further wins
+Next hygiene: real CSV/XML corpus A/B for C11; optional flamegraph if chasing 20+ MB/s.
 
 ---
 
@@ -139,6 +135,10 @@ is default and SSM is isolated from DP.
 | **Global XWRT dictionary** | dickens, webster, nci, mr, json | Top-128 then C6 top-512 with ESC; measured C5 dickens −4.6pt, webster −4.0pt; C6 ≈−1.1pt dickens vs HEAD | **kept as default** |
 | **SSE/APM/APM2 cascade** | mr, dickens, json, webster, nci | **improved all 5** | **wired into codec** |
 | **AVX2 SIMD walk_dist** | All | 5-10x fast path speedup, zero ratio loss | **completed** |
+| **C10 Order-12 PpmdSsm (Text)** | dickens 2MB | −0.003pt (990101→990035 B) | **reverted**; API `with_max_order` kept |
+| **C11 CSV/XML stream split** | synthetic CSV/XML | round-trip + BWT pipeline tests | **kept**; real-corpus ratio TBD |
+| **S11 MixerAcc stretch + bank prefetch** | dickens 200KB | deterministic compress; ratio-neutral by design | **kept** |
+| **S12 parallel_map_sizes BWT trials** | (infra) | RawCm/XWRT/JSON/CSV/XML size jobs via nested `rayon::join` | **kept**; ratio unchanged |
 
 ### Speed passes
 
@@ -154,5 +154,5 @@ is default and SSM is isolated from DP.
 | experiment | files tested | result | action |
 |---|---|---|---|
 | round-trip verification | all 5 | lossless | every pass round-trip verified |
-| test suite | all | 143/143 green | kept |
+| test suite | all | 162/162 green | kept |
 | bit-identical output | dickens 2MB | each pass `cmp`-identical to prior where claimed | kept |

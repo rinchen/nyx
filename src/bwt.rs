@@ -434,6 +434,88 @@ pub enum BwtPipeline {
     JsonSplit,
     /// Path E: XWRT dictionary → BWT → MTF → RLE0 → CM.
     XwrtBwtMtfRle,
+    /// Path F: CSV column split → N× independent BWT trials → CM.
+    CsvSplit,
+    /// Path G: XML stream split → 3× independent BWT trials → CM.
+    XmlSplit,
+}
+
+/// Pick the smallest of raw / BWT→MTF→RLE0 / LZP→BWT→MTF for one stream.
+fn encode_stream_pick(data: &[u8]) -> (u8, Vec<u8>) {
+    let raw_len = data.len();
+    let bwt = bwt_mtf_rle_encode(data);
+    let lzp = bwt_mtf_encode(&lzp_encode(data));
+    if bwt.len() <= raw_len && bwt.len() <= lzp.len() {
+        (1, bwt)
+    } else if lzp.len() <= raw_len && lzp.len() <= bwt.len() {
+        (2, lzp)
+    } else {
+        (0, data.to_vec())
+    }
+}
+
+fn decode_stream_pick(data: &[u8], pipe: u8) -> Vec<u8> {
+    match pipe {
+        0 => data.to_vec(),
+        1 => bwt_mtf_rle_decode(data),
+        _ => {
+            let mtf = bwt_mtf_decode(data);
+            lzp_decode(&mtf, 0)
+        }
+    }
+}
+
+/// Pack 2-bit per-stream selectors into a byte vec (`ceil(n/4)` bytes).
+fn pack_selectors(pipes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; pipes.len().div_ceil(4)];
+    for (i, &p) in pipes.iter().enumerate() {
+        out[i / 4] |= (p & 0x3) << (2 * (i % 4));
+    }
+    out
+}
+
+fn unpack_selector(bytes: &[u8], i: usize) -> u8 {
+    (bytes[i / 4] >> (2 * (i % 4))) & 0x3
+}
+
+/// Run 1–N independent size jobs concurrently via nested `rayon::join`.
+fn parallel_map_sizes<F, T>(jobs: Vec<F>) -> Vec<T>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    match jobs.len() {
+        0 => Vec::new(),
+        1 => {
+            let mut jobs = jobs;
+            vec![jobs.remove(0)()]
+        }
+        2 => {
+            let mut iter = jobs.into_iter();
+            let (a, b) = (iter.next().unwrap(), iter.next().unwrap());
+            let (ra, rb) = rayon::join(a, b);
+            vec![ra, rb]
+        }
+        3 => {
+            let mut iter = jobs.into_iter();
+            let (a, b, c) = (
+                iter.next().unwrap(),
+                iter.next().unwrap(),
+                iter.next().unwrap(),
+            );
+            let (ra, (rb, rc)) = rayon::join(a, || rayon::join(b, c));
+            vec![ra, rb, rc]
+        }
+        _ => {
+            let mid = jobs.len() / 2;
+            let mut left = jobs;
+            let right = left.split_off(mid);
+            let (mut left_r, right_r) =
+                rayon::join(|| parallel_map_sizes(left), || parallel_map_sizes(right));
+            left_r.extend(right_r);
+            left_r
+        }
+    }
 }
 
 impl BwtPipeline {
@@ -453,76 +535,15 @@ impl BwtPipeline {
             BwtPipeline::LzpBwtMtf => bwt_mtf_encode(&lzp_encode(data)),
             BwtPipeline::JsonSplit => {
                 let streams = crate::json_split::split(data);
-                // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
-                // 2 bits per stream in selector: 0=RawCm, 1=BwtMtfRle, 2=LzpBwtMtf
-                let s_raw = streams.structural.len();
-                let s_bwt = bwt_mtf_rle_encode(&streams.structural);
-                let s_lzp = bwt_mtf_encode(&lzp_encode(&streams.structural));
-                let struct_pipe = if s_bwt.len() <= s_raw && s_bwt.len() <= s_lzp.len() {
-                    1
-                } else if s_lzp.len() <= s_raw && s_lzp.len() <= s_bwt.len() {
-                    2
-                } else {
-                    0
-                };
-                let struct_encoded = match struct_pipe {
-                    0 => streams.structural.clone(),
-                    1 => s_bwt,
-                    _ => s_lzp,
-                };
+                let (struct_pipe, struct_encoded) = encode_stream_pick(&streams.structural);
+                let (keys_pipe, keys_encoded) = encode_stream_pick(&streams.keys);
+                let (vals_pipe, vals_encoded) = encode_stream_pick(&streams.string_values);
+                let (nums_pipe, nums_encoded) = encode_stream_pick(&streams.numbers);
 
-                let k_raw = streams.keys.len();
-                let k_bwt = bwt_mtf_rle_encode(&streams.keys);
-                let k_lzp = bwt_mtf_encode(&lzp_encode(&streams.keys));
-                let keys_pipe = if k_bwt.len() <= k_raw && k_bwt.len() <= k_lzp.len() {
-                    1
-                } else if k_lzp.len() <= k_raw && k_lzp.len() <= k_bwt.len() {
-                    2
-                } else {
-                    0
-                };
-                let keys_encoded = match keys_pipe {
-                    0 => streams.keys.clone(),
-                    1 => k_bwt,
-                    _ => k_lzp,
-                };
-
-                let v_raw = streams.string_values.len();
-                let v_bwt = bwt_mtf_rle_encode(&streams.string_values);
-                let v_lzp = bwt_mtf_encode(&lzp_encode(&streams.string_values));
-                let vals_pipe = if v_bwt.len() <= v_raw && v_bwt.len() <= v_lzp.len() {
-                    1
-                } else if v_lzp.len() <= v_raw && v_lzp.len() <= v_bwt.len() {
-                    2
-                } else {
-                    0
-                };
-                let vals_encoded = match vals_pipe {
-                    0 => streams.string_values.clone(),
-                    1 => v_bwt,
-                    _ => v_lzp,
-                };
-
-                let n_raw = streams.numbers.len();
-                let n_bwt = bwt_mtf_rle_encode(&streams.numbers);
-                let n_lzp = bwt_mtf_encode(&lzp_encode(&streams.numbers));
-                let nums_pipe = if n_bwt.len() <= n_raw && n_bwt.len() <= n_lzp.len() {
-                    1
-                } else if n_lzp.len() <= n_raw && n_lzp.len() <= n_bwt.len() {
-                    2
-                } else {
-                    0
-                };
-                let nums_encoded = match nums_pipe {
-                    0 => streams.numbers.clone(),
-                    1 => n_bwt,
-                    _ => n_lzp,
-                };
-
-                let selector = (struct_pipe as u8)
-                    | ((keys_pipe as u8) << 2)
-                    | ((vals_pipe as u8) << 4)
-                    | ((nums_pipe as u8) << 6);
+                let selector = (struct_pipe)
+                    | (keys_pipe << 2)
+                    | (vals_pipe << 4)
+                    | (nums_pipe << 6);
 
                 // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
                 let mut out = Vec::with_capacity(data.len() + 21);
@@ -535,6 +556,57 @@ impl BwtPipeline {
                 out.extend_from_slice(&keys_encoded);
                 out.extend_from_slice(&vals_encoded);
                 out.extend_from_slice(&nums_encoded);
+                out
+            }
+            BwtPipeline::CsvSplit => {
+                let streams = crate::csv_split::split(data);
+                let ncols = streams.ncols();
+                let nrows = streams.nrows();
+                let mut pipes = Vec::with_capacity(ncols);
+                let mut encoded_cols = Vec::with_capacity(ncols);
+                for col in &streams.columns {
+                    let (pipe, enc) = encode_stream_pick(col);
+                    pipes.push(pipe);
+                    encoded_cols.push(enc);
+                }
+                let selectors = pack_selectors(&pipes);
+                // Layout:
+                // [orig_len:u32][delim:u8][trailing_nl:u8][ncols:u16][nrows:u32]
+                // [fields_per_row:u16×nrows][selectors:ceil(ncols/4)]
+                // [col_len:u32×ncols][col data...]
+                let mut out = Vec::with_capacity(data.len() + 32 + nrows * 2);
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.push(streams.delim);
+                out.push(u8::from(streams.trailing_newline));
+                out.extend_from_slice(&(ncols as u16).to_le_bytes());
+                out.extend_from_slice(&(nrows as u32).to_le_bytes());
+                for &f in &streams.fields_per_row {
+                    out.extend_from_slice(&f.to_le_bytes());
+                }
+                out.extend_from_slice(&selectors);
+                for enc in &encoded_cols {
+                    out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+                }
+                for enc in &encoded_cols {
+                    out.extend_from_slice(enc);
+                }
+                out
+            }
+            BwtPipeline::XmlSplit => {
+                let streams = crate::xml_split::split(data);
+                let (tags_pipe, tags_encoded) = encode_stream_pick(&streams.tags);
+                let (attrs_pipe, attrs_encoded) = encode_stream_pick(&streams.attrs);
+                let (text_pipe, text_encoded) = encode_stream_pick(&streams.text);
+                let selector = tags_pipe | (attrs_pipe << 2) | (text_pipe << 4);
+                // Layout: [orig_len:u32][selector:u8][t_len:u32][a_len:u32][tags][attrs][text]
+                let mut out = Vec::with_capacity(data.len() + 13);
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.push(selector);
+                out.extend_from_slice(&(tags_encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(attrs_encoded.len() as u32).to_le_bytes());
+                out.extend_from_slice(&tags_encoded);
+                out.extend_from_slice(&attrs_encoded);
+                out.extend_from_slice(&text_encoded);
                 out
             }
             BwtPipeline::XwrtBwtMtfRle => {
@@ -596,6 +668,9 @@ impl BwtPipeline {
                     u32::from_le_bytes([payload[13], payload[14], payload[15], payload[16]])
                         as usize;
                 let mut pos = 17;
+                if pos + s0_len + s1_len + s2_len > payload.len() {
+                    return Vec::new();
+                }
                 let s0 = &payload[pos..pos + s0_len];
                 pos += s0_len;
                 let s1 = &payload[pos..pos + s1_len];
@@ -604,24 +679,100 @@ impl BwtPipeline {
                 pos += s2_len;
                 let s3 = &payload[pos..];
 
-                let decode_stream = |data: &[u8], pipe: u8| -> Vec<u8> {
-                    match pipe {
-                        0 => data.to_vec(),
-                        1 => bwt_mtf_rle_decode(data),
-                        _ => {
-                            let mtf = bwt_mtf_decode(data);
-                            lzp_decode(&mtf, 0)
-                        }
-                    }
-                };
-
                 let streams = crate::json_split::JsonStreams {
-                    structural: decode_stream(s0, s0_pipe),
-                    keys: decode_stream(s1, s1_pipe),
-                    string_values: decode_stream(s2, s2_pipe),
-                    numbers: decode_stream(s3, s3_pipe),
+                    structural: decode_stream_pick(s0, s0_pipe),
+                    keys: decode_stream_pick(s1, s1_pipe),
+                    string_values: decode_stream_pick(s2, s2_pipe),
+                    numbers: decode_stream_pick(s3, s3_pipe),
                 };
                 crate::json_split::merge(&streams, orig_len).unwrap_or_default()
+            }
+            BwtPipeline::CsvSplit => {
+                // See encode layout comment.
+                if payload.len() < 12 {
+                    return Vec::new();
+                }
+                let mut pos = 0usize;
+                let _orig_len =
+                    u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let delim = payload[pos];
+                pos += 1;
+                let trailing_newline = payload[pos] != 0;
+                pos += 1;
+                let ncols = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                let nrows = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + nrows * 2 > payload.len() {
+                    return Vec::new();
+                }
+                let mut fields_per_row = Vec::with_capacity(nrows);
+                for _ in 0..nrows {
+                    fields_per_row.push(u16::from_le_bytes(
+                        payload[pos..pos + 2].try_into().unwrap(),
+                    ));
+                    pos += 2;
+                }
+                let sel_len = ncols.div_ceil(4);
+                if pos + sel_len + ncols * 4 > payload.len() {
+                    return Vec::new();
+                }
+                let selectors = &payload[pos..pos + sel_len];
+                pos += sel_len;
+                let mut col_lens = Vec::with_capacity(ncols);
+                for _ in 0..ncols {
+                    col_lens.push(
+                        u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize,
+                    );
+                    pos += 4;
+                }
+                let mut columns = Vec::with_capacity(ncols);
+                for (i, &clen) in col_lens.iter().enumerate() {
+                    if pos + clen > payload.len() {
+                        return Vec::new();
+                    }
+                    let pipe = unpack_selector(selectors, i);
+                    columns.push(decode_stream_pick(&payload[pos..pos + clen], pipe));
+                    pos += clen;
+                }
+                crate::csv_split::join(&crate::csv_split::CsvStreams {
+                    delim,
+                    columns,
+                    fields_per_row,
+                    trailing_newline,
+                })
+                .unwrap_or_default()
+            }
+            BwtPipeline::XmlSplit => {
+                // Layout: [orig_len:u32][selector:u8][t_len:u32][a_len:u32][tags][attrs][text]
+                if payload.len() < 13 {
+                    return Vec::new();
+                }
+                let orig_len =
+                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                let selector = payload[4];
+                let tags_pipe = selector & 0x3;
+                let attrs_pipe = (selector >> 2) & 0x3;
+                let text_pipe = (selector >> 4) & 0x3;
+                let t_len =
+                    u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+                let a_len =
+                    u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]) as usize;
+                let mut pos = 13;
+                if pos + t_len + a_len > payload.len() {
+                    return Vec::new();
+                }
+                let tags = decode_stream_pick(&payload[pos..pos + t_len], tags_pipe);
+                pos += t_len;
+                let attrs = decode_stream_pick(&payload[pos..pos + a_len], attrs_pipe);
+                pos += a_len;
+                let text = decode_stream_pick(&payload[pos..], text_pipe);
+                crate::xml_split::join(
+                    &crate::xml_split::XmlStreams { tags, attrs, text },
+                    orig_len,
+                )
+                .unwrap_or_default()
             }
             BwtPipeline::XwrtBwtMtfRle => {
                 // Layout: [orig_len:u32][encoded_len:u32][bwt_mtf_rle_encoded][dictionary_bytes]
@@ -669,30 +820,28 @@ const TRIAL_MIN_LEN: usize = 1 << 20; // 1 MB
 /// gains nothing from BWT's long-range reordering.)
 const TRIAL_MAX_SHANNON: f32 = 7.2;
 
-/// Run all three BWT paths on `data` and return the smallest.
+/// Run all BWT paths on `data` and return the smallest.
 ///
 /// Fast-path heuristics: blocks < 256 KB always use raw CM (the transforms can
 /// only help long-range structure that short blocks lack). Blocks under 1 MB
-/// (256 KB..1 MB) skip trials *unless* they look like JSON — JSON stream-splitting
-/// pays off from 256 KB up. Blocks above 1 MB use a Shannon guard: near-random
-/// text skips trials too. Only the **pipeline** and **size** are returned; the
-/// caller re-encodes with the chosen pipeline.
+/// (256 KB..1 MB) skip trials *unless* they look like JSON/CSV/XML — structured
+/// stream-splitting pays off from 256 KB up. Blocks above 1 MB use a Shannon
+/// guard: near-random text skips trials too. Only the **pipeline** and **size**
+/// are returned; the caller re-encodes with the chosen pipeline.
 ///
-/// If the block looks like JSON and is large enough, a fourth path (JSON split) is
-/// also tried: the block is split into 4 streams and each is BWT-trialed independently.
-///
-/// When `global_dict` is `Some`, a fifth path (`XwrtBwtMtfRle`) is tried: the
-/// corpus-wide word dictionary is applied before BWT. XWRT tokens use
-/// `0x80..=0xFE` (and `0xFF` ESC + u16 for larger ids), so the trial is gated
-/// on the block being pure ASCII — high literal bytes would collide with tokens.
-/// literal bytes would alias tokens and break the round-trip.
+/// When detectors fire, structured-split paths (JSON / CSV / XML) are tried.
+/// When `global_dict` is `Some`, `XwrtBwtMtfRle` is also tried (ASCII-only).
+/// All applicable size trials run concurrently via nested `rayon::join`.
 pub fn compress_text_with_trial(
     data: &[u8],
     global_dict: Option<&crate::model::word::XwrtDictionary>,
 ) -> BwtPathResult {
     let is_json = crate::json_split::looks_like_json(data);
+    let is_csv = !is_json && crate::csv_split::looks_like_csv(data);
+    let is_xml = !is_json && !is_csv && crate::xml_split::looks_like_xml(data);
+    let is_structured = is_json || is_csv || is_xml;
     let small = data.len() < 256 * 1024;
-    let medium = (256 * 1024..TRIAL_MIN_LEN).contains(&data.len()) && !is_json;
+    let medium = (256 * 1024..TRIAL_MIN_LEN).contains(&data.len()) && !is_structured;
     let near_random = crate::classify::shannon_estimate(data) > TRIAL_MAX_SHANNON;
     if small || medium || near_random {
         return BwtPathResult {
@@ -702,38 +851,58 @@ pub fn compress_text_with_trial(
         };
     }
 
-    // S5: Parallel blocks — run all pipeline trials concurrently using rayon.
-    let path_a_size = data.len();
-    let (path_b_size, path_c_size) = rayon::join(
-        || BwtPipeline::BwtMtfRle.encode(data, global_dict).len(),
-        || BwtPipeline::LzpBwtMtf.encode(data, global_dict).len(),
-    );
-    let json_split_size = if is_json {
-        Some(
-            rayon::join(
-                || BwtPipeline::JsonSplit.encode(data, global_dict).len(),
-                || 0,
-            )
-            .0,
+    // Collect applicable size-trial closures (B, C, optional structured, optional XWRT)
+    // and run them concurrently via nested rayon::join.
+    let try_xwrt = global_dict.is_some() && data.is_ascii();
+    type Trial = (BwtPipeline, usize);
+    let mut jobs: Vec<Box<dyn FnOnce() -> Trial + Send>> = Vec::new();
+    jobs.push(Box::new(|| {
+        (
+            BwtPipeline::BwtMtfRle,
+            BwtPipeline::BwtMtfRle.encode(data, global_dict).len(),
         )
-    } else {
-        None
-    };
-    let xwrt_size = if global_dict.is_some() && data.is_ascii() {
-        Some(BwtPipeline::XwrtBwtMtfRle.encode(data, global_dict).len())
-    } else {
-        None
-    };
+    }));
+    jobs.push(Box::new(|| {
+        (
+            BwtPipeline::LzpBwtMtf,
+            BwtPipeline::LzpBwtMtf.encode(data, global_dict).len(),
+        )
+    }));
+    if is_json {
+        jobs.push(Box::new(|| {
+            (
+                BwtPipeline::JsonSplit,
+                BwtPipeline::JsonSplit.encode(data, global_dict).len(),
+            )
+        }));
+    }
+    if is_csv {
+        jobs.push(Box::new(|| {
+            (
+                BwtPipeline::CsvSplit,
+                BwtPipeline::CsvSplit.encode(data, global_dict).len(),
+            )
+        }));
+    }
+    if is_xml {
+        jobs.push(Box::new(|| {
+            (
+                BwtPipeline::XmlSplit,
+                BwtPipeline::XmlSplit.encode(data, global_dict).len(),
+            )
+        }));
+    }
+    if try_xwrt {
+        jobs.push(Box::new(|| {
+            (
+                BwtPipeline::XwrtBwtMtfRle,
+                BwtPipeline::XwrtBwtMtfRle.encode(data, global_dict).len(),
+            )
+        }));
+    }
 
-    let mut candidates: Vec<(BwtPipeline, usize)> = vec![(BwtPipeline::RawCm, path_a_size)];
-    candidates.push((BwtPipeline::BwtMtfRle, path_b_size));
-    candidates.push((BwtPipeline::LzpBwtMtf, path_c_size));
-    if let Some(json_size) = json_split_size {
-        candidates.push((BwtPipeline::JsonSplit, json_size));
-    }
-    if let Some(xwrt_size) = xwrt_size {
-        candidates.push((BwtPipeline::XwrtBwtMtfRle, xwrt_size));
-    }
+    let mut candidates: Vec<Trial> = vec![(BwtPipeline::RawCm, data.len())];
+    candidates.extend(parallel_map_sizes(jobs));
 
     let (best_pipeline, best_size) = candidates
         .into_iter()
@@ -965,6 +1134,23 @@ mod tests {
         let text = b"{\"name\":\"John\",\"age\":42,\"city\":\"New York\"}\n".repeat(500);
         let encoded = BwtPipeline::JsonSplit.encode(&text, None);
         let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len(), None);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn bwt_pipeline_csv_split_round_trip() {
+        let text = b"name,age,city\nJohn,30,NYC\nAnna,28,LA\nBob,45,CHI\n".repeat(200);
+        let encoded = BwtPipeline::CsvSplit.encode(&text, None);
+        let decoded = BwtPipeline::CsvSplit.decode(&encoded, text.len(), None);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn bwt_pipeline_xml_split_round_trip() {
+        let text = b"<catalog><book id=\"1\">Alpha</book><book id=\"2\">Beta</book></catalog>\n"
+            .repeat(200);
+        let encoded = BwtPipeline::XmlSplit.encode(&text, None);
+        let decoded = BwtPipeline::XmlSplit.decode(&encoded, text.len(), None);
         assert_eq!(decoded, text);
     }
 

@@ -2,11 +2,11 @@
 //!
 //! Extends the PPM approach from `ppm.rs` with several PAQ/PPMd techniques:
 //!
-//! - **Orders 0–8** with information inheritance: higher orders fall back to lower
-//!   orders, weighted by an escape probability. Unlike the simple `PpmModel` which uses
-//!   `1/(c0+c1)` as the escape probability, this model uses a **Secondary Escape
-//!   Estimation (SEE)** table to refine the escape probability based on the full
-//!   context signature.
+//! - **Orders 0–N** (default N=8; Text uses N=12) with information inheritance:
+//!   higher orders fall back to lower orders, weighted by an escape probability.
+//!   Unlike the simple `PpmModel` which uses `1/(c0+c1)` as the escape probability,
+//!   this model uses a **Secondary Escape Estimation (SEE)** table to refine the
+//!   escape probability based on the full context signature.
 //!
 //! - **SEE table**: indexed by `[order][context_hash]`. Each entry holds 16 states
 //!   (4-bit) tracking the recent escape/fall-through behavior for that (order,
@@ -38,14 +38,17 @@ const MAX_PROB: u16 = 4095;
 const MIN_PROB: u16 = 1;
 
 /// Address bits for context tables: 2^18 = 256K buckets per table.
-/// 9 order tables + 3 sparse = 12 tables × 256K × 8 bytes = 24MB total.
+/// Each order table ≈ 256K × 8 bytes ≈ 2 MB. Default order-8: 9 order + 3 sparse
+/// ≈ 24 MB. Order-12 Text construction: 13 order + 3 sparse ≈ 32 MB — SEE also
+/// grows with `max_order+1`. CTX_BITS=18 is already large; prefer Text-only
+/// order-12 via [`PpmdSsm::with_max_order`], not a global const bump.
 const CTX_BITS: u32 = 18;
 
 /// Number of states in the SEE table (4-bit state).
 const SEE_STATES: usize = 16;
 
-/// Maximum PPM order.
-const MAX_ORDER: usize = 8;
+/// Default maximum PPM order ([`PpmdSsm::new`]).
+const DEFAULT_MAX_ORDER: usize = 8;
 
 /// The three sparse de Bruijn context patterns. Each pattern is a list of byte
 /// offsets (relative to the current position, 0 = current/most recent byte)
@@ -73,10 +76,10 @@ struct SeeTable {
 }
 
 impl SeeTable {
-    /// Create a SEE table with `slots` hash slots per order.
-    fn new(slots: usize) -> Self {
+    /// Create a SEE table with `slots` hash slots per order and `max_order+1` rows.
+    fn new(slots: usize, max_order: usize) -> Self {
         Self {
-            states: vec![0; (MAX_ORDER + 1) * slots],
+            states: vec![0; (max_order + 1) * slots],
             n_slots: slots,
         }
     }
@@ -114,9 +117,11 @@ impl SeeTable {
     }
 }
 
-/// PPMd model with orders 0-8, SEE, and 3 sparse de Bruijn contexts.
+/// PPMd model with configurable max order, SEE, and 3 sparse de Bruijn contexts.
 pub struct PpmdSsm {
-    /// Order-k context tables for k = 0..=MAX_ORDER.
+    /// Highest order used (inclusive). Orders are `0..=max_order`.
+    max_order: usize,
+    /// Order-k context tables for k = 0..=max_order.
     orders: Vec<CtxTable>,
     /// 3 sparse de Bruijn context tables.
     sparse: Vec<CtxTable>,
@@ -134,20 +139,32 @@ pub struct PpmdSsm {
 }
 
 impl PpmdSsm {
-    /// Create a new PPMd model.
+    /// Create a new PPMd model with the default max order (8).
     #[must_use]
     pub fn new() -> Self {
-        let orders: Vec<CtxTable> = (0..=MAX_ORDER).map(|_| CtxTable::new(CTX_BITS)).collect();
+        Self::with_max_order(DEFAULT_MAX_ORDER)
+    }
+
+    /// Create a PPMd model with orders `0..=max_order`.
+    ///
+    /// Text stacks use order 12. Memory scales with `max_order+1` order tables
+    /// (≈2 MB each at [`CTX_BITS`]=18) plus a SEE row per order — see module
+    /// docs. Cap is 31 so the escape bitmask fits in `u32`.
+    #[must_use]
+    pub fn with_max_order(max_order: usize) -> Self {
+        let max_order = max_order.min(31);
+        let orders: Vec<CtxTable> = (0..=max_order).map(|_| CtxTable::new(CTX_BITS)).collect();
         let sparse: Vec<CtxTable> = (0..N_SPARSE).map(|_| CtxTable::new(CTX_BITS)).collect();
         let sparse_asm: Vec<ByteAssembler> = SPARSE_PATTERNS
             .iter()
             .map(|p| ByteAssembler::new(p.len()))
             .collect();
         Self {
+            max_order,
             orders,
             sparse,
-            see: SeeTable::new(1 << 16), // 64K slots per order
-            asm: ByteAssembler::new(MAX_ORDER),
+            see: SeeTable::new(1 << 16, max_order), // 64K slots per order
+            asm: ByteAssembler::new(max_order),
             sparse_asm,
             last_used: std::cell::Cell::new(0),
             last_escaped_orders: std::cell::Cell::new(0),
@@ -213,7 +230,7 @@ impl BitModel for PpmdSsm {
         // Only walk orders up to the current assembler depth (beyond that, contexts
         // are empty and we'd waste time hashing nothing).
         let bit_pos = self.asm.nbits();
-        let max_order = self.asm.bytes_len().min(MAX_ORDER as u64) as usize;
+        let max_order = self.asm.bytes_len().min(self.max_order as u64) as usize;
         let mut p_lower: f64 = 2048.0;
         let mut used = 0usize;
         let mut escaped_orders: u32 = 0;
@@ -429,5 +446,37 @@ mod tests {
         // return a valid probability.
         let p = m.predict();
         assert!((1..=4095).contains(&p), "valid probability range");
+    }
+
+    #[test]
+    fn order12_construct_predict_update_roundtrip() {
+        let text = b"order twelve ppmd short string";
+        let mut enc = PpmdSsm::with_max_order(12);
+        assert_eq!(enc.max_order, 12);
+        assert_eq!(enc.orders.len(), 13);
+
+        let mut probs = Vec::new();
+        for &byte in text {
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1 == 1;
+                probs.push(enc.predict());
+                enc.update(bit);
+            }
+        }
+
+        let mut dec = PpmdSsm::with_max_order(12);
+        let mut i = 0;
+        for &byte in text {
+            for bit_idx in (0..8).rev() {
+                let bit = (byte >> bit_idx) & 1 == 1;
+                assert_eq!(
+                    dec.predict(),
+                    probs[i],
+                    "order-12 predict mismatch at bit {i}"
+                );
+                dec.update(bit);
+                i += 1;
+            }
+        }
     }
 }

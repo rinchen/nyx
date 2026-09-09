@@ -1,10 +1,30 @@
 # Rcn Optimization Opportunity Log
 
 Last updated: 2026-09-09
-Test status: 143/143 passing
+Test status: 162/162 passing
 
 Human-readable TODO, experiment log, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
+
+---
+
+## External proposal triage (2026-09)
+
+Ideas from an external list that **collide with closed ticket IDs**. Status vs this tree:
+
+| Proposal idea | Verdict |
+|---------------|---------|
+| S8 interleaved rANS after SIMD walk_dist | **Done** — already wired in `bytecodec` |
+| S9 libsais BWT | **Done** — `bwt_libsais` → `libsais-rs` (default still `divsufsort` O(n)) |
+| S10 prefetch + stretch-in-`MixerAcc` | **Done as S11** — stretch LUT on `MixerAcc`; `_mm_prefetch` next bank |
+| S11 bumpalo / per-block bank arena | **Rejected** — banks are flat SoA + decay in place, not 8192 `Vec`s/block |
+| S12 parallel BWT trials | **Done as S12** — `parallel_map_sizes` covers RawCm / XWRT / JSON / CSV / XML trials |
+| C6 XWRT-512 ESC | **Done** |
+| C7 classifier DP thresholds | **Done** (Text 12; Binary/Exec 16 — ≥24 hurt mr) |
+| C8 16k + Indirect default | **Banks done; Indirect shelved** |
+| C9 Order-12 PPMd Text | **Tried as C10 — reverted** (gain ≪ 0.3pt) |
+| C10 FSE side-stream | **Done** (repo C9) |
+| C11 CSV/XML stream split | **Done as C11** — detectors + BWT trial wiring |
 
 ---
 
@@ -17,10 +37,12 @@ Product overview and headline benches: [README.md](README.md).
 | C3 | XWRT dictionary before BWT | Per-block XWRT before BWT→MTF→RLE0→CM. | 2-4pt on text | Completed |
 | C4 | Exec/Binary transforms | DP-LZP default; E8E9; delta/stride. | 2-5pt on mr/nci | Completed |
 | C5 | Corpus-wide global XWRT-128 | Top-128 dict once in header. | −4-5pt on text | Completed |
-| C6 | Global XWRT 128 → 512 with ESC | `0x80..=0xFE` ids 0..126; `0xFF\|\|u16` ids 127..511; ESC only for words len>3; header count `u16`. Measured dickens ~41.3%→~40.2% (−1.1pt) vs HEAD on this machine. | −1 to −2pt on text | Completed |
+| C6 | Global XWRT 128 → 512 with ESC | `0x80..=0xFE` ids 0..126; `0xFF\|\|u16` ids 127..511; ESC only for words len>3. | −1 to −2pt on text | Completed |
 | C7 | Adaptive DP LZP threshold | Text ≥12; Binary/Exec stay 16 (≥24 regressed mr). | Help text; avoid mr hit | Completed |
-| C8 | 16k banks + indirect | `NUM_MIXERS=16384` (14-bit). IndirectModel tried; **not in default Text stack** (prior regression). | Banks kept; indirect shelved | Completed (banks); indirect in-tree only |
+| C8 | 16k banks + indirect | `NUM_MIXERS=16384`. Indirect **not** in default Text stack. | Banks kept; indirect shelved | Completed (banks) |
 | C9 | FSE-family match side-stream | Order-0 byte rANS on varint blob when smaller. | ∼0.5–1pt | Completed |
+| C10 | Order-12 PPMd for Text only | `with_max_order(12)` API kept; default Text stays order-8. | −0.5pt text | **Reverted** — 2MB dickens −0.003pt |
+| C11 | CSV/XML stream splitting | Column / tag-attr-text splits like JSON; methods 15–18. | Structured-data ratio | Completed |
 
 ---
 
@@ -30,13 +52,15 @@ Product overview and headline benches: [README.md](README.md).
 |---|--------|-------------|---------------|--------|
 | S1 | SIMD `walk_dist` | AVX2 cumulative counts. | 5-10x fast path | Completed |
 | S2 | SoA weight layout | Contiguous bank weights. | 10-20% slow | Completed |
-| S3 | Stretch-value reuse | Precompute stretch in mix/update. | Small | Completed |
+| S3 | Stretch-value reuse | Precompute stretch in mix/update (within-call). | Small | Completed |
 | S4 | Wider stride / context | More models / context bits. | Known gain | Completed |
-| S5 | Parallel BWT trials | `rayon::join` path B/C. | Modest | Partial |
-| S6 / S9 | libsais BWT backend | Optional `bwt_libsais` feature (`libsais-rs`); default `divsufsort`. | BWT trial speed | Completed (optional) |
+| S5 | Parallel BWT trials | `rayon::join` path B/C. | Modest | Partial → see S12 |
+| S6 / S9 | libsais BWT backend | Optional `bwt_libsais` (`libsais-rs`); default `divsufsort`. | BWT trial speed | Completed (optional) |
 | S7 | mimalloc | Allocator. | Small | Completed |
-| S8 | Interleaved rANS re-bench | Already wired; re-benched after AVX2 walk_dist. | Confirm MB/s | Completed |
+| S8 | Interleaved rANS re-bench | Wired; re-benched after AVX2 walk_dist. | Confirm MB/s | Completed |
 | S10 | Classify-ahead pipeline | `rayon::join` classify N+1 while encode N. | Overlap classify | Completed |
+| S11 | Prefetch + stretch on `MixerAcc` | Carry stretch LUT across mix→update; prefetch next bank weights. | Ratio-neutral speed | Completed |
+| S12 | Wider BWT trial parallelism | `parallel_map_sizes` for remaining size trials. | Text trial wall time | Completed |
 
 ---
 
@@ -45,9 +69,9 @@ Product overview and headline benches: [README.md](README.md).
 ### Slow Path (`--mode slow`, default)
 - 8 bit models (Text) + two-level **16k**-bank mixer hierarchy + master mixer
 - SSE/APM/APM2 cascade; cross-block decay 0.995; 32MB LZP window
-- BWT text trial + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
+- BWT text trial (incl. CSV/XML split) + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
 - Match side-stream: varint + optional order-0 rANS (C9)
-- Classify-ahead Rayon overlap (S10)
+- Classify-ahead Rayon overlap (S10); stretch-on-acc + bank prefetch (S11); wider BWT trial fan-out (S12)
 
 ### Fast Path (`--mode fast`)
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
@@ -57,14 +81,11 @@ Product overview and headline benches: [README.md](README.md).
 
 ## Recommended Next Step
 
-**Backlog:** Numbered compression/speed tickets C1–C9 and S1–S10 are complete (S5 remains partial: intra-block BWT trial `rayon::join` only — not full cross-block parallelism beyond classify-ahead).
+1. Optional: re-bench dickens/json slow rows for a fully same-day 5-file set.
+2. Profile slow path (flamegraph) if chasing 20+ MB/s; S11 prefetch is soft-hint only.
+3. Real CSV/XML corpora A/B for C11 ratio claims (synthetic round-trips already green).
 
-**Hygiene (do next):**
-1. Finish slow-path re-bench of **webster** and **nci** (README headline still has prior figures for those two).
-2. Re-measure **mr** after C7 softened Binary/Exec min match back to 16 (README’s 27.3% was under the ≥24 trial).
-3. Update [README.md](README.md) headline table with those numbers.
-
-**Research (not scheduled):** Closing the dickens/webster gap to `zstd -19` needs new modeling experiments — not more of C6–C9. A lighter Indirect-style context could be A/B’d later; do not treat it as the default next ticket after prior dickens regressions. Experiment log and research notes: [DEVELOPMENT.md](DEVELOPMENT.md).
+Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd order without a ≥0.3pt measure. Experiment log: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
@@ -73,4 +94,4 @@ Product overview and headline benches: [README.md](README.md).
 | Date | Notes |
 |------|-------|
 | 2026-09-08 | C5 global XWRT-128 |
-| 2026-09-09 | Docs truth; C6–C9 / S8–S10; 143 tests; dickens HEAD 41.3% → C6 stack ~40.2% |
+| 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage → S11/S12/C11 done; C10 reverted (−0.003pt) |

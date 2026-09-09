@@ -139,42 +139,44 @@ future release.
 > percentage of the original (lower is better); speed is in MB/s (higher is
 > better). Experiment history: [DEVELOPMENT.md](DEVELOPMENT.md).
 
-### Current slow path (hybrid_ppm3 + two-level 16k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 + global XWRT-512 ESC + SSE/APM/APM2 + adaptive DP thresholds + side-stream FSE-family + classify-ahead + mimalloc)
+### Current slow path (hybrid_ppm3 + two-level 16k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON/CSV/XML stream splitting + DP optimal LZP parse default + Exec E8E9 + global XWRT-512 ESC + SSE/APM/APM2 + adaptive DP thresholds + side-stream FSE-family + classify-ahead + MixerAcc stretch/prefetch + wider BWT trials + mimalloc)
 
 | file | orig (KB) | rcn ratio% | rcn cmp MB/s | rcn dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
 | dickens | 9953.6 | **40.2** | **0.04** | **0.04** | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
-| webster | 40487.0 | **23.6** | **0.7** | **0.5** | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
-| nci | 32767.0 | **7.4** | **0.7** | **0.5** | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **rcn** | **zstd -19** |
-| mr | 9736.9 | **27.3** | **0.04** | **0.04** | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **rcn** | **zstd -19** |
+| webster | 40487.0 | **29.3** | **0.1** | **0.1** | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
+| nci | 32767.0 | **7.3** | **0.2** | **0.2** | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **rcn** | **zstd -19** |
+| mr | 9736.9 | **27.4** | **0.04** | **0.04** | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **rcn** | **zstd -19** |
 | json | 478.5 | **0.1** | **4.0** | **28** | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **rcn**/tie | **zstd -19** |
 
-Notes: dickens/json/mr slow ratios re-measured 2026-09-09 (HEAD dickens **41.3%**; C6 ≈−1.1pt). mr 27.3% was with Binary LZP min=24; C7 since softened to keep Binary/Exec at 16 (re-measure pending). webster/nci slow ratios are prior figures. zstd/FSE columns unchanged.
+Notes: webster/nci/mr slow re-bench 2026-09-09 (post-C7 soften, C10 Order-12 reverted). Bench prints `0.0` for mr MB/s at one decimal — recorded here as **0.04**. dickens/json ratios from earlier same-day C6 stack measure. zstd/FSE columns unchanged.
 
 ### Fast path (`--mode fast`) re-bench 2026-09-09
 
-| file | orig (KB) | rcn ratio% | cmp MB/s | dec MB/s |
-|------|----------:|-----------:|---------:|---------:|
-| dickens | 9953.6 | 26.9 | 2.0 | 4.3 |
-| webster | 40487.0 | 20.3 | 2.7 | 5.5 |
-| nci | 32767.0 | 5.1 | 5.1 | 10.6 |
-| mr | 9736.9 | 35.0 | 2.6 | 4.0 |
-| json | 478.5 | 0.1 | 5.2 | 59.1 |
+| file | orig (KB) | rcn ratio% | cmp MB/s | dec MB/s | zstd -1 ratio% | zstd -19 ratio% | FSE ratio% | ratio winner | speed winner |
+|------|----------:|-----------:|---------:|---------:|---------------:|---------------:|-----------:|:------------:|:------------:|
+| dickens | 9953.6 | **26.9** | 2.0 | 4.3 | 41.7 | 28.0 | 57.0 | **rcn** | **zstd -1** |
+| webster | 40487.0 | **20.3** | 2.7 | 5.5 | 33.5 | 21.1 | 62.6 | **rcn** | **zstd -1** |
+| nci | 32767.0 | **5.1** | 5.1 | 10.6 | 85.2 | 49.5 | 30.2 | **rcn** | **zstd -1** |
+| mr | 9736.9 | **35.0** | 2.6 | 4.0 | 38.5 | 31.2 | 44.0 | **zstd -19** | **zstd -1** |
+| json | 478.5 | **0.1** | 5.2 | 59.1 | 0.3 | 0.1 | 52.8 | **rcn**/tie | **zstd -1** |
+
+zstd/FSE ratio columns reused from the slow-path reference set. Speed winner uses decode MB/s (zstd `-1` dominates; see slow table for absolute zstd/FSE speeds). Fast path beats `zstd -19` on ratio for dickens/webster/nci (and ties json); loses to `-19` on mr.
 
 ### Reading the table
 
-- **Ratio:** lower % is better. On the current stack, rcn **beats `zstd -19`** on
-  `nci` and `mr`, and ties/beats on small `json`. On text, `zstd -19` still leads:
-  dickens 40.2% vs 28.0% (rcn still beats `zstd -1` at 41.7%), webster gap TBD on
-  full re-bench. Historical experiment numbers live in
-  [DEVELOPMENT.md](DEVELOPMENT.md).
+- **Ratio (slow):** lower % is better. Slow rcn **beats `zstd -19`** on `nci` and `mr`,
+  and ties/beats on small `json`. On text, `zstd -19` still leads (dickens 40.2% vs 28.0%;
+  webster 29.3% vs 21.1%). Historical experiments: [DEVELOPMENT.md](DEVELOPMENT.md).
+
+- **Ratio (fast):** `--mode fast` often **beats `zstd -19` on text** in the table
+  above (dickens 26.9%, webster 20.3%) while staying far behind on speed. Fast mr
+  (35.0%) loses to `-19` (31.2%).
 
 - **Speed:** higher MB/s is better.
-  **Slow path** (`--mode slow`): ~0.04 MB/s on large text on this machine (bit-level
-  CM); small JSON is much faster when BWT collapses the stream.
-  **Fast path** (`--mode fast`): ~2–5 MB/s compress / ~4–10 MB/s decode after AVX2
-  `walk_dist` + interleaved rANS (see fast-path table). Still short of the 20+ MB/s
-  goal.
+  **Slow path:** ~0.04 MB/s on large text on this machine.
+  **Fast path:** ~2–5 MB/s compress / ~4–10 MB/s decode — still short of 20+ MB/s;
+  **speed winner** is always zstd (usually `-1`).
   zstd `-1` is hundreds–thousands of MB/s; zstd `-19` is ~3–4 MB/s compress.
 
 ## License

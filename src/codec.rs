@@ -134,6 +134,10 @@ pub const METHOD_LZP_BWT_MTF: u8 = 6;
 pub const METHOD_JSON_SPLIT: u8 = 7;
 /// Text XWRT path: XWRT dictionary → BWT → MTF → RLE0 → CM.
 pub const METHOD_XWRT_BWT_MTF_RLE: u8 = 13;
+/// Text CSV column-split path: split CSV → N× BWT → CM.
+pub const METHOD_CSV_SPLIT: u8 = 15;
+/// Text XML stream-split path: split XML → 3× BWT → CM.
+pub const METHOD_XML_SPLIT: u8 = 16;
 /// Byte-level CM (fast path): orders 0–2 count models + byte rANS.
 pub const METHOD_BYTE_CM: u8 = 8;
 /// Text BWT+RLE0 path, byte-coded (fast).
@@ -144,6 +148,10 @@ pub const METHOD_BYTE_LZP_BWT_MTF: u8 = 10;
 pub const METHOD_BYTE_JSON_SPLIT: u8 = 11;
 /// Text XWRT→BWT→MTF→RLE0 path, byte-coded (fast).
 pub const METHOD_BYTE_XWRT_BWT_MTF_RLE: u8 = 12;
+/// Text CSV split path, byte-coded (fast).
+pub const METHOD_BYTE_CSV_SPLIT: u8 = 17;
+/// Text XML split path, byte-coded (fast).
+pub const METHOD_BYTE_XML_SPLIT: u8 = 18;
 
 /// One block's compression summary, reported by [`compress_mode_diag`] for
 /// `--verbose` progress output.
@@ -172,11 +180,15 @@ pub fn method_label(method: u8) -> &'static str {
         METHOD_LZP_BWT_MTF => "LZP→BWT→MTF→CM",
         METHOD_JSON_SPLIT => "JSON-split→BWT→CM",
         METHOD_XWRT_BWT_MTF_RLE => "XWRT→BWT→MTF→RLE0→CM",
+        METHOD_CSV_SPLIT => "CSV-split→BWT→CM",
+        METHOD_XML_SPLIT => "XML-split→BWT→CM",
         METHOD_BYTE_CM => "byte-CM",
         METHOD_BYTE_BWT_MTF_RLE => "byte-BWT→MTF→RLE0",
         METHOD_BYTE_LZP_BWT_MTF => "byte-LZP→BWT→MTF",
         METHOD_BYTE_JSON_SPLIT => "byte-JSON-split→BWT",
         METHOD_BYTE_XWRT_BWT_MTF_RLE => "byte-XWRT→BWT→MTF→RLE0",
+        METHOD_BYTE_CSV_SPLIT => "byte-CSV-split→BWT",
+        METHOD_BYTE_XML_SPLIT => "byte-XML-split→BWT",
         _ => "?",
     }
 }
@@ -407,6 +419,14 @@ fn encode_block_fast(block_data: &[u8], kind: crate::classify::BlockKind) -> (Ve
                 crate::bytecodec::compress_block(&transformed),
                 METHOD_BYTE_XWRT_BWT_MTF_RLE,
             ),
+            bwt::BwtPipeline::CsvSplit => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_CSV_SPLIT,
+            ),
+            bwt::BwtPipeline::XmlSplit => (
+                crate::bytecodec::compress_block(&transformed),
+                METHOD_BYTE_XML_SPLIT,
+            ),
         };
         (comp, method, transformed.len())
     } else if kind == crate::classify::BlockKind::Exec {
@@ -451,6 +471,8 @@ fn encode_block_slow(
             bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
             bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
             bwt::BwtPipeline::XwrtBwtMtfRle => METHOD_XWRT_BWT_MTF_RLE,
+            bwt::BwtPipeline::CsvSplit => METHOD_CSV_SPLIT,
+            bwt::BwtPipeline::XmlSplit => METHOD_XML_SPLIT,
         };
         // Transform the block data through the chosen pipeline, then CM-encode.
         let transformed = trial.pipeline.encode(block_data, global_dict);
@@ -528,6 +550,7 @@ pub fn build_stack_for_kind(
                 Box::new(crate::model::sparse::Sparse::new()),
                 Box::new(crate::model::exec::Exec::new()),
                 Box::new(crate::model::lzp::Lzp::new()),
+                // C10 Order-12 measured ~0pt on text (2MB dickens −0.003pt); keep default order-8.
                 Box::new(crate::model::ppmd_ssm::PpmdSsm::new()),
                 Box::new(crate::model::word::WordModel::new()),
             ];
@@ -1107,6 +1130,8 @@ where
                 | METHOD_BYTE_LZP_BWT_MTF
                 | METHOD_BYTE_JSON_SPLIT
                 | METHOD_BYTE_XWRT_BWT_MTF_RLE
+                | METHOD_BYTE_CSV_SPLIT
+                | METHOD_BYTE_XML_SPLIT
                 | METHOD_BYTE_EXEC_E8E9
         ) {
             // Byte-level (fast) path: one rANS symbol per byte.
@@ -1127,6 +1152,16 @@ where
                     global_dict.as_ref(),
                 ),
                 METHOD_BYTE_XWRT_BWT_MTF_RLE => bwt::BwtPipeline::XwrtBwtMtfRle.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
+                METHOD_BYTE_CSV_SPLIT => bwt::BwtPipeline::CsvSplit.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
+                METHOD_BYTE_XML_SPLIT => bwt::BwtPipeline::XmlSplit.decode(
                     &decoded,
                     entry.orig_len as usize,
                     global_dict.as_ref(),
@@ -1171,6 +1206,16 @@ where
                     entry.orig_len as usize,
                     global_dict.as_ref(),
                 ),
+                METHOD_CSV_SPLIT => bwt::BwtPipeline::CsvSplit.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
+                METHOD_XML_SPLIT => bwt::BwtPipeline::XmlSplit.decode(
+                    &decoded,
+                    entry.orig_len as usize,
+                    global_dict.as_ref(),
+                ),
                 METHOD_EXEC => crate::model::e8e9::e8e9_inverse(&decoded),
                 _ => decoded,
             }
@@ -1200,14 +1245,19 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         METHOD_CM | METHOD_TEXT => Ok(crate::classify::BlockKind::Text),
         METHOD_BINARY => Ok(crate::classify::BlockKind::Binary),
         METHOD_EXEC => Ok(crate::classify::BlockKind::Exec),
-        METHOD_BWT_MTF_RLE | METHOD_LZP_BWT_MTF | METHOD_JSON_SPLIT | METHOD_XWRT_BWT_MTF_RLE => {
-            Ok(crate::classify::BlockKind::Text)
-        }
+        METHOD_BWT_MTF_RLE
+        | METHOD_LZP_BWT_MTF
+        | METHOD_JSON_SPLIT
+        | METHOD_XWRT_BWT_MTF_RLE
+        | METHOD_CSV_SPLIT
+        | METHOD_XML_SPLIT => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_CM
         | METHOD_BYTE_BWT_MTF_RLE
         | METHOD_BYTE_LZP_BWT_MTF
         | METHOD_BYTE_JSON_SPLIT
-        | METHOD_BYTE_XWRT_BWT_MTF_RLE => Ok(crate::classify::BlockKind::Text),
+        | METHOD_BYTE_XWRT_BWT_MTF_RLE
+        | METHOD_BYTE_CSV_SPLIT
+        | METHOD_BYTE_XML_SPLIT => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_EXEC_E8E9 => Ok(crate::classify::BlockKind::Exec),
         _ => Err(RcnError::InvalidContainer(format!(
             "unknown method {}",

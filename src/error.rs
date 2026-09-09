@@ -28,6 +28,14 @@ pub enum RcnError {
     /// JSON stream splitting/merging failed (corrupt sub-stream).
     #[error("json split error: {0}")]
     JsonSplitError(String),
+
+    /// CSV stream splitting/merging failed (corrupt sub-stream).
+    #[error("csv split error: {0}")]
+    CsvSplitError(String),
+
+    /// XML stream splitting/merging failed (corrupt sub-stream).
+    #[error("xml split error: {0}")]
+    XmlSplitError(String),
 }
 
 /// Convenience alias for codec results.
