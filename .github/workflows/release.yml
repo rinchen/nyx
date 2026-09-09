@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      version-type:
+        description: 'Version bump type (patch, minor, major)'
+        required: true
+        default: 'patch'
+        options: ['patch', 'minor', 'major']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # Need full history for tagging
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Get current version
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Calculate new version
+        id: bump_version
+        run: |
+          CURRENT_VERSION=${{ steps.get_version.outputs.current_version }}
+          VERSION_TYPE=${{ github.event.inputs.version-type || 'patch' }}
+          
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          
+          case "$VERSION_TYPE" in
+            "major")
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_MINOR=0
+              NEW_PATCH=0
+              ;;
+            "minor")
+              NEW_MAJOR=$MAJOR
+              NEW_MINOR=$((MINOR + 1))
+              NEW_PATCH=0
+              ;;
+            "patch"|*)
+              NEW_MAJOR=$MAJOR
+              NEW_MINOR=$MINOR
+              NEW_PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update Cargo.toml
+        run: |
+          NEW_VERSION=${{ steps.bump_version.outputs.new_version }}
+          sed -i -E "s/^(version = \").*(\")/\1$NEW_VERSION\2/" Cargo.toml
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${{ steps.bump_version.outputs.new_version }}"
+
+      - name: Tag release
+        run: |
+          git tag ${{ steps.bump_version.outputs.tag }}
+          git push origin ${{ steps.bump_version.outputs.tag }}
+
+      - name: Push changes
+        run: git push
