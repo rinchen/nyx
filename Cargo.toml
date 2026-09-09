@@ -1,6 +1,6 @@
 [package]
 name = "rcn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust bit-mixer + BWT + DP-LZP compressor aiming to beat zstd -19 on text"
 license = "MIT"
