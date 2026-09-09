@@ -3,6 +3,9 @@
 Last updated: 2026-09-09
 Test status: 143/143 passing
 
+Human-readable TODO, experiment log, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
+Product overview and headline benches: [README.md](README.md).
+
 ---
 
 ## Compression Big Tickets (Ratio Improvements)
