@@ -28,7 +28,7 @@ jobs:
         run: cargo build --verbose
 
       - name: Test
-        run: cargo test --verbose
+        run: cargo test --features no_avx2
 
       - name: Publish
         run: cargo publish
