@@ -153,7 +153,7 @@ fn cmd_bench(corpus: &PathBuf) -> Result<(), String> {
         let enc_mbps = (data.len() as f64 / 1e6) / (enc_ms / 1000.0);
         let dec_mbps = (data.len() as f64 / 1e6) / (dec_ms / 1000.0);
         println!(
-            "{:<28} {:>10.1} {:>10.1} {:>8.1}% {:>11.1} {:>11.1}",
+            "{:<28} {:>10.1} {:>10.1} {:>8.1}% {:>11.2} {:>11.2}",
             path.file_name().unwrap().to_string_lossy(),
             orig_kb,
             comp_kb,

@@ -26,7 +26,7 @@ use rcn::codec::{self, decompress, CodecMode};
     name = "rcn",
     version,
     about = "Rcn: adaptive staged context-mixing compressor",
-    long_about = "Rcn is an experimental context-mixing compressor. It stages \
+    long_about = "Rcn is a ratio-first context-mixing compressor. It stages \
 BWT, LZP, and online logistic mixing, then entropy-codes with rANS. \
 Subcommands compress and decompress .rcn (RCN1) containers, bench a corpus, \
 or run the library self-test.",
@@ -41,9 +41,9 @@ struct Cli {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ModeArg {
-    /// Bit-level CM (higher ratio, slower).
+    /// Bit-level CM (default). Stronger on some binary; much slower; loses text to zstd -19.
     Slow,
-    /// Byte-level CM (faster, slightly worse ratio).
+    /// Byte-level CM. Usually better text ratio + throughput; loses to zstd -19 on mr.
     Fast,
 }
 
@@ -63,6 +63,9 @@ enum Cmd {
         /// Entropy mode: `slow` (bit-level CM, default) or `fast` (byte-level CM).
         #[arg(long, value_enum, default_value_t = ModeArg::Slow)]
         mode: ModeArg,
+        /// Print per-block kind, method, and sizes to stderr.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Decompress a .rcn (RCN1) container back to a file.
     Decompress {
@@ -104,7 +107,8 @@ fn run() -> Result<(), String> {
             output,
             backend,
             mode,
-        } => cmd_compress(&input, &output, &backend, mode),
+            verbose,
+        } => cmd_compress(&input, &output, &backend, mode, verbose),
         Cmd::Decompress { input, output } => cmd_decompress(&input, &output),
         Cmd::Bench { corpus, vs, fast } => cmd_bench(&corpus, vs.as_deref(), fast),
         Cmd::SelfTest => cmd_selftest(),
@@ -116,6 +120,7 @@ fn cmd_compress(
     output: &PathBuf,
     backend: &str,
     mode: ModeArg,
+    verbose: bool,
 ) -> Result<(), String> {
     if backend != "rans" {
         return Err(format!(
@@ -127,7 +132,20 @@ fn cmd_compress(
         ModeArg::Slow => CodecMode::Slow,
         ModeArg::Fast => CodecMode::Fast,
     };
-    let compressed = codec::compress_mode(&data, mode).map_err(|e| format!("compress failed: {e}"))?;
+    let (compressed, diags) = codec::compress_mode_diag(&data, mode)
+        .map_err(|e| format!("compress failed: {e}"))?;
+    if verbose {
+        for (i, d) in diags.iter().enumerate() {
+            eprintln!(
+                "block {i}: kind={} method={} ({}) in={} out={}",
+                d.kind,
+                d.method,
+                codec::method_label(d.method),
+                d.size_in,
+                d.size_out
+            );
+        }
+    }
     fs::write(output, &compressed).map_err(|e| format!("write {}: {e}", output.display()))?;
     let ratio = compressed.len() as f64 / (data.len() as f64).max(1.0);
     eprintln!(
@@ -212,7 +230,7 @@ fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool) -> Result<(), Strin
         let enc_mbps = (data.len() as f64 / 1e6) / (enc_ms / 1000.0);
         let dec_mbps = (data.len() as f64 / 1e6) / (dec_ms / 1000.0);
         println!(
-            "{:<28} {:>10.1} {:>10.1} {:>8.1}% {:>11.1} {:>11.1}",
+            "{:<28} {:>10.1} {:>10.1} {:>8.1}% {:>11.2} {:>11.2}",
             path.file_name().unwrap().to_string_lossy(),
             orig_kb,
             comp_kb,

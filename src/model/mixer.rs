@@ -135,7 +135,7 @@ impl LogisticMixer {
     /// NOTE: Adam is kept for API compatibility only. The hot path is fixed-point
     /// SGD; `new_adam` produces an SGD-trained mixer with the requested `lr`
     /// (Adam's adaptive rates were never measurably better on the default stacks,
-    /// see README experiment log — "Second-order mixer training" row).
+    /// see DEVELOPMENT.md A/B history — "Second-order mixer training" row).
     #[must_use]
     pub fn new_adam(n: usize, lr: f32) -> Self {
         Self {

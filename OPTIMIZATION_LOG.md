@@ -3,7 +3,7 @@
 Last updated: 2026-09-09
 Test status: 162/162 passing
 
-Human-readable TODO, experiment log, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
+Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
 
 ---
@@ -24,7 +24,7 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 | C8 16k + Indirect default | **Banks done; Indirect shelved** |
 | C9 Order-12 PPMd Text | **Tried as C10 — reverted** (gain ≪ 0.3pt) |
 | C10 FSE side-stream | **Done** (repo C9) |
-| C11 CSV/XML stream split | **Done as C11** — detectors + BWT trial wiring |
+| C11 CSV/XML stream split | **Done as C11** — detectors + BWT trial wiring; fixture A/B kept |
 
 ---
 
@@ -42,7 +42,7 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 | C8 | 16k banks + indirect | `NUM_MIXERS=16384`. Indirect **not** in default Text stack. | Banks kept; indirect shelved | Completed (banks) |
 | C9 | FSE-family match side-stream | Order-0 byte rANS on varint blob when smaller. | ∼0.5–1pt | Completed |
 | C10 | Order-12 PPMd for Text only | `with_max_order(12)` API kept; default Text stays order-8. | −0.5pt text | **Reverted** — 2MB dickens −0.003pt |
-| C11 | CSV/XML stream splitting | Column / tag-attr-text splits like JSON; methods 15–18. | Structured-data ratio | Completed |
+| C11 | CSV/XML stream splitting | Column / tag-attr-text splits like JSON; methods 15–18. | Structured-data ratio | Completed (fixtures kept) |
 
 ---
 
@@ -77,15 +77,28 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
 - AVX2 SIMD walk_dist
 
+### Default-mode gate
+`--mode fast` becomes default only if it beats or ties `zstd -19` on **all** headline files. Today it loses on `mr` (~35% vs ~31%) → **keep Slow**.
+
 ---
 
 ## Recommended Next Step
 
-1. Optional: re-bench dickens/json slow rows for a fully same-day 5-file set.
-2. Profile slow path (flamegraph) if chasing 20+ MB/s; S11 prefetch is soft-hint only.
-3. Real CSV/XML corpora A/B for C11 ratio claims (synthetic round-trips already green).
+1. **North star:** close text gap vs `zstd -19` on slow dickens/webster, **or** close fast `mr` gap so the fast-default gate can flip.
+2. **Speed (if chasing 20+ MB/s):** profile with symbols (release builds are stripped on macOS `sample`); next levers are bit-model/mixer loop (slow) and BWT / `walk_dist` (fast) — not S11 prefetch.
+3. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
 
-Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd order without a ≥0.3pt measure. Experiment log: [DEVELOPMENT.md](DEVELOPMENT.md).
+Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd order without a ≥0.3pt measure. A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
+
+---
+
+## Hotspot note (2026-09-09)
+
+macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
+
+1. **Slow encode:** one deep in-process call chain dominates; consistent with bit CM predict→mix→update. S11 `_mm_prefetch` does not appear as a separable hotspot.
+2. **Fast encode:** wall time in transform trial + byte entropy; dickens full file ~seconds at ~26.9% ratio.
+3. **Next speed lever:** instrumented/profiled build of the bit loop (slow) or BWT/`walk_dist` (fast).
 
 ---
 
@@ -94,4 +107,4 @@ Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd or
 | Date | Notes |
 |------|-------|
 | 2026-09-08 | C5 global XWRT-128 |
-| 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage → S11/S12/C11 done; C10 reverted (−0.003pt) |
+| 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |

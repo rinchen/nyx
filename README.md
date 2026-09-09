@@ -1,13 +1,11 @@
 # Rcn
 
-> **Experimentation: work in progress.** `rcn` — **R**ust **C**ompressor, **N**ew —
-> is an experimental, research-oriented command-line compressor written in Rust. It
-> combines a bit-level logistic mixer, Burrows–Wheeler Transform (BWT), and DP-LZP
-> matching to chase the highest achievable ratio; the benchmark target is beating
-> `zstd -19` on text. Expect rough edges; the container format and CLI are not yet
-> stable.
+> `rcn` — **R**ust **C**ompressor, **N**ew — is a ratio-first command-line
+> compressor written in Rust. It combines context mixing, Burrows–Wheeler
+> Transform (BWT), and DP-LZP matching. The benchmark target is beating
+> `zstd -19` on text. The `.rcn` (RCN1) container and CLI may still change.
 
-Optimization tickets, experiment log, and CI notes:
+Optimization tickets, A/B history, and CI notes:
 [DEVELOPMENT.md](DEVELOPMENT.md) · [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ## Design methodology
@@ -26,14 +24,13 @@ in isolation:
 - **Mix probabilistically.** An online logistic mixer blends many context models
   (order-0/1/2, sparse, executable, word, LZP) bit-by-bit to drive a rANS coder.
 
-Because the stages are modular, experiments are cheap: swap a model, re-run a
-benchmark, keep or discard based on measured ratio. The current target is beating
-`zstd -19` on text and mixed corpora.
+Stages are modular: swap a model, re-run a benchmark, keep or discard based on
+measured ratio. The current target is beating `zstd -19` on text and mixed corpora.
 
 ## Projected use cases
 
-- **Research & education** — a readable, self-contained reference for combining
-  BWT, LZP matching, and context-mixing entropy coding in one pipeline.
+- **Learning reference** — a readable, self-contained pipeline combining BWT,
+  LZP matching, and context-mixing entropy coding.
 - **Text-centric archival** — corpora with lots of redundancy (dickens, webster,
   source trees, JSON dumps) where ratio matters more than speed.
 - **Baseline for further work** — a clean staging ground for trying new models,
@@ -45,12 +42,11 @@ per byte than those, in exchange for better ratio on the right inputs.
 
 ## The method
 
-> **Status: actively improving.** Rcn ships two entropy paths:
-> `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
-> 16k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
-> coder + byte rANS). The benchmark target is beating `zstd -19` on
-> text + mixed corpora, with `FSE` as a secondary reference. See
-> [Benchmarks](#benchmarks) for the numbers.
+> Rcn ships two entropy paths: `--mode slow` (bit-level CM with a two-level
+> 16k-bank mixer; default) and `--mode fast` (PPM-style byte CM + interleaved
+> rANS). Fast usually wins text ratio and throughput vs slow; slow can win on
+> some binary (e.g. `mr`). Fast is **not** the default because it loses to
+> `zstd -19` on `mr` (~35% vs ~31%). See [Benchmarks](#benchmarks).
 
 Input is split into variable-size blocks by data type. Each block is classified
 by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
@@ -93,6 +89,12 @@ rcn --version
 # Compress a file into a .rcn (RCN1) container
 rcn compress input.bin output.rcn
 
+# Per-block method/size on stderr
+rcn compress --verbose input.bin output.rcn
+
+# Faster byte-CM path (better text ratio; loses to zstd -19 on mr)
+rcn compress --mode fast input.bin output.rcn
+
 # Decompress
 rcn decompress output.rcn restored.bin
 
@@ -120,15 +122,16 @@ On x86_64 (Linux), the AVX2 code path can be disabled at build time with
 `--no-default-features --features no_avx2` — see [CI / testing](DEVELOPMENT.md#ci--testing).
 
 ### Compression modes
-The CLI exposes two entropy paths: `--mode slow` (bit-level CM, higher ratio,
-default) and `--mode fast` (byte-level CM, faster). Named multi-level presets
-(`-1`…`-9` analogous to zstd) are out of scope until the strong path beats
-`zstd -19` on text and the fast path has a clear speed floor.
+`--mode slow` (default): bit-level CM — stronger on some binary (`mr`), much
+slower; still loses text to `zstd -19`.
+`--mode fast`: byte-level CM — usually better text ratio and ~50–100× throughput
+vs slow; beats `zstd -19` on dickens/webster/nci (ties json); loses on `mr`.
+Default stays `slow` until fast also beats (or ties) `zstd -19` on the full
+headline 5-file set. Named `-1`…`-9` presets remain out of scope.
 
 ### Streaming / `--stdout`
 The `compress` and `decompress` subcommands accept `-` as input/output path for
-stdin/stdout piping. Per-block progress/stats (`--verbose`) are planned for a
-future release.
+stdin/stdout piping. Compress accepts `--verbose` for per-block method and size.
 
 ## Benchmarks
 
@@ -137,7 +140,7 @@ future release.
 > representative **5-file subset** (dickens, webster, nci, mr, json) under
 > `--mode slow`. Fast-path numbers follow. `ratio%` is the compressed size as a
 > percentage of the original (lower is better); speed is in MB/s (higher is
-> better). Experiment history: [DEVELOPMENT.md](DEVELOPMENT.md).
+> better). A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ### Current slow path (hybrid_ppm3 + two-level 16k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON/CSV/XML stream splitting + DP optimal LZP parse default + Exec E8E9 + global XWRT-512 ESC + SSE/APM/APM2 + adaptive DP thresholds + side-stream FSE-family + classify-ahead + MixerAcc stretch/prefetch + wider BWT trials + mimalloc)
 
@@ -147,9 +150,9 @@ future release.
 | webster | 40487.0 | **29.3** | **0.1** | **0.1** | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | **7.3** | **0.2** | **0.2** | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **rcn** | **zstd -19** |
 | mr | 9736.9 | **27.4** | **0.04** | **0.04** | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **rcn** | **zstd -19** |
-| json | 478.5 | **0.1** | **4.0** | **28** | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **rcn**/tie | **zstd -19** |
+| json | 478.5 | **0.1** | **6.3** | **30.7** | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **rcn**/tie | **zstd -19** |
 
-Notes: webster/nci/mr slow re-bench 2026-09-09 (post-C7 soften, C10 Order-12 reverted). Bench prints `0.0` for mr MB/s at one decimal — recorded here as **0.04**. dickens/json ratios from earlier same-day C6 stack measure. zstd/FSE columns unchanged.
+Notes: Slow 5-file hygiene 2026-09-09 (dickens/json re-bench same day as webster/nci/mr). Bench MB/s now prints two decimals. zstd/FSE columns unchanged.
 
 ### Fast path (`--mode fast`) re-bench 2026-09-09
 
@@ -161,13 +164,13 @@ Notes: webster/nci/mr slow re-bench 2026-09-09 (post-C7 soften, C10 Order-12 rev
 | mr | 9736.9 | **35.0** | 2.6 | 4.0 | 38.5 | 31.2 | 44.0 | **zstd -19** | **zstd -1** |
 | json | 478.5 | **0.1** | 5.2 | 59.1 | 0.3 | 0.1 | 52.8 | **rcn**/tie | **zstd -1** |
 
-zstd/FSE ratio columns reused from the slow-path reference set. Speed winner uses decode MB/s (zstd `-1` dominates; see slow table for absolute zstd/FSE speeds). Fast path beats `zstd -19` on ratio for dickens/webster/nci (and ties json); loses to `-19` on mr.
+zstd/FSE ratio columns reused from the slow-path reference set. Speed winner uses decode MB/s (zstd `-1` dominates; see slow table for absolute zstd/FSE speeds). Fast path beats `zstd -19` on ratio for dickens/webster/nci (and ties json); loses to `-19` on mr — so fast is not the CLI default.
 
 ### Reading the table
 
 - **Ratio (slow):** lower % is better. Slow rcn **beats `zstd -19`** on `nci` and `mr`,
   and ties/beats on small `json`. On text, `zstd -19` still leads (dickens 40.2% vs 28.0%;
-  webster 29.3% vs 21.1%). Historical experiments: [DEVELOPMENT.md](DEVELOPMENT.md).
+  webster 29.3% vs 21.1%). A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 - **Ratio (fast):** `--mode fast` often **beats `zstd -19` on text** in the table
   above (dickens 26.9%, webster 20.3%) while staying far behind on speed. Fast mr

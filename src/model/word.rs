@@ -186,7 +186,7 @@ pub struct WordModel {
     /// Previous byte (for pair tracking).
     prev_byte: Option<u8>,
     /// Whether to use Re-Pair substitution.
-    #[allow(dead_code)] // toggle for experimental use
+    #[allow(dead_code)] // unused toggle; Re-Pair path is always on via `new`
     use_repar: bool,
 }
 

@@ -1,6 +1,6 @@
 # Rcn development notes
 
-Optimization tickets, experiment log, CI/testing notes, and roadmaps.
+Optimization tickets, A/B history, CI/testing notes, and roadmaps.
 For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
@@ -69,14 +69,17 @@ Pre-commit: `.pre-commit-config.yaml` runs `cargo build` + `cargo test` (mirrors
 7. **S10 — Classify-ahead pipeline** — **Completed**.
 8. **mimalloc** — **Completed**.
 
-## Ratio research directions
+## Ratio backlog
 
 **Closed through C11** (C10 Order-12 reverted). IndirectModel stays in-tree, not default.
 Tables: [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 **North star:** beat `zstd -19` on text + mixed corpora while keeping `nci`/`mr` wins.
+Fast path already beats `-19` on text in the headline set but loses on `mr`, so CLI
+default stays `--mode slow` until that gate clears.
 
-Next hygiene: real CSV/XML corpus A/B for C11; optional flamegraph if chasing 20+ MB/s.
+Next: improve text ratio vs `zstd -19` on the slow path, or clear the fast-default
+gate by closing the `mr` gap vs `-19`.
 
 ---
 
@@ -103,11 +106,11 @@ is default and SSM is isolated from DP.
 
 ---
 
-## Experiments log (2026-09)
+## A/B history (2026-09)
 
 ### Architecture & modeling
 
-| experiment | files tested | result | action |
+| change | files tested | result | action |
 |---|---|---|---|
 | Per-bit-position mixer context | mr, dickens, json, webster, nci | **improved all 5** | kept as default |
 | Classifier-aware method bytes | mr, dickens, json, webster, nci | neutral | kept as infrastructure |
@@ -136,7 +139,7 @@ is default and SSM is isolated from DP.
 | **SSE/APM/APM2 cascade** | mr, dickens, json, webster, nci | **improved all 5** | **wired into codec** |
 | **AVX2 SIMD walk_dist** | All | 5-10x fast path speedup, zero ratio loss | **completed** |
 | **C10 Order-12 PpmdSsm (Text)** | dickens 2MB | −0.003pt (990101→990035 B) | **reverted**; API `with_max_order` kept |
-| **C11 CSV/XML stream split** | synthetic CSV/XML | round-trip + BWT pipeline tests | **kept**; real-corpus ratio TBD |
+| **C11 CSV/XML stream split** | `testdata/structured/sample.csv` (701KB), `sample.xml` (586KB) | CSV: trial picks `CsvSplit` (payload 156KB vs RawCm 702KB / BWT 201KB); slow **1.02%**, fast **0.95%** (methods 15/17). XML: payload trial prefers `XmlSplit`; slow often lands global XWRT (method 13, **1.52%**); fast XML-split **2.09%**. Need ≥256KB for trials. | **kept** |
 | **S11 MixerAcc stretch + bank prefetch** | dickens 200KB | deterministic compress; ratio-neutral by design | **kept** |
 | **S12 parallel_map_sizes BWT trials** | (infra) | RawCm/XWRT/JSON/CSV/XML size jobs via nested `rayon::join` | **kept**; ratio unchanged |
 
@@ -148,10 +151,11 @@ is default and SSM is isolated from DP.
 | #2 | Byte-level "fast" path (`--mode fast`): PPM-style single-context count coder (deterministic order-0/1/2 selector + fused 256-symbol cumulative walk_dist + byte rANS). No mixer/softmax. | dickens 2MB | **2.6× encode speedup vs slow with ~1.7× better ratio on BWT+MTF streams** | kept as `--mode fast` |
 | #3 | Single-pass acc-merge across the mixer chain + Q16 fixed-point mixer | dickens 2MB (slow) | **~10% encode speedup, ratio flat** | kept as default |
 | #4 | 32-way interleaved byte rANS | dickens 2MB (fast) | **no measurable speedup** while serial `walk_dist` dominated; later wired + re-benched after AVX2 `walk_dist` | **wired into the fast path** |
+| #5 | macOS `sample` (release, stripped) | dickens | Slow: bit CM/mixer call chain dominates; S11 prefetch not a separate frame. Fast: BWT/`walk_dist` — next speed lever there. | note only |
 
 ### Code-quality / correctness notes
 
-| experiment | files tested | result | action |
+| change | files tested | result | action |
 |---|---|---|---|
 | round-trip verification | all 5 | lossless | every pass round-trip verified |
 | test suite | all | 162/162 green | kept |
