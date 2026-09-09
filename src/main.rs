@@ -25,8 +25,9 @@ use rcn::codec::{self, decompress, CodecMode};
 #[command(
     name = "rcn",
     version,
-    about = "Rcn: adaptive staged context-mixing compressor",
-    long_about = "Rcn is a ratio-first context-mixing compressor. It stages \
+    about = "Rcn: ratio-first context-mixing compressor (goal: beat zstd -19)",
+    long_about = "Rcn is a ratio-first context-mixing compressor. The success \
+metric is beating zstd -19 on ratio — not matching zstd -1 on speed. It stages \
 BWT, LZP, and online logistic mixing, then entropy-codes with rANS. \
 Subcommands compress and decompress .rcn (RCN1) containers, bench a corpus, \
 or run the library self-test.",

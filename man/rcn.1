@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: MIT
 .TH RCN 1 "September 2026" "rcn 0.1.2" "User Commands"
 .SH NAME
-rcn \- adaptive staged context-mixing compressor
+rcn \- ratio-first context-mixing compressor (goal: beat zstd \-19)
 .SH SYNOPSIS
 .B rcn
 [\fIOPTIONS\fR]
@@ -22,8 +22,12 @@ rcn \- adaptive staged context-mixing compressor
 .B rcn self-test
 .SH DESCRIPTION
 .B rcn
-is a ratio-first context-mixing compressor. It stages BWT, LZP, and online
-logistic mixing, then entropy-codes with rANS into a .rcn (RCN1) container.
+is a ratio-first context-mixing compressor. The success metric is beating
+.B zstd \-19
+on compressed size (ratio), not matching
+.B zstd \-1
+on throughput. It stages BWT, LZP, and online logistic mixing, then
+entropy-codes with rANS into a .rcn (RCN1) container.
 .PP
 Invoke
 .B rcn \-h

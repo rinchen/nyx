@@ -3,12 +3,16 @@
 # bench_vs_sota.sh — compare `rcn` against reference compressors on a corpus.
 #
 # Builds rcn (release), then for every regular file in the corpus directory runs
-# zstd -19, xz -9, brotli -11, lz4 -9 (skipping any not installed) and rcn,
-# tabulating (name, orig_kb, comp_kb, ratio%, cmp_MBps, dec_MBps).
+# zstd -1 (fast baseline), zstd -19 (goal), xz -9, brotli -11, lz4 -9 (skipping
+# any not installed) and rcn, tabulating
+# (name, orig_kb, comp_kb, ratio%, cmp_MBps, dec_MBps).
 #
 # Usage: scripts/bench_vs_sota.sh <corpus_dir> [rcn_bin]
 #   corpus_dir  directory of files to compress (subdirs are skipped)
 #   rcn_bin     optional path to a rcn binary (default: ./target/release/rcn)
+#
+# Environment:
+#   SKIP_RCN=1  skip the slow rcn pass (peer CLIs only)
 
 set -u
 
@@ -20,8 +24,8 @@ if [[ -z "$CORPUS" || ! -d "$CORPUS" ]]; then
     exit 1
 fi
 
-# Build rcn in release mode unless a binary was handed in.
-if [[ ! -x "$RCN" ]]; then
+# Build rcn in release mode unless a binary was handed in or SKIP_RCN.
+if [[ "${SKIP_RCN:-0}" != "1" && ! -x "$RCN" ]]; then
     echo "building rcn (release)..." >&2
     cargo build --release --bin rcn || { echo "rcn build failed" >&2; exit 1; }
 fi
@@ -63,8 +67,10 @@ for f in "$CORPUS"/*; do
     [[ "$orig" -eq 0 ]] && continue
     okb="$(awk -v b="$orig" 'BEGIN { printf "%.1f", b/1024 }')"
 
-    # --- rcn ---
-    if [[ -x "$RCN" ]]; then
+    echo "# $name" 
+
+    # --- rcn (default = slow) ---
+    if [[ "${SKIP_RCN:-0}" != "1" && -x "$RCN" ]]; then
         t="$(run_and_time "$WORK/n.rcn" "$RCN" compress "$f" "$WORK/n.rcn")"
         c="$(wc -c <"$WORK/n.rcn")"
         t2="$(run_and_time "$WORK/n.out" "$RCN" decompress "$WORK/n.rcn" "$WORK/n.out")"
@@ -72,7 +78,16 @@ for f in "$CORPUS"/*; do
         fmt "rcn" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
     fi
 
-    # --- zstd -19 ---
+    # --- zstd -1 (fast baseline; not the goal) ---
+    if have zstd; then
+        t="$(run_and_time "$WORK/z1.zst" zstd -1 -q -f -o "$WORK/z1.zst" "$f")"
+        c="$(wc -c <"$WORK/z1.zst")"
+        t2="$(run_and_time "$WORK/z1.out" zstd -q -d -f -o "$WORK/z1.out" "$WORK/z1.zst")"
+        r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
+        fmt "zstd-1" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
+    fi
+
+    # --- zstd -19 (primary goal) ---
     if have zstd; then
         t="$(run_and_time "$WORK/z.zst" zstd -19 -q -f -o "$WORK/z.zst" "$f")"
         c="$(wc -c <"$WORK/z.zst")"
@@ -92,7 +107,7 @@ for f in "$CORPUS"/*; do
 
     # --- brotli -11 ---
     if have brotli; then
-        t="$(run_and_time "$WORK/b.br" brotli -11 -c "$f")"
+        t="$(run_and_time "$WORK/b.br" brotli -q 11 -c "$f")"
         c="$(wc -c <"$WORK/b.br")"
         t2="$(run_and_time "$WORK/b.out" brotli -d -c "$WORK/b.br")"
         r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
@@ -106,5 +121,14 @@ for f in "$CORPUS"/*; do
         t2="$(run_and_time "$WORK/l.out" lz4 -d -q -f "$WORK/l.lz4" "$WORK/l.out")"
         r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
         fmt "lz4-9" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
+    fi
+
+    # --- gzip -9 ---
+    if have gzip; then
+        t="$(run_and_time "$WORK/g.gz" gzip -9 -c "$f")"
+        c="$(wc -c <"$WORK/g.gz")"
+        t2="$(run_and_time "$WORK/g.out" gzip -d -c "$WORK/g.gz")"
+        r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
+        fmt "gzip-9" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
     fi
 done

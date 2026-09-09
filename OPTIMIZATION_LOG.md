@@ -81,13 +81,17 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 
 ### Default-mode gate
 
-`--mode fast` becomes default only if it beats or ties `zstd -19` on **all** headline files. Today it loses on `mr` (~35% vs ~31%) → **keep Slow**.
+`--mode fast` becomes default only if it beats or ties `zstd -19` on **all**
+headline files. Today it loses on `nci` (~5.1% vs ~5.0%) and `mr` (~35% vs ~31%)
+→ **keep Slow**. Scorecard: [README.md](README.md#goal).
 
 ---
 
 ## Recommended Next Step
 
-1. **North star:** close text gap vs `zstd -19` on slow dickens/webster, **or** close fast `mr` gap so the fast-default gate can flip.
+1. **North star:** beat `zstd -19` on ratio (slow text dickens/webster, and/or
+   fast `mr`) — not throughput vs `zstd -1`. Scorecard and crates.io peers:
+   [README.md](README.md#goal).
 2. **Speed (if chasing 20+ MB/s):** profile with symbols (release builds are stripped on macOS `sample`); next levers are bit-model/mixer loop (slow) and BWT / `walk_dist` (fast) — not S11 prefetch.
 3. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
 

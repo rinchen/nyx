@@ -77,12 +77,15 @@ Pre-commit: `.pre-commit-config.yaml` runs `cargo build` + `cargo test` (mirrors
 **Closed through C11** (C10 Order-12 reverted). IndirectModel stays in-tree, not default.
 Tables: [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-**North star:** beat `zstd -19` on text + mixed corpora while keeping `nci`/`mr` wins.
-Fast path already beats `-19` on text in the headline set but loses on `mr`, so CLI
-default stays `--mode slow` until that gate clears.
+**North star:** beat `zstd -19` on text + mixed corpora. Beating `zstd -1` on
+ratio is already true on the headline set and is *secondary* — not the success
+criterion. With refreshed zstd refs, fast wins dickens/webster vs `-19` but
+loses `nci`/`mr`; slow wins `mr`. CLI default stays `--mode slow` until a mode
+clears every headline file.
 
-Next: improve text ratio vs `zstd -19` on the slow path, or clear the fast-default
-gate by closing the `mr` gap vs `-19`.
+Next: improve ratio vs `zstd -19` on the remaining gaps (slow text/`nci`, fast
+`nci`/`mr`). Peer / crates.io landscape:
+[README.md](README.md#peers-cratesio-and-cli-equivalents).
 
 ---
 
