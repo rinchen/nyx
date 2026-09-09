@@ -20,6 +20,7 @@ rayon = "1"
 [features]
 default = ["two_pass"]
 two_pass = []
+no_avx2 = []
 
 [dev-dependencies]
 criterion = "0.5"

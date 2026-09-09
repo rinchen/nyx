@@ -318,7 +318,7 @@ impl ByteCountModel {
         let t = u64::from(self.totals[ctx].max(1));
         let inv = u32::from(reciprocal_table()[t as usize]);
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "no_avx2")))]
         {
             use std::arch::x86_64::*;
             // AVX2 path is bit-identical to scalar only when `cnt * inv < 2^32`.
