@@ -57,7 +57,14 @@ Product overview and headline benches: [README.md](README.md).
 
 ## Recommended Next Step
 
-Re-bench the full 5-file slow subset after each ratio ticket; chase remaining gap to `zstd -19` on webster/dickens. Optional: re-try a lighter indirect context now that SoA/16k banks are in place.
+**Backlog:** Numbered compression/speed tickets C1–C9 and S1–S10 are complete (S5 remains partial: intra-block BWT trial `rayon::join` only — not full cross-block parallelism beyond classify-ahead).
+
+**Hygiene (do next):**
+1. Finish slow-path re-bench of **webster** and **nci** (README headline still has prior figures for those two).
+2. Re-measure **mr** after C7 softened Binary/Exec min match back to 16 (README’s 27.3% was under the ≥24 trial).
+3. Update [README.md](README.md) headline table with those numbers.
+
+**Research (not scheduled):** Closing the dickens/webster gap to `zstd -19` needs new modeling experiments — not more of C6–C9. A lighter Indirect-style context could be A/B’d later; do not treat it as the default next ticket after prior dickens regressions. Experiment log and research notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 

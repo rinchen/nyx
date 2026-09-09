@@ -8,7 +8,9 @@ Last updated: 2026-09-09. Test status: 143/143 passing (`cargo test --lib`).
 
 ---
 
-## TODO - Remaining Optimization Tasks
+## Completed optimization checklist
+
+Numbered C/S backlog is empty; items below are the closed ticket record.
 
 ### Compression - beat zstd -19
 - ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – WordModel + banks + 32MB window + XWRT
@@ -63,17 +65,22 @@ Pre-commit: `.pre-commit-config.yaml` runs `cargo build` + `cargo test` (mirrors
 7. **S10 — Classify-ahead pipeline** — **Completed**.
 8. **mimalloc** — **Completed**.
 
-## Potential ratio improvements (remaining)
+## Ratio research directions
 
-C6–C9 are implemented (IndirectModel left out of the default Text stack after
-re-test). Further gains toward `zstd -19` on text likely need new modeling, not
-more of the same tickets. See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
+**No open numbered ratio tickets** — C6–C9 are closed (IndirectModel stays
+in-tree, not in the default Text stack). Ticket tables:
+[OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-### New optimization target (2026-09)
+**North star:** beat `zstd -19` on text + mixed corpora while keeping `nci`/`mr`
+wins. `FSE` is a secondary reference; speed remains secondary.
 
-Beat `zstd -19` on ratio for text + mixed corpora while keeping the existing
-`nci`/`mr` wins. `FSE` is tracked as a secondary reference. Speed remains
-secondary.
+Concrete research angles (not scheduled tickets):
+
+- New Text models beyond the current 8-model stack (full DMC previously hurt;
+  Indirect shelved after dickens regression)
+- Stronger text transforms / match modeling — not another XWRT vocab bump
+- Finish the slow 5-file re-bench (webster/nci + mr post-C7 soften) so gaps vs
+  `-19` are honest before claiming further wins
 
 ---
 
