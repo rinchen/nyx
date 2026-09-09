@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "rcn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ans",
  "byteorder",

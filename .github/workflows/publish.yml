@@ -4,19 +4,50 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.2)"
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.2)"
+        required: true
+        type: string
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write
     steps:
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "Expected a v* tag, got: $TAG"
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
 
       - name: Verify version matches Cargo.toml
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ steps.meta.outputs.tag }}"
           CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
           echo "tag=$TAG cargo_version=$CARGO_VERSION"
           if [ "$TAG" != "v$CARGO_VERSION" ]; then
@@ -25,12 +56,26 @@ jobs:
           fi
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
 
       - name: Test
-        run: cargo test --features no_avx2
+        run: cargo test --locked --features no_avx2
+
+      # Trusted Publishing OIDC (preferred). When this workflow is called from
+      # release.yml, crates.io matches the *caller* filename — register both
+      # publish.yml and release.yml as trusted publishers. Falls back to the
+      # CARGO_REGISTRY_TOKEN secret if OIDC is not configured.
+      - name: Authenticate to crates.io
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish
-        run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outcome == 'success' && steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::No crates.io credentials. Add Trusted Publishing for publish.yml and release.yml on the crate, or set the CARGO_REGISTRY_TOKEN secret."
+            exit 1
+          fi
+          cargo publish --locked

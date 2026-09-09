@@ -1,8 +1,6 @@
 name: Release
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       version-type:
@@ -16,31 +14,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.bump_version.outputs.tag }}
+      version: ${{ steps.bump_version.outputs.new_version }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # Need full history for tagging
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Get current version
         id: get_version
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
-          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "current_version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Calculate new version
         id: bump_version
         run: |
           CURRENT_VERSION=${{ steps.get_version.outputs.current_version }}
           VERSION_TYPE=${{ github.event.inputs.version-type || 'patch' }}
-          
+
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
-          
+
           case "$VERSION_TYPE" in
             "major")
               NEW_MAJOR=$((MAJOR + 1))
@@ -58,27 +56,37 @@ jobs:
               NEW_PATCH=$((PATCH + 1))
               ;;
           esac
-          
-          NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Update Cargo.toml
+          NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cargo.toml and Cargo.lock
         run: |
           NEW_VERSION=${{ steps.bump_version.outputs.new_version }}
           sed -i -E "s/^(version = \").*(\")/\1$NEW_VERSION\2/" Cargo.toml
+          # Keep lockfile package version in sync so publish --locked stays clean
+          cargo update -p rcn
 
       - name: Commit version bump
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${{ steps.bump_version.outputs.new_version }}"
 
-      - name: Tag release
+      - name: Push commit and tag
         run: |
-          git tag ${{ steps.bump_version.outputs.tag }}
-          git push origin ${{ steps.bump_version.outputs.tag }}
+          TAG=${{ steps.bump_version.outputs.tag }}
+          git tag "$TAG"
+          # Push commit first, then tag. Tag pushes from GITHUB_TOKEN do not
+          # start other workflows; the publish job below is invoked explicitly.
+          git push origin HEAD
+          git push origin "$TAG"
 
-      - name: Push changes
-        run: git push
+  publish:
+    needs: release
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+    secrets: inherit
