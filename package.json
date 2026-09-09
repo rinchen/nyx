@@ -1,0 +1,11 @@
+{
+  "name": "rcn-devtools",
+  "private": true,
+  "description": "Dev tooling only (markdown lint). Not published.",
+  "scripts": {
+    "lint:md": "markdownlint-cli2 \"**/*.md\" \"#node_modules\" \"#target\" \"#corpus\" \"#.work\""
+  },
+  "devDependencies": {
+    "markdownlint-cli2": "^0.18.1"
+  }
+}

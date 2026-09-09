@@ -13,6 +13,7 @@ Last updated: 2026-09-09. Test status: 162/162 passing (`cargo test --lib`).
 Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ### Compression - beat zstd -19
+
 - ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – WordModel + banks + 32MB window + XWRT
 - ✅ **Compress the match side-stream (varint)** – delta_pos/len/dist varints
 - ✅ **Global XWRT dictionary (top-128)** – corpus-wide; C5 measured dickens −4.6pt, webster −4.0pt
@@ -24,6 +25,7 @@ Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPT
 - ✅ **C11 — CSV/XML stream splitting** – `csv_split` / `xml_split`; BWT trial pipelines + methods; synthetic round-trips green
 
 ### Speed - achieve 20+ MB/s
+
 - ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~2–5 MB/s cmp / ~4–10 MB/s dec (see README Benchmarks)
 - ✅ **Parallel BWT trials (S5 partial)** – `rayon::join` for path B/C inside a block trial
 - ✅ **S9 — Optional libsais BWT backend** – `--features bwt_libsais` uses pure-Rust `libsais-rs`; default remains `divsufsort`
@@ -32,6 +34,7 @@ Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPT
 - ✅ **S12 — Wider BWT trial parallelism** – `parallel_map_sizes` fans out RawCm / XWRT / JSON / CSV / XML size trials; encode winner once
 
 ### Other Completed
+
 - **S1–S4, S7, C1–C5** – SIMD walk_dist, SoA banks, stretch reuse, mimalloc, SSE/APM, global XWRT-128, etc.
 - **CI fixes** – `no_avx2` feature for Linux CI scalar path
 - **Pre-commit hook** – mirrors the CI gate

@@ -67,6 +67,7 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 ## Current Stack (What Works)
 
 ### Slow Path (`--mode slow`, default)
+
 - 8 bit models (Text) + two-level **16k**-bank mixer hierarchy + master mixer
 - SSE/APM/APM2 cascade; cross-block decay 0.995; 32MB LZP window
 - BWT text trial (incl. CSV/XML split) + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
@@ -74,10 +75,12 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 - Classify-ahead Rayon overlap (S10); stretch-on-acc + bank prefetch (S11); wider BWT trial fan-out (S12)
 
 ### Fast Path (`--mode fast`)
+
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
 - AVX2 SIMD walk_dist
 
 ### Default-mode gate
+
 `--mode fast` becomes default only if it beats or ties `zstd -19` on **all** headline files. Today it loses on `mr` (~35% vs ~31%) → **keep Slow**.
 
 ---

@@ -26,3 +26,6 @@ corpus/
 # Temporary local benchmark scratch
 .work/
 .hermes/
+
+# npm (markdownlint-cli2)
+node_modules/
