@@ -7,6 +7,7 @@ on:
         description: 'Version bump type (patch, minor, major)'
         required: true
         default: 'patch'
+        type: choice
         options: ['patch', 'minor', 'major']
 
 jobs:
@@ -86,6 +87,9 @@ jobs:
 
   publish:
     needs: release
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/publish.yml
     with:
       tag: ${{ needs.release.outputs.tag }}
