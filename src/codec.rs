@@ -5,21 +5,21 @@
 //!
 //! The mixer uses a CMIX/PAQ8-style three-layer stack:
 //!
-//! 1. **Bank mixers** (4096 instances): selected by a context hash of
+//! 1. **Bank mixers** (16384 instances): selected by a context hash of
 //!    order-1 / order-2 / word-context + bit position. Each bank specializes
 //!    its weights to a specific context, avoiding the ~50% saturation that a
 //!    single logistic mixer hits on repetitive corpora like dickens.
 //! 2. **Global mixer**: a single context-agnostic mixer over the same models.
 //! 3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
 //!
-//! Only the selected bank + global + master are trained per bit — never all 4096.
+//! Only the selected bank + global + master are trained per bit — never all 16384.
 //! At block boundaries, weights are **decayed** (not reset), preserving learned
 //! structure across the stream.
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
 //! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
-//!   Exec, Lzp, PpmModel order-3, WordModel.
+//!   Exec, Lzp, PpmModel order-3, WordModel, IndirectModel.
 //! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec,
 //!   LZP, PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
 //!   benefits from every signal.
@@ -33,14 +33,15 @@
 //!
 //! rcn runs a forward LZP match pre-pass
 //! with **DP optimal parsing** and emits explicit `(len, dist)` records for long
-//! matches (≥ 16 bytes). Matched bytes are **skipped** in the rANS stream —
+//! matches (adaptive min length: Text ≥12, Binary/Exec ≥24, Random/other ≥16).
+//! Matched bytes are **skipped** in the rANS stream —
 //! only literals (non-matched bytes) are CM-encoded. The decoder reconstructs
 //! matched bytes by copying from history.
 //!
 //! Match selection cost = bits(match_flag) + bits(len) + bits(dist) + residual_cost,
 //! where residual_cost is estimated as len × AVG_BITS_PER_BYTE (CM cost per byte).
 //! A match is taken when its overhead (33 bits) is less than the CM cost of the
-//! matched bytes (len × 4 bits), i.e., len > 8.25. With MATCH_MIN_LEN=16, matches
+//! matched bytes (len × 4 bits), i.e., len > 8.25. With min length ≥12, matches
 //! always save net bits.
 //!
 //! Method values:
@@ -51,6 +52,7 @@ use crate::container::{
     read_global_dict, write_global_dict, BlockEntry, Header, FLAG_GLOBAL_DICT, VERSION,
 };
 use crate::entropy::range::{BitDecoder, BitEncoder};
+use crate::entropy::side_fse;
 use crate::error::{RcnError, Result};
 use crate::model::lzp::Lzp;
 use crate::model::mixer_bank::MixerBank;
@@ -91,7 +93,18 @@ fn write_varint(out: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-const MATCH_MIN_LEN: usize = 16;
+/// Adaptive DP-LZP minimum match length by block kind.
+/// Text uses a lower gate (more matches); Binary/Exec keep 16 after a ≥24
+/// trial regressed `mr` (~20.6%→27.3%).
+#[inline]
+fn match_min_len(kind: crate::classify::BlockKind) -> usize {
+    match kind {
+        crate::classify::BlockKind::Text => 12,
+        crate::classify::BlockKind::Binary
+        | crate::classify::BlockKind::Exec
+        | crate::classify::BlockKind::Random => 16,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MatchRun {
@@ -181,7 +194,7 @@ pub enum CodecMode {
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
 /// weight structure per block boundary, smoothly transferring context without
-/// hard-clearing (which would defeat the 4k-bank specialization).
+/// hard-clearing (which would defeat the 8k-bank specialization).
 const BLOCK_DECAY: f32 = 0.995;
 
 /// Compress `buf` into a `RCN1` container using classifier-aware stacks.
@@ -254,11 +267,18 @@ where
     let global_dict: Option<XwrtDictionary> =
         (mode == CodecMode::Slow).then(|| XwrtDictionary::build_from_data(buf));
 
+    // Prefetched (end, kind) for the next Slow-mode block — filled by overlapping
+    // classify of N+1 while encoding N (bit-identical: encode stays serial).
+    let mut pending_next: Option<(usize, crate::classify::BlockKind)> = None;
+
     while offset < buf.len() {
-        let block = &buf[offset..];
-        let kind = crate::classify::classify(block);
-        let block_size = block_size_for_kind(kind, block, offset, buf.len());
-        let end = (offset + block_size).min(buf.len());
+        let (end, kind) = if let Some((pend_end, pend_kind)) = pending_next.take() {
+            (pend_end, pend_kind)
+        } else {
+            let kind = crate::classify::classify(&buf[offset..]);
+            let block_size = block_size_for_kind(kind, &buf[offset..], offset, buf.len());
+            ((offset + block_size).min(buf.len()), kind)
+        };
         let block_data = &buf[offset..end];
 
         if mode == CodecMode::Slow && last_kind != Some(kind) {
@@ -269,8 +289,36 @@ where
             last_kind = Some(kind);
         }
 
+        let next_start = end;
         let (comp, method, store_orig_len) = match mode {
             CodecMode::Fast => encode_block_fast(block_data, kind),
+            CodecMode::Slow if next_start < buf.len() => {
+                // Overlap classify+size of block N+1 with encode of block N.
+                let ((c, m, o), next) = rayon::join(
+                    || {
+                        encode_block_slow(
+                            block_data,
+                            kind,
+                            &mut models,
+                            &mut mixer,
+                            lzp_idx,
+                            global_dict.as_ref(),
+                        )
+                    },
+                    || {
+                        let next_kind = crate::classify::classify(&buf[next_start..]);
+                        let next_size = block_size_for_kind(
+                            next_kind,
+                            &buf[next_start..],
+                            next_start,
+                            buf.len(),
+                        );
+                        ((next_start + next_size).min(buf.len()), next_kind)
+                    },
+                );
+                pending_next = Some(next);
+                (c, m, o)
+            }
             CodecMode::Slow => encode_block_slow(
                 block_data,
                 kind,
@@ -325,8 +373,8 @@ where
     for e in &entries {
         e.write(&mut out);
     }
-out.extend_from_slice(&payloads);
-        Ok((out, diags))
+    out.extend_from_slice(&payloads);
+    Ok((out, diags))
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
@@ -409,17 +457,17 @@ fn encode_block_slow(
         // For BWT paths, `orig_len` stores the *transformed* length (what the
         // decoder must decode from rANS). The original length is recovered
         // during BWT reversal; correctness is verified by CRC.
-        let comp = compress_block(models, mixer, lzp_idx, &transformed);
+        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind);
         (comp, method, transformed.len())
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
         // making them much more compressible.
         let transformed = crate::model::e8e9::e8e9_transform(block_data);
-        let comp = compress_block(models, mixer, lzp_idx, &transformed);
+        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind);
         (comp, METHOD_EXEC, transformed.len())
     } else {
         // Binary: raw CM with the existing stack.
-        let comp = compress_block(models, mixer, lzp_idx, block_data);
+        let comp = compress_block(models, mixer, lzp_idx, block_data, kind);
         (comp, method_for_kind(kind), block_data.len())
     }
 }
@@ -469,7 +517,9 @@ pub fn build_stack_for_kind(
             (models, MixerBank::new(0), None)
         }
         crate::classify::BlockKind::Text => {
-            // Text stack with Order-8 PPMd + SEE + sparse de Bruijn (promoted to default)
+            // Text stack: orders 0–2, Sparse, Exec, LZP, PPMd+SSM, Word.
+            // IndirectModel was tried with 16k banks (C8); kept in-tree but not
+            // in the default stack after prior dickens regressions.
             let n = 8;
             let models: Vec<Box<dyn BitModel>> = vec![
                 Box::new(crate::model::order::OrderN::new(0)),
@@ -531,8 +581,9 @@ fn compress_block(
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     block: &[u8],
+    kind: crate::classify::BlockKind,
 ) -> Vec<u8> {
-    let runs = scan_matches(block);
+    let runs = scan_matches(block, kind);
     encode_block_with_matches(models, mixer, lzp_idx, block, &runs)
 }
 
@@ -603,18 +654,23 @@ fn encode_block_with_matches(
         m.prepare_block(block);
     }
 
-    // Match side-stream (varint-encoded): [num_runs:u32] then each record as
-    // delta_pos (varint), len (varint), dist (varint).
-    // Positions are delta-encoded so most values are small.
-    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    // Match side-stream: [num_runs:u32][flag:u8][payload_len:u32][payload...]
+    // where payload is varint records (delta_pos, len, dist), optionally
+    // order-0 FSE/rANS-compressed (flag=1) when that shrinks the blob.
+    let mut raw_side = Vec::new();
     let mut prev_pos: usize = 0;
     for r in runs {
         let delta_pos = r.pos.wrapping_sub(prev_pos);
-        write_varint(&mut out, delta_pos);
-        write_varint(&mut out, r.len);
-        write_varint(&mut out, r.dist);
+        write_varint(&mut raw_side, delta_pos);
+        write_varint(&mut raw_side, r.len);
+        write_varint(&mut raw_side, r.dist);
         prev_pos = r.pos;
     }
+    let (flag, payload) = side_fse::pack_side_stream(&raw_side);
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    out.push(flag);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
 
     // Build a position→length map for matched regions.
     let mut match_len_at: Vec<usize> = vec![0; block.len()];
@@ -698,9 +754,10 @@ fn encode_block_with_matches(
     out
 }
 
-fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
+fn scan_matches(block: &[u8], kind: crate::classify::BlockKind) -> Vec<MatchRun> {
     let mut lzp = Lzp::new();
     let n = block.len();
+    let min_len = match_min_len(kind);
 
     // AVG_BITS_PER_BYTE: estimated CM cost per byte for residual cost calculation.
     // A well-trained CM predicts ~3-4 bits/byte on structured data. We use 4.0
@@ -711,16 +768,16 @@ fn scan_matches(block: &[u8]) -> Vec<MatchRun> {
     let window = 4 * 1024 * 1024;
 
     // Phase 1: pre-compute the best match at every position.
-    // best_match[i] = Some((len, dist)) if a match of >= MATCH_MIN_LEN exists at position i.
+    // best_match[i] = Some((len, dist)) if a match of >= min_len exists at position i.
     // The LZP chain walk reports (len, dist) in one pass — no O(window) backward
     // re-scan per position, which was the pathological blow-up on large text blocks.
     let mut best_match: Vec<Option<(usize, usize)>> = vec![None; n];
     for i in 0..n {
         lzp.train_at(block, i);
-        if i + 1 >= 16 && i + MATCH_MIN_LEN <= n {
+        if i + 1 >= min_len && i + min_len <= n {
             if let Some((len, dist)) = lzp.best_match(block, i) {
                 let len = len.min(255);
-                if len >= MATCH_MIN_LEN && dist > 0 && dist <= window {
+                if len >= min_len && dist > 0 && dist <= window {
                     best_match[i] = Some((len, dist));
                 }
             }
@@ -858,26 +915,40 @@ fn decode_block_with_matches(
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
-    if comp.len() < 4 {
+    // Header: [num_runs:u32][flag:u8][payload_len:u32] = 9 bytes minimum.
+    if comp.len() < 9 {
         return Err(RcnError::InvalidContainer(
             "match side-stream too short".into(),
         ));
     }
     let num_runs = u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]) as usize;
-    let mut offset = 4;
+    let flag = comp[4];
+    let payload_len = u32::from_le_bytes([comp[5], comp[6], comp[7], comp[8]]) as usize;
+    let payload_start: usize = 9;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| RcnError::InvalidContainer("match side-stream length overflow".into()))?;
+    if payload_end > comp.len() {
+        return Err(RcnError::InvalidContainer(
+            "match side-stream truncated".into(),
+        ));
+    }
+    let raw_side = side_fse::unpack_side_stream(flag, &comp[payload_start..payload_end])
+        .map_err(|()| RcnError::InvalidContainer("corrupt match side-stream entropy".into()))?;
 
     // Read all match records (varint-encoded delta positions).
     let mut runs: Vec<MatchRun> = Vec::with_capacity(num_runs);
     let mut prev_pos: usize = 0;
+    let mut offset = 0usize;
     for _ in 0..num_runs {
-        let (delta_pos, new_offset) = read_varint(comp, offset).ok_or_else(|| {
+        let (delta_pos, new_offset) = read_varint(&raw_side, offset).ok_or_else(|| {
             RcnError::InvalidContainer("truncated match record (delta_pos)".into())
         })?;
         offset = new_offset;
-        let (len, new_offset) = read_varint(comp, offset)
+        let (len, new_offset) = read_varint(&raw_side, offset)
             .ok_or_else(|| RcnError::InvalidContainer("truncated match record (len)".into()))?;
         offset = new_offset;
-        let (dist, new_offset) = read_varint(comp, offset)
+        let (dist, new_offset) = read_varint(&raw_side, offset)
             .ok_or_else(|| RcnError::InvalidContainer("truncated match record (dist)".into()))?;
         offset = new_offset;
         let pos = prev_pos.wrapping_add(delta_pos);
@@ -885,7 +956,8 @@ fn decode_block_with_matches(
         runs.push(MatchRun { pos, len, dist });
     }
 
-    let mut dec = BitDecoder::new(&comp[offset..]).map_err(|e| RcnError::Entropy(e.to_string()))?;
+    let mut dec =
+        BitDecoder::new(&comp[payload_end..]).map_err(|e| RcnError::Entropy(e.to_string()))?;
     let mut out = Vec::with_capacity(orig_len);
     let mut probs: [u16; 12] = [2048; 12];
     let n = models.len();
@@ -1262,12 +1334,12 @@ mod tests {
     #[test]
     fn scan_matches_finds_repeats() {
         let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
-        let runs = scan_matches(data);
+        let runs = scan_matches(data, crate::classify::BlockKind::Text);
         assert!(
             !runs.is_empty(),
             "expected at least one match in repeated data"
         );
-        assert!(runs[0].len >= MATCH_MIN_LEN);
+        assert!(runs[0].len >= match_min_len(crate::classify::BlockKind::Text));
     }
 
     #[test]
@@ -1280,7 +1352,7 @@ mod tests {
             x ^= x << 5;
             *b = x as u8;
         }
-        let runs = scan_matches(&data);
+        let runs = scan_matches(&data, crate::classify::BlockKind::Binary);
         assert!(runs.is_empty(), "expected no matches in random data");
     }
 

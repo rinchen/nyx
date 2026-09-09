@@ -17,11 +17,14 @@ ans = "0.4.0"
 divsufsort = "2"
 mimalloc = "0.1"
 rayon = "1"
+libsais-rs = { version = "0.2.2", default-features = false, optional = true }
 
 [features]
 default = ["two_pass"]
 two_pass = []
 no_avx2 = []
+# Optional libsais SA-IS BWT backend (pure-Rust libsais-rs). Default remains divsufsort.
+bwt_libsais = ["dep:libsais-rs"]
 
 [dev-dependencies]
 criterion = "0.5"

@@ -9,10 +9,14 @@
 //! Pipeline (encode):  data → BWT → MTF → RLE0 → [CM/rANS]
 //! Pipeline (decode):  [rANS/CM] → RLE0⁻¹ → MTF⁻¹ → BWT⁻¹ → data
 //!
-//! BWT uses `divsufsort` for O(n) suffix-array construction. Rotation-based BWT is used
-//! (via doubled string) to avoid sentinel collisions when data contains null bytes. The
-//! LF-mapping walk forms a single cycle guaranteed by the cyclic rotation ordering.
+//! BWT suffix-array backend:
+//! - **Default**: `divsufsort` (O(n) SA on the doubled string).
+//! - **Optional** (`bwt_libsais` feature): pure-Rust `libsais-rs` SA-IS on the same
+//!   doubled string. Streams stay structurally compatible (primary index + BWT string);
+//!   bit-identical SA order across backends is *not* required — inverse must match the
+//!   forward of the *same* backend.
 
+#[cfg(not(feature = "bwt_libsais"))]
 use divsufsort::sort as divsufsort_sort;
 
 // ---------------------------------------------------------------------------
@@ -119,6 +123,25 @@ pub fn mtf_inverse(data: &[u8]) -> Vec<u8> {
 // BWT (rotation-based via doubled string)
 // ---------------------------------------------------------------------------
 
+/// Build a suffix array for `data` (positions into `data`).
+///
+/// Default: divsufsort. With `bwt_libsais`: libsais-rs SA-IS.
+fn build_sa(data: &[u8]) -> Vec<usize> {
+    #[cfg(feature = "bwt_libsais")]
+    {
+        let n = data.len();
+        let mut sa = vec![0i32; n];
+        let rc = libsais_rs::libsais(data, &mut sa, 0, None);
+        debug_assert_eq!(rc, 0, "libsais failed with code {rc}");
+        sa.into_iter().map(|p| p as usize).collect()
+    }
+    #[cfg(not(feature = "bwt_libsais"))]
+    {
+        let sa = divsufsort_sort(data);
+        sa.into_parts().1.iter().map(|&p| p as usize).collect()
+    }
+}
+
 /// Forward Burrows-Wheeler transform.
 ///
 /// Sorts all cyclic rotations of `data` (using the doubled-string SA trick to avoid
@@ -137,8 +160,7 @@ pub fn bwt_forward(data: &[u8]) -> Vec<u8> {
     doubled.extend_from_slice(data);
     doubled.extend_from_slice(data);
 
-    let sa = divsufsort_sort(&doubled);
-    let sa: Vec<usize> = sa.into_parts().1.iter().map(|&p| p as usize).collect();
+    let sa = build_sa(&doubled);
 
     // Collect only suffixes starting at positions 0..n (rotations of the original).
     let mut bwt = Vec::with_capacity(n);
@@ -660,8 +682,9 @@ const TRIAL_MAX_SHANNON: f32 = 7.2;
 /// also tried: the block is split into 4 streams and each is BWT-trialed independently.
 ///
 /// When `global_dict` is `Some`, a fifth path (`XwrtBwtMtfRle`) is tried: the
-/// corpus-wide word dictionary is applied before BWT. XWRT tokens live in
-/// `0x80..=0xFF`, so the trial is gated on the block being pure ASCII — high
+/// corpus-wide word dictionary is applied before BWT. XWRT tokens use
+/// `0x80..=0xFE` (and `0xFF` ESC + u16 for larger ids), so the trial is gated
+/// on the block being pure ASCII — high literal bytes would collide with tokens.
 /// literal bytes would alias tokens and break the round-trip.
 pub fn compress_text_with_trial(
     data: &[u8],

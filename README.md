@@ -43,26 +43,31 @@ per byte than those, in exchange for better ratio on the right inputs.
 ## TODO - Remaining Optimization Tasks
 
 ### Compression - beat zstd -19
-- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – promoted to default for Text blocks; fixed config keeps WordModel + 8k banks + 32MB window + XWRT
-- ✅ **Compress the match side-stream** – implemented varint encoding (delta_pos, len, dist) packed into the stream; saves 30-40% of the side-stream = ~0.5-1pt back on mr/massive_json
-- ✅ **Global XWRT dictionary** – one corpus-wide pass builds a global top-128 dictionary stored once in the container header; every Text-block XWRT trial reuses it (per-block dictionaries removed). Measured: dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral
+- ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – WordModel + banks + 32MB window + XWRT
+- ✅ **Compress the match side-stream (varint)** – delta_pos/len/dist varints
+- ✅ **Global XWRT dictionary (top-128)** – corpus-wide; C5 measured dickens −4.6pt, webster −4.0pt
+- ✅ **C6 — Global XWRT 128 → 512 with ESC tokens** – `0x80..=0xFE` for ids 0..126; `0xFF || u16_le(id)` for 127..511 (ESC slots only for words longer than 3 bytes so tokens never expand); header dict count is `u16`
+- ✅ **C7 — Adaptive DP LZP threshold** – Text ≥12; Binary/Exec/Random stay 16 (`≥24` on Binary/Exec regressed mr and was reverted)
+- ✅ **C8 — 16k banks** – `NUM_MIXERS=16384` (14-bit hash). Single IndirectModel tried again; **left out of default Text stack** (prior dickens regression); model remains in-tree
+- ✅ **C9 — FSE-family match side-stream** – order-0 byte rANS on the varint blob when smaller (`[num_runs][flag][len][payload]`)
 
 ### Speed - achieve 20+ MB/s
-- **Interleaved rANS** – wired into the fast path (`RansByteEncoder32`/`Decoder32`). Speed pass #4 found no gain while `walk_dist`'s linear scan dominated; that scan is now AVX2 SIMD, so the win is unverified — re-bench
-- **Parallel blocks** – wired: webster 40MB goes ~0.7 MB/s → ~4-5 MB/s on 8 cores, bit-identical
-- **Replace rotation-based BWT with libsais** – deferred (SA-IS O(n) would be 5-10x faster BWT); the last remaining speed lever for Text blocks
+- ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~2–5 MB/s cmp / ~4–10 MB/s dec (see Benchmarks)
+- ✅ **Parallel BWT trials (S5 partial)** – `rayon::join` for path B/C inside a block trial
+- ✅ **S9 — Optional libsais BWT backend** – `--features bwt_libsais` uses pure-Rust `libsais-rs`; default remains `divsufsort`
+- ✅ **S10 — Classify-ahead pipeline** – `rayon::join` overlaps classify+size of block N+1 with encode of N (encode stays serial / bit-identical)
 
 ### Other Completed
-- **S1-S7, C1-C4, C5 (global XWRT)** – all optimization items implemented and verified
-- **CI fixes** – Node 20 deprecation resolved (`actions/checkout@v5`); bytecodec AVX2 prefix-sum repaired (x86_64-only debug overflow); CI now runs tests with the `no_avx2` feature to disable the x86_64-only AVX2 path, which is not yet verified on Linux runners
-- **Pre-commit hook** – `.pre-commit-config.yaml` mirrors the CI gate (`cargo build` + `cargo test`) plus an all-targets check
-- **Benchmarks** – table updated with new optimization results
+- **S1–S4, S7, C1–C5** – SIMD walk_dist, SoA banks, stretch reuse, mimalloc, SSE/APM, global XWRT-128, etc.
+- **CI fixes** – `no_avx2` feature for Linux CI scalar path
+- **Pre-commit hook** – mirrors the CI gate
 
+Gap to beat `zstd -19` on text still tracked in the headline table (dickens/webster). nci / mr / json already win.
 ## The method
 
 > **Status: actively improving.** Rcn ships two entropy paths:
 > `--mode slow` (the bit-level 8–9 model logistic mixer with a two-level
-> 8k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
+> 16k-bank hierarchy) and `--mode fast` (a PPM-style single-context count
 > coder + byte rANS). The benchmark target is beating `zstd -19` on
 > text + mixed corpora, with `FSE` as a secondary reference. See
 > [Benchmarks](#benchmarks) for the numbers.
@@ -77,14 +82,14 @@ by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 
 The bit-level path runs an **online logistic mixer hierarchy**:
 
-1. **Bank mixers** (8192 instances): selected by a context hash of byte-class,
+1. **Bank mixers** (16384 instances): selected by a context hash of byte-class,
    bit-position, order-1/order-2 bytes, and word-hash. Each bank specializes
    weights to its context, avoiding the ~50% saturation a single mixer hits
    on repetitive corpora.
 2. **Global mixer**: a context-agnostic fallback over the same models.
 3. **Master mixer**: blends `[p_bank, p_global, p_lzp_conf]` in logistic space.
 
-Only the selected bank + global + master are trained per bit — never all 8192.
+Only the selected bank + global + master are trained per bit — never all 16384.
 At block boundaries, weights are **decayed** (not reset), preserving learned
 structure across the stream. The fused probability drives an rANS bit coder
 (via the audited [`ans`](https://crates.io/crates/ans) crate).
@@ -141,11 +146,11 @@ GitHub Actions runs on `ubuntu-latest` (x86_64) where the AVX2 SIMD path in
 Linux runners, CI runs tests with the `no_avx2` feature to exercise the scalar
 path only; local builds still use AVX2 by default on x86_64.
 
-### Compression levels
-The CLI currently offers two modes (`--mode slow` / `--mode fast`) representing the
-bit-level and byte-level entropy paths respectively. Future work includes numbered
-compression levels (`-1` fastest / `-9` strongest) analogous to `zstd`.
-
+### Compression modes
+The CLI exposes two entropy paths: `--mode slow` (bit-level CM, higher ratio,
+default) and `--mode fast` (byte-level CM, faster). Named multi-level presets
+(`-1`…`-9` analogous to zstd) are out of scope until the strong path beats
+`zstd -19` on text and the fast path has a clear speed floor.
 ### Streaming / `--stdout`
 The `compress` and `decompress` subcommands accept `-` as input/output path for
 stdin/stdout piping. Per-block progress/stats (`--verbose`) are planned for a
@@ -153,25 +158,35 @@ future release.
 
 ## Benchmarks
 
-> **Both ratio and speed, on every run.** rcn codes bit-by-bit, so a fair
-> comparison must report both axes. Full-corpus (12-file Silesia + mixed)
-> numbers are expensive at ~1.5 MB/s, so the headline table below is a
-> representative **5-file subset** (dickens, webster, nci, mr, json).
-> `ratio%` is the compressed size as a percentage of the original (lower is
-> better); speed is in MB/s (higher is better). Full data is in the
+> **Both ratio and speed, on every run.** rcn codes bit-by-bit on the slow path,
+> so a fair comparison must report both axes. The headline table below is a
+> representative **5-file subset** (dickens, webster, nci, mr, json) under
+> `--mode slow`. Fast-path numbers are in the Speed bullet. `ratio%` is the
+> compressed size as a percentage of the original (lower is better); speed is
+> in MB/s (higher is better). Full data is in the
 > [experiments log](#experiments-log-2026-09).
 
-### Current (hybrid_ppm3 + two-level 8k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 transform + corpus-wide global XWRT dictionary before BWT + SSE/APM/APM2 cascade + AVX2 SIMD walk_dist + stretch-value reuse + delta transform for Binary + mimalloc allocator)
+### Current slow path (hybrid_ppm3 + two-level 16k-bank mixer + classifier-aware method bytes + word model + cross-block decay + 32MB LZP window + BWT text trial + JSON stream splitting + DP optimal LZP parse default + Exec E8E9 + global XWRT-512 ESC + SSE/APM/APM2 + adaptive DP thresholds + side-stream FSE-family + classify-ahead + mimalloc)
 
 | file | orig (KB) | rcn ratio% | rcn cmp MB/s | rcn dec MB/s | zstd -1 ratio% | zstd -1 cmp MB/s | zstd -1 dec MB/s | zstd -19 ratio% | zstd -19 cmp MB/s | zstd -19 dec MB/s | FSE ratio% | FSE cmp MB/s | FSE dec MB/s | ratio winner | speed winner |
 |------|----------:|-----------:|-------------:|-------------:|---------------:|-----------------:|-----------------:|---------------:|-----------------:|-----------------:|-----------:|-------------:|-------------:|:------------:|:------------:|
-| dickens | 9953.6 | **33.2** | **0.5** | **0.4** | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **rcn** | **zstd -19** |
-| webster | 40487.0 | **23.6** | **0.7** | **0.5** | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **rcn** | **zstd -19** |
+| dickens | 9953.6 | **40.2** | **0.04** | **0.04** | 41.7 | 496.1 | 2837.1 | 28.0 | 3.3 | 288.9 | 57.0 | 375.6 | 463.7 | **zstd -19** | **zstd -19** |
+| webster | 40487.0 | **23.6** | **0.7** | **0.5** | 33.5 | 404.5 | 1219.8 | 21.1 | 4.0 | 720.6 | 62.6 | 424.6 | 507.9 | **zstd -19** | **zstd -19** |
 | nci | 32767.0 | **7.4** | **0.7** | **0.5** | 85.2 | 376.9 | 3218.9 | 49.5 | 3.9 | 1626.0 | 30.2 | 326.7 | 335.9 | **rcn** | **zstd -19** |
-| mr | 9736.9 | **20.6** | **0.5** | **0.5** | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **rcn** | **zstd -19** |
-| json | 478.5 | **0.0** | **0.5** | **0.5** | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **rcn** | **zstd -19** |
+| mr | 9736.9 | **27.3** | **0.04** | **0.04** | 38.5 | 551.2 | 1008.8 | 31.2 | 5.6 | 291.2 | 44.0 | 233.2 | 229.3 | **rcn** | **zstd -19** |
+| json | 478.5 | **0.1** | **4.0** | **28** | 0.3 | 12173.7 | 35691.0 | 0.1 | 36824.1 | 36824.1 | 52.8 | 1649.5 | 1251.9 | **rcn**/tie | **zstd -19** |
 
-(`~` = zstd/FSE rounds to 0 on a KB-normalized basis.)
+Notes: dickens/json/mr slow ratios re-measured 2026-09-09 (HEAD dickens **41.3%**; C6 ≈−1.1pt). mr 27.3% was with Binary LZP min=24; C7 since softened to keep Binary/Exec at 16 (re-measure pending). webster/nci slow ratios are prior figures. zstd/FSE columns unchanged.
+
+### Fast path (`--mode fast`) re-bench 2026-09-09
+
+| file | orig (KB) | rcn ratio% | cmp MB/s | dec MB/s |
+|------|----------:|-----------:|---------:|---------:|
+| dickens | 9953.6 | 26.9 | 2.0 | 4.3 |
+| webster | 40487.0 | 20.3 | 2.7 | 5.5 |
+| nci | 32767.0 | 5.1 | 5.1 | 10.6 |
+| mr | 9736.9 | 35.0 | 2.6 | 4.0 |
+| json | 478.5 | 0.1 | 5.2 | 59.1 |
 
 ### DP-optimal LZP parse (now default)
 
@@ -191,25 +206,21 @@ DP optimal LZP parse runs a forward LZP match pre-pass and emits `(len, dist)` r
 
 ### Reading the table
 
-- **Ratio:** lower % is better. rcn wins on `nci`, `mr`, and `json` (see the
-  **ratio winner** column); it is close to zstd -1 on webster (35.1% vs zstd-1's
-  33.5% — BWT trial narrows the gap from 50.4%→35.1%). zstd `-19` still dominates
-  on text and high-redundancy structured data, so the current optimization stage
-  is measured against `zstd -19`; `zstd -1` remains a fast/low-level secondary
-  reference.
+- **Ratio:** lower % is better. On the current stack, rcn **beats `zstd -19`** on
+  `nci` and `mr`, and ties/beats on small `json`. On text, `zstd -19` still leads:
+  dickens 40.2% vs 28.0% (rcn still beats `zstd -1` at 41.7%), webster gap TBD on
+  full re-bench. Historical experiment numbers (e.g. older webster 35.1% / claimed
+  33.2% dickens) are in the experiments log — the headline dickens figure above is
+  a 2026-09-09 re-measure (prior README 33.2% did not reproduce on this tree/machine;
+  HEAD was 41.3% before C6).
 
-  Note: `json` now achieves 0.1% ratio (vs 3.0% with raw CM) because BWT turns
-  long-range word repeats into local MTF zero-runs that RLE0 + CM compress to
-  near-entropy. The two-level bank mixer hierarchy also excels at
-  repetitive-but-structured data where context switches matter. On **large JSON**
-  (5.4MB, 22MB), rcn's JSON stream splitting + per-stream BWT trial **beats
-  zstd -1 and even zstd -19** (json 5.4MB: rcn 2.7% vs zstd-1 2.5% vs zstd-19 1.8%;
-  json 22MB: rcn 0.81% vs zstd-1 2.48% vs zstd-19 1.35%).
-
-- **Speed:** higher MB/s is better. **Slow path** (`--mode slow`, bit-level CM):
-  ~0.03 MB/s compress single-threaded (dickens 2 MiB→~54 s wall; 256 KB→10.0 s, 512 KB→20.0 s, 1 MiB→27.9 s).  
-  **Fast path** (`--mode fast`, byte-level CM + 32‑wide interleaved rANS + AVX2 SIMD walk_dist): 2–5 MB/s compress / 8–10 MB/s decode (measured: dickens 2.1/4.2, webster 2.7/5.4, nci 5.1/10.1, mr 2.6/3.9, json 5.2/58.9 MB/s).  
-  zstd `-1` is ~400–12000 MB/s compress / ~1000–36000 MB/s decode; zstd `-19` is ~3–4 MB/s compress / ~200–900 MB/s decode; FSE is ~200–1600 MB/s both ways.
+- **Speed:** higher MB/s is better.
+  **Slow path** (`--mode slow`): ~0.04 MB/s on large text on this machine (bit-level
+  CM); small JSON is much faster when BWT collapses the stream.
+  **Fast path** (`--mode fast`): ~2–5 MB/s compress / ~4–10 MB/s decode after AVX2
+  `walk_dist` + interleaved rANS (see fast-path table). Still short of the 20+ MB/s
+  goal.
+  zstd `-1` is hundreds–thousands of MB/s; zstd `-19` is ~3–4 MB/s compress.
 
 ### New optimization target (2026-09)
 
@@ -269,31 +280,20 @@ secondary.
 
 ## Speed roadmap (2026-09)
 
-The fast path (`--mode fast`) has the full speed stack in place. The slow
-path (`--mode slow`) still dominates on some inputs; the remaining levers, in
-priority order:
-
-1. **SoA weight layout for the 8192 banks** — contiguous weight arrays instead
-   of per-bank `Vec`, replacing pointer-chase fetches with a single cache line.
-   Bit-identical, ratio-neutral. **Completed**.
-2. **Stretch-value reuse** — carry stretch bucket lookups through `MixerAcc`
-   to avoid ~11 table re-lookups per bit. **Completed**.
-3. **Wider stride / context model** — increase the number of models or the
-   order-2 context size. **Completed** (8192 banks, 13-bit context hash).
-4. **Parallel blocks** — clone decayed state per rayon thread for near-linear
-   speedup on large files (webster 40MB). **Completed**.
-5. **Faster BWT** — replace rotation-based doubled string filter SA with libsais
-   SA-IS O(n) algorithm. 5-10x BWT trial speedup.
-6. **mimalloc allocator** — BWT trial does many Vec allocations; a better
-   allocator reduces overhead. **Completed**.
+1. **SoA weight layout** — **Completed**.
+2. **Stretch-value reuse** — **Completed**.
+3. **Wider stride / 16k banks** — **Completed** (16384 banks, 14-bit hash).
+4. **Parallel BWT trials** — intra-block `rayon::join`. **Partial (S5)**.
+5. **S8 — Interleaved rANS re-bench** — **Completed** (wired; fast-path table above).
+6. **S9 — Optional libsais BWT** — `--features bwt_libsais`. **Completed**.
+7. **S10 — Classify-ahead pipeline** — **Completed**.
+8. **mimalloc** — **Completed**.
 
 ## Potential ratio improvements (remaining)
 
-All compression tickets (C1-C4) and the corpus-wide global XWRT dictionary are
-now completed. The only remaining optimization is S6 (Faster BWT with libsais
-SA-IS), which is deferred due to implementation complexity.
-
-Full details and tracking: see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
+C6–C9 are implemented (IndirectModel left out of the default Text stack after
+re-test). Further gains toward `zstd -19` on text likely need new modeling, not
+more of the same tickets. See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ## License
 

@@ -1,7 +1,7 @@
 # Rcn Optimization Opportunity Log
 
-Last updated: 2026-09-08
-Test status: 138/138 passing
+Last updated: 2026-09-09
+Test status: 143/143 passing
 
 ---
 
@@ -9,11 +9,15 @@ Test status: 138/138 passing
 
 | # | Ticket | Description | Expected Gain | Status |
 |---|--------|-------------|---------------|--------|
-| C1 | Wire SSE/APM/APM2 cascade | `SseApmCascade` exists in `src/model/sse_apm.rs` and is integrated in slow-path encoder/decoder. Measured: nci -0.9pt, mr -0.8pt, dickens -0.3pt, webster -0.5pt, json -0.1pt | -2-4pt on text files | Completed |
-| C2 | Re-benchmark fixed PPMd config | Order-8 PPMd with SEE + sparse de Bruijn (CTX_BITS=18, matching hybrid_ppm3). Previous +0.8pt webster was with broken config. | +1.5-2pt on webster | Completed |
-| C3 | XWRT dictionary before BWT | Build top 2k words per Text block, replace with 0x80+id cap bits, then BWT→MTF→RLE0→CM. How cmix gets text wins. | 2-4pt on dickens/webster | Completed |
-| C4 | Exec/Binary transforms | DP-optimal LZP parse promoted to default (isolated from SSM); E8E9 for Exec; delta/stride for Binary | 2-5pt on mr/nci | DP default + E8E9 + delta/stride completed |
-| C5 | **Corpus-wide global XWRT dictionary** | First pass over the whole corpus builds a top-128 word dictionary stored once in the container header (flags bit 0). Every Text-block XWRT trial reuses it — per-block dict bytes removed from payloads. Gated on pure-ASCII blocks (tokens 0x80-0xFF alias high literal bytes). Measured: dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral (byte-identical output), json 458→299B. Also fixed latent serialization bug: `len() as u8` truncated dicts >255 words to zero; word scan now drops >255-byte breakless runs (base64/garbage). | −4-5pt on text | Completed (2026-09-08) |
+| C1 | Wire SSE/APM/APM2 cascade | Integrated in slow-path encoder/decoder. | -2-4pt on text | Completed |
+| C2 | Re-benchmark fixed PPMd config | Order-8 PPMd with SEE + sparse de Bruijn. | +1.5-2pt on webster | Completed |
+| C3 | XWRT dictionary before BWT | Per-block XWRT before BWT→MTF→RLE0→CM. | 2-4pt on text | Completed |
+| C4 | Exec/Binary transforms | DP-LZP default; E8E9; delta/stride. | 2-5pt on mr/nci | Completed |
+| C5 | Corpus-wide global XWRT-128 | Top-128 dict once in header. | −4-5pt on text | Completed |
+| C6 | Global XWRT 128 → 512 with ESC | `0x80..=0xFE` ids 0..126; `0xFF\|\|u16` ids 127..511; ESC only for words len>3; header count `u16`. Measured dickens ~41.3%→~40.2% (−1.1pt) vs HEAD on this machine. | −1 to −2pt on text | Completed |
+| C7 | Adaptive DP LZP threshold | Text ≥12; Binary/Exec stay 16 (≥24 regressed mr). | Help text; avoid mr hit | Completed |
+| C8 | 16k banks + indirect | `NUM_MIXERS=16384` (14-bit). IndirectModel tried; **not in default Text stack** (prior regression). | Banks kept; indirect shelved | Completed (banks); indirect in-tree only |
+| C9 | FSE-family match side-stream | Order-0 byte rANS on varint blob when smaller. | ∼0.5–1pt | Completed |
 
 ---
 
@@ -21,51 +25,42 @@ Test status: 138/138 passing
 
 | # | Ticket | Description | Expected Gain | Status |
 |---|--------|-------------|---------------|--------|
-| S1 | SIMD-accelerated `walk_dist` | Linear 256-probability scan in `ByteCountModel::walk_dist` is fast-path bottleneck (~90% of encode+decode time). AVX2/AVX-512 cumulative counts. Also applicable to slow path. | 5-10x on fast path | Completed |
-| S2 | SoA weight layout for 8192 banks | Contiguous weight arrays instead of per-bank `Vec`, single cache line fetch. Bit-identical, ratio-neutral. | 10-20% slow path | Completed |
-| S3 | Stretch-value reuse | Precompute stretch values in `mix_acc`/`update_from_acc` to avoid 11 table re-lookups per bit. | Small improvement | Completed |
-| S4 | Wider stride / context model | Increase number of models or order-2 context size. | Known gain | Completed |
-| S5 | Parallel blocks | Clone decayed state per rayon thread - near-linear speedup on webster 40MB. | Near-linear | Completed |
-| S6 | Faster BWT (libsais SA-IS) | Replace rotation-based doubled string filter SA with SA-IS O(n). | 5-10x BWT trial | Deferred |
-| S7 | Allocator (mimalloc) | BWT trial does many Vec allocations. | Small | Completed |
+| S1 | SIMD `walk_dist` | AVX2 cumulative counts. | 5-10x fast path | Completed |
+| S2 | SoA weight layout | Contiguous bank weights. | 10-20% slow | Completed |
+| S3 | Stretch-value reuse | Precompute stretch in mix/update. | Small | Completed |
+| S4 | Wider stride / context | More models / context bits. | Known gain | Completed |
+| S5 | Parallel BWT trials | `rayon::join` path B/C. | Modest | Partial |
+| S6 / S9 | libsais BWT backend | Optional `bwt_libsais` feature (`libsais-rs`); default `divsufsort`. | BWT trial speed | Completed (optional) |
+| S7 | mimalloc | Allocator. | Small | Completed |
+| S8 | Interleaved rANS re-bench | Already wired; re-benched after AVX2 walk_dist. | Confirm MB/s | Completed |
+| S10 | Classify-ahead pipeline | `rayon::join` classify N+1 while encode N. | Overlap classify | Completed |
 
 ---
 
 ## Current Stack (What Works)
 
 ### Slow Path (`--mode slow`, default)
-- 8-9 bit models + two-level 8k-bank mixer hierarchy + master mixer
-- SSE/APM/APM2 cascade refinement
-- Cross-block weight decay (0.995)
-- 32MB LZP window for Text blocks
-- BWT text trial (6 paths: RawCM / BWT+MTF+RLE0+CM / LZP+BWT+MTF+CM / JSON split / XWRT global-dict+BWT / global XWRT itself)
-- Corpus-wide global XWRT dictionary (top-128 words, stored once in container header; XWRT trial gated on pure-ASCII blocks)
-- Exec E8E9 transform (x86 relative → absolute offsets)
-- rANS bit coder (ans crate)
-- DP-optimal LZP parse (default) — runs forward LZP match pre-pass, emits (len, dist) records for matches ≥ 16 bytes, skips matched bytes in rANS stream
+- 8 bit models (Text) + two-level **16k**-bank mixer hierarchy + master mixer
+- SSE/APM/APM2 cascade; cross-block decay 0.995; 32MB LZP window
+- BWT text trial + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
+- Match side-stream: varint + optional order-0 rANS (C9)
+- Classify-ahead Rayon overlap (S10)
 
 ### Fast Path (`--mode fast`)
-- Orders 0-2 count models + byte rANS
-- Deterministic order selection
-- 32-way interleaved byte rANS (in-tree, not wired out)
-- PPM-style cumulative walk_dist (AVX2 SIMD-accelerated)
-- Classifier-aware method bytes
+- Orders 0-2 count models + **wired** 32-way interleaved byte rANS
+- AVX2 SIMD walk_dist
 
 ---
 
-## Recommended Next Step (User Suggestion)
+## Recommended Next Step
 
-> "If you want one big win: do **#1 SIMD walk_dist + wire SSE/APM**. walk_dist fix makes interleaved rANS actually matter, and SSE/APM gets you webster 35.1%→~33% beating zstd -1 without touching slow path."
+Re-bench the full 5-file slow subset after each ratio ticket; chase remaining gap to `zstd -19` on webster/dickens. Optional: re-try a lighter indirect context now that SoA/16k banks are in place.
 
 ---
 
 ## Test Log
 
-| Date | Commit | Tests | Notes |
-|------|--------|-------|-------|
-| 2026-09-06 | 740f11a | 127/127 pass | All tests green |
-| 2026-09-07 | 6b7bc3c | 132/132 pass | XWRT dict + E8E9 + SIMD walk_dist done |
-| 2026-09-07 | (this session) | 135/135 pass | DP-optimal LZP promoted to default |
-| 2026-09-08 | (uncommitted) | 138/138 pass | Corpus-wide global XWRT dictionary (C5): dickens −4.6pt, webster −4.0pt, nci −1.5pt, mr neutral |
-
----
+| Date | Notes |
+|------|-------|
+| 2026-09-08 | C5 global XWRT-128 |
+| 2026-09-09 | Docs truth; C6–C9 / S8–S10; 143 tests; dickens HEAD 41.3% → C6 stack ~40.2% |

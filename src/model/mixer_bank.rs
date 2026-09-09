@@ -1,26 +1,26 @@
 //! Two-level context-mixing hierarchy: bank mixers → global mixer → master mixer.
 //!
 //! CMIX / PAQ8 use a multi-layer mixer stack:
-//!   1. **Bank mixers** (8192 instances): each selected by a context hash of
+//!   1. **Bank mixers** (16384 instances): each selected by a context hash of
 //!      order-1 / order-2 / word-context + bit position. One logistic mixer
 //!      saturates at ~50% on repetitive corpora (dickens); per-context banks
 //!      avoid this by specializing weights per context.
 //!   2. **Global mixer**: a single shared logistic mixer over the same models,
 //!      providing a context-agnostic fallback prediction.
 //!   3. **Master mixer**: blends `[p_bank, p_global, p_lzp]` in logistic space.
-//!      Only the master + the selected bank are trained per bit — never all 8192.
+//!      Only the master + the selected bank are trained per bit — never all 16384.
 //!
 //! Cross-block persistence: bank and master weights are **decayed** (not reset)
 //! at block boundaries, preserving learned structure across the stream.
 //!
-//! Memory: 8192 mixers × 8 models × (1 base + 8 pos) × 4 bytes ≈ 2.2 MB for the
-//! banks, plus 2 mixers (global + master) ≈ 2.2 MB total.
+//! Memory: 16384 mixers × 8 models × (1 base + 8 pos) × 4 bytes ≈ 4.5 MB for the
+//! banks, plus 2 mixers (global + master).
 
 use crate::model::mixer::{LogisticMixer, W_INIT};
 use crate::model::ByteAssembler;
 
-/// Number of mixer instances in the bank. 8192 gives 13 bits of context selection.
-pub const NUM_MIXERS: usize = 8192;
+/// Number of mixer instances in the bank. 16384 gives 14 bits of context selection.
+pub const NUM_MIXERS: usize = 16384;
 
 /// Byte classes for mixer selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,14 +51,16 @@ impl ByteClass {
 
 /// Compute the bank ID from context.
 ///
-/// Uses a 13-bit hash: `(byte_class << 10) | (bit_pos << 7) | (order1 << 5) | (order2 << 3) | word_hash`
+/// Uses a 14-bit hash:
+/// `(byte_class << 11) | (bit_pos << 8) | (order1 << 5) | (order2 << 2) | (word_hash & 3)`
 ///
 /// The bit position is folded into the bank ID so each (context, bit-position) pair
 /// gets its own weight vector — this is why the per-bit-position win worked:
 /// text bytes have very different bit distributions per position.
 ///
 /// `order2_byte` is the byte before `order1_byte`, providing two levels of
-/// backward context for bank selection.
+/// backward context for bank selection. Two bits of `word_hash` use the extra
+/// bank bit relative to the older 13-bit / 8192 layout.
 pub fn mixer_id(
     byte_class: ByteClass,
     bit_pos: u8,
@@ -70,8 +72,8 @@ pub fn mixer_id(
     let bp = (bit_pos as usize) & 0x7;
     let o1 = (order1_byte as usize) & 0x7;
     let o2 = (order2_byte as usize) & 0x7;
-    let wh = (word_hash as usize) & 0x1;
-    ((class_bits << 10) | (bp << 7) | (o1 << 5) | (o2 << 3) | wh) & 0x1FFF
+    let wh = word_hash & 0x3;
+    ((class_bits << 11) | (bp << 8) | (o1 << 5) | (o2 << 2) | wh) & 0x3FFF
 }
 
 /// Reusable per-bit accumulator state from [`MixerBank::mix_acc`].
@@ -88,7 +90,7 @@ pub struct MixerAcc {
     master_probs: [u16; 3],
 }
 
-/// Two-level mixer: 8192 bank mixers + a global mixer + a master mixer.
+/// Two-level mixer: 16384 bank mixers + a global mixer + a master mixer.
 ///
 /// - `mixers`: context-specific bank selected by `mixer_id`. Only the selected
 ///   bank is trained per bit.
@@ -251,7 +253,7 @@ impl MixerBank {
 /// Train the selected bank mixer, the global mixer, and the master mixer.
     ///
     /// Only three mixers are touched per bit: the context-selected bank, the
-    /// global, and the master. Not all 8192. This is the key performance
+    /// global, and the master. Not all 16384. This is the key performance
     /// property of the two-level hierarchy.
     ///
     /// Returns the master mixer's predicted probability for this bit.
@@ -420,14 +422,14 @@ mod tests {
     }
 
     #[test]
-    fn memory_under_3mb() {
+    fn memory_under_6mb() {
         let bank = MixerBank::new(8);
         let bytes = bank.memory_bytes();
-        // SoA layout: 8192 banks × 8 models × (4 + 32 + 4) = ~2.5MB for banks,
+        // SoA layout: 16384 banks × 8 models × (4 + 32 + 4) ≈ 5.2MB for banks,
         // plus global/master mixers.
         assert!(
-            bytes < 3_000_000,
-            "MixerBank with 8 models should be <3 MB: got {} bytes",
+            bytes < 6_000_000,
+            "MixerBank with 8 models should be <6 MB: got {} bytes",
             bytes
         );
     }

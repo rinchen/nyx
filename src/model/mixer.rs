@@ -8,7 +8,7 @@
 //!
 //! For higher compression, see [`super::sse_apm::SseApmCascade`] which adds SSE/APM/APM2
 //! refinement stages after the mixer, and [`super::mixer_bank::MixerBank`] which selects
-//! from 4096 context-specific mixer instances.
+//! from 8192 context-specific mixer instances.
 //!
 //! ## Fixed-point arithmetic (Q16 weights, Q10 stretch)
 //!
@@ -218,7 +218,7 @@ impl LogisticMixer {
     ///
     /// A factor of 0.0 restores init; 1.0 leaves unchanged. This preserves
     /// learned structure across block boundaries without hard-clearing, which
-    /// would throw away the per-context weight vectors that the 4096-bank
+    /// would throw away the per-context weight vectors that the 8192-bank
     /// hierarchy depends on.
     pub fn decay(&mut self, factor: f32) {
         let f = factor;

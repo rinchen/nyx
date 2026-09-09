@@ -164,7 +164,10 @@ impl ByteAssembler {
 /// `predict` returns the model's estimate of P(bit==1) in `[1, 4095]`. `update` is
 /// called **after** the true bit is known so the model can adapt. `reset` clears
 /// per-block state at the start of each new block.
-pub trait BitModel {
+///
+/// `Send` is required so Slow-mode can overlap classify(N+1) with encode(N) via
+/// `rayon::join` while holding `&mut dyn BitModel` in the encode worker.
+pub trait BitModel: Send {
     /// Predicted probability of bit==1, in `[1, 4095]`.
     fn predict(&self) -> u16;
 
