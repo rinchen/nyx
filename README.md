@@ -54,7 +54,7 @@ per byte than those, in exchange for better ratio on the right inputs.
 
 ### Other Completed
 - **S1-S7, C1-C4, C5 (global XWRT)** – all optimization items implemented and verified
-- **CI fixes** – Node 20 deprecation resolved (`actions/checkout@v5`); bytecodec AVX2 prefix-sum repaired (x86_64-only debug overflow)
+- **CI fixes** – Node 20 deprecation resolved (`actions/checkout@v5`); bytecodec AVX2 prefix-sum repaired (x86_64-only debug overflow); CI now runs tests with the `no_avx2` feature to disable the x86_64-only AVX2 path, which is not yet verified on Linux runners
 - **Pre-commit hook** – `.pre-commit-config.yaml` mirrors the CI gate (`cargo build` + `cargo test`) plus an all-targets check
 - **Benchmarks** – table updated with new optimization results
 
@@ -117,7 +117,16 @@ rcn self-test
 ### Installation
 `rcn` is installed via `cargo install --locked rcn` or downloaded as a binary release from
 [crates.io](https://crates.io/crates/rcn). The package requires Rust toolchain ≥1.70 and
-an x86_64 (AVX2) or arm64 (scalar) processor.
+an x86_64 (AVX2) or arm64 (scalar) processor. On x86_64 (Linux), the AVX2 code path
+can be disabled at build time with `--no-default-features --features no_avx2` — see
+[CI notes](#ci-notes) below.
+
+### CI notes
+GitHub Actions runs on `ubuntu-latest` (x86_64) where the AVX2 SIMD path in
+`bytecodec` is compiled and exercised, while local development on Apple Silicon
+(arm64) uses the scalar path. Until the AVX2 implementation is fully verified on
+Linux runners, CI runs tests with the `no_avx2` feature to exercise the scalar
+path only; local builds still use AVX2 by default on x86_64.
 
 ### Compression levels
 The CLI currently offers two modes (`--mode slow` / `--mode fast`) representing the
