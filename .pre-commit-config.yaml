@@ -19,3 +19,10 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: markdownlint
+        name: Lint Markdown with markdownlint-cli2
+        entry: npm run lint:md
+        language: system
+        pass_filenames: false
+        always_run: true
+        files: \.md$
