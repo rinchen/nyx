@@ -101,6 +101,10 @@ cargo build --release --bin rcn
 ## Usage
 
 ```bash
+# Help and version
+rcn -h
+rcn --version
+
 # Compress a file into a .rcn (RCN1) container
 rcn compress input.bin output.rcn
 
@@ -114,12 +118,21 @@ rcn bench path/to/corpus
 rcn self-test
 ```
 
+A section-1 man page lives at [`man/rcn.1`](man/rcn.1). Preview it from the
+source tree with `man ./man/rcn.1`. To install it system-wide (optional):
+
+```bash
+install -m 644 man/rcn.1 "$(manpath | cut -d: -f1)/man1/rcn.1"
+```
+
+`cargo install` installs the binary only, not the man page.
+
 ### Installation
 `rcn` is installed via `cargo install --locked rcn` or downloaded as a binary release from
-[crates.io](https://crates.io/crates/rcn). The package requires Rust toolchain ≥1.70 and
-an x86_64 (AVX2) or arm64 (scalar) processor. On x86_64 (Linux), the AVX2 code path
-can be disabled at build time with `--no-default-features --features no_avx2` — see
-[CI notes](#ci-notes) below.
+[crates.io](https://crates.io/crates/rcn). The package requires Rust toolchain ≥1.85
+(`rust-version` in `Cargo.toml`) and an x86_64 (AVX2) or arm64 (scalar) processor.
+On x86_64 (Linux), the AVX2 code path can be disabled at build time with
+`--no-default-features --features no_avx2` — see [CI notes](#ci-notes) below.
 
 ### CI notes
 GitHub Actions runs on `ubuntu-latest` (x86_64) where the AVX2 SIMD path in

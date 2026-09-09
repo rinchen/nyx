@@ -25,7 +25,14 @@ use rcn::codec::{self, decompress, CodecMode};
 #[command(
     name = "rcn",
     version,
-    about = "Rcn: adaptive staged context-mixing compressor"
+    about = "Rcn: adaptive staged context-mixing compressor",
+    long_about = "Rcn is an experimental context-mixing compressor. It stages \
+BWT, LZP, and online logistic mixing, then entropy-codes with rANS. \
+Subcommands compress and decompress .rcn (RCN1) containers, bench a corpus, \
+or run the library self-test.",
+    after_help = "See also: man rcn (if installed), or man/rcn.1 in the source tree.",
+    arg_required_else_help = true,
+    propagate_version = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,7 +51,11 @@ enum ModeArg {
 enum Cmd {
     /// Compress a file into a .rcn (RCN1) container.
     Compress {
+        /// Path to the input file.
+        #[arg(value_name = "INPUT")]
         input: PathBuf,
+        /// Path for the compressed .rcn output.
+        #[arg(value_name = "OUTPUT")]
         output: PathBuf,
         /// Entropy backend (only `rans` is built in).
         #[arg(long, default_value = "rans")]
@@ -54,9 +65,18 @@ enum Cmd {
         mode: ModeArg,
     },
     /// Decompress a .rcn (RCN1) container back to a file.
-    Decompress { input: PathBuf, output: PathBuf },
+    Decompress {
+        /// Path to the .rcn container.
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+        /// Path for the restored output file.
+        #[arg(value_name = "OUTPUT")]
+        output: PathBuf,
+    },
     /// Benchmark rcn over every file in a corpus directory.
     Bench {
+        /// Directory of files to compress for timing and ratio.
+        #[arg(value_name = "CORPUS")]
         corpus: PathBuf,
         /// Reserved for SOTA comparison (see `scripts/bench_vs_sota.sh`).
         #[arg(long)]

@@ -1,0 +1,161 @@
+.\" SPDX-License-Identifier: MIT
+.TH RCN 1 "September 2026" "rcn 0.1.2" "User Commands"
+.SH NAME
+rcn \- adaptive staged context-mixing compressor
+.SH SYNOPSIS
+.B rcn
+[\fIOPTIONS\fR]
+.I COMMAND
+...
+.PP
+.B rcn compress
+[\fIOPTIONS\fR]
+.I INPUT OUTPUT
+.PP
+.B rcn decompress
+.I INPUT OUTPUT
+.PP
+.B rcn bench
+[\fIOPTIONS\fR]
+.I CORPUS
+.PP
+.B rcn self-test
+.SH DESCRIPTION
+.B rcn
+is an experimental context-mixing compressor. It stages BWT, LZP, and online
+logistic mixing, then entropy-codes with rANS into a .rcn (RCN1) container.
+.PP
+Invoke
+.B rcn \-h
+or
+.B rcn \-\-help
+for a summary; use
+.B rcn
+.I COMMAND
+.B \-h
+for per-command help.
+.SH COMMANDS
+.TP
+.B compress
+Compress a file into a .rcn (RCN1) container.
+.RS
+.TP
+.I INPUT
+Path to the input file.
+.TP
+.I OUTPUT
+Path for the compressed .rcn output.
+.TP
+.BI \-\-backend \ backend
+Entropy backend. Only
+.B rans
+is built in (default:
+.BR rans ).
+.TP
+.BI \-\-mode \ mode
+Entropy mode:
+.B slow
+(bit-level CM, higher ratio, default) or
+.B fast
+(byte-level CM, faster, slightly worse ratio).
+.RE
+.TP
+.B decompress
+Decompress a .rcn (RCN1) container back to a file.
+.RS
+.TP
+.I INPUT
+Path to the .rcn container.
+.TP
+.I OUTPUT
+Path for the restored output file.
+.RE
+.TP
+.B bench
+Benchmark rcn over every file in a corpus directory (timing and ratio).
+.RS
+.TP
+.I CORPUS
+Directory of files to compress.
+.TP
+.BI \-\-vs \ label
+Reserved for SOTA comparison (see
+.I scripts/bench_vs_sota.sh
+in the source tree).
+.TP
+.B \-\-fast
+Use the byte-level (fast) entropy mode.
+.RE
+.TP
+.B self-test
+Run the library test suite (via
+.BR cargo )
+and report PASS/FAIL.
+.SH OPTIONS
+Global options apply to every command:
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version. Also accepted after a subcommand (for example
+.BR "rcn compress \-V" ).
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred (I/O failure, unsupported backend, compress/decompress
+error, or failing self-test).
+.SH EXAMPLES
+Compress a file:
+.PP
+.RS
+.nf
+rcn compress input.bin output.rcn
+.fi
+.RE
+.PP
+Compress with the fast entropy mode:
+.PP
+.RS
+.nf
+rcn compress input.bin output.rcn \-\-mode fast
+.fi
+.RE
+.PP
+Decompress:
+.PP
+.RS
+.nf
+rcn decompress output.rcn restored.bin
+.fi
+.RE
+.PP
+Bench a corpus directory:
+.PP
+.RS
+.nf
+rcn bench path/to/corpus
+.fi
+.RE
+.PP
+Show help or version:
+.PP
+.RS
+.nf
+rcn \-h
+rcn \-\-version
+.fi
+.RE
+.SH SEE ALSO
+.BR zstd (1),
+.BR xz (1),
+.BR gzip (1)
+.PP
+Project repository:
+.IR https://github.com/rinchen/rcn
+.SH BUGS
+Report bugs at
+.IR https://github.com/rinchen/rcn/issues .
