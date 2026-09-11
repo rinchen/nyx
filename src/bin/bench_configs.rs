@@ -237,7 +237,7 @@ fn cmd_bench_configs(corpus: &PathBuf) -> Result<(), String> {
         let configs: [(
             &str,
             fn() -> (
-                Vec<Box<dyn rcn::model::BitModel>>,
+                Vec<rcn::model::stack_enum::StackModel>,
                 rcn::model::mixer_bank::MixerBank,
                 Option<usize>,
             ),
