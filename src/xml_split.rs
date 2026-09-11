@@ -5,9 +5,10 @@
 //! markers live in the tags stream; attribute and text payloads are routed to
 //! their own channels so BWT sees highly repetitive streams.
 
-/// Prefix byte that marks a length-prefixed fragment in the tags stream.
-/// XML markup is ASCII, so `0xFE` cannot appear in well-formed structural data.
-const MARK_PREFIX: u8 = 0xFE;
+use crate::split_common::{
+    check_stream_bounds, emit_marked_fragment, parse_marked_fragment, skip_ascii_whitespace,
+    MARK_PREFIX,
+};
 
 const CHANNEL_ATTR: u8 = b'A';
 const CHANNEL_TEXT: u8 = b'T';
@@ -32,25 +33,13 @@ impl XmlStreams {
     }
 }
 
-fn emit_fragment(tags: &mut Vec<u8>, content: &mut Vec<u8>, buf: &mut Vec<u8>, channel: u8) {
-    let len = buf.len() as u32;
-    tags.push(MARK_PREFIX);
-    tags.extend_from_slice(&len.to_le_bytes());
-    tags.push(channel);
-    content.extend_from_slice(buf);
-    buf.clear();
-}
-
 /// Heuristic: starts with `<` / `<?xml` / has tag-like structure.
 #[must_use]
 pub fn looks_like_xml(data: &[u8]) -> bool {
     if data.len() < 16 {
         return false;
     }
-    let mut idx = 0;
-    while idx < data.len() && data[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
+    let idx = skip_ascii_whitespace(data);
     if idx >= data.len() || data[idx] != b'<' {
         return false;
     }
@@ -91,7 +80,7 @@ pub fn split(data: &[u8]) -> XmlStreams {
         if data[i] == b'<' {
             // Flush pending text.
             if !text_buf.is_empty() {
-                emit_fragment(&mut out.tags, &mut out.text, &mut text_buf, CHANNEL_TEXT);
+                emit_marked_fragment(&mut out.tags, &mut out.text, &mut text_buf, CHANNEL_TEXT);
             }
 
             out.tags.push(b'<');
@@ -124,7 +113,7 @@ pub fn split(data: &[u8]) -> XmlStreams {
                 _ => None,
             };
             if !attr_buf.is_empty() {
-                emit_fragment(&mut out.tags, &mut out.attrs, &mut attr_buf, CHANNEL_ATTR);
+                emit_marked_fragment(&mut out.tags, &mut out.attrs, &mut attr_buf, CHANNEL_ATTR);
             }
             if let Some(t) = trailing {
                 out.tags.push(t);
@@ -140,7 +129,7 @@ pub fn split(data: &[u8]) -> XmlStreams {
     }
 
     if !text_buf.is_empty() {
-        emit_fragment(&mut out.tags, &mut out.text, &mut text_buf, CHANNEL_TEXT);
+        emit_marked_fragment(&mut out.tags, &mut out.text, &mut text_buf, CHANNEL_TEXT);
     }
 
     out
@@ -161,30 +150,22 @@ pub fn join(streams: &XmlStreams, original_len: usize) -> Result<Vec<u8>, crate:
     while si < s.len() {
         let b = s[si];
         if b == MARK_PREFIX {
-            if si + 5 >= s.len() {
-                return Err(crate::error::RcnError::XmlSplitError(format!(
+            let (len, channel, new_si) = parse_marked_fragment(s, si).ok_or_else(|| {
+                crate::error::RcnError::XmlSplitError(format!(
                     "truncated marker at tags offset {si}"
-                )));
-            }
-            let len = u32::from_le_bytes([s[si + 1], s[si + 2], s[si + 3], s[si + 4]]) as usize;
-            let channel = s[si + 5];
-            si += 6;
+                ))
+            })?;
+            si = new_si;
             match channel {
                 CHANNEL_ATTR => {
-                    if ai + len > streams.attrs.len() {
-                        return Err(crate::error::RcnError::XmlSplitError(
-                            "attrs stream exhausted".into(),
-                        ));
-                    }
+                    check_stream_bounds(ai, len, streams.attrs.len(), "attrs")
+                        .map_err(crate::error::RcnError::XmlSplitError)?;
                     out.extend_from_slice(&streams.attrs[ai..ai + len]);
                     ai += len;
                 }
                 CHANNEL_TEXT => {
-                    if ti + len > streams.text.len() {
-                        return Err(crate::error::RcnError::XmlSplitError(
-                            "text stream exhausted".into(),
-                        ));
-                    }
+                    check_stream_bounds(ti, len, streams.text.len(), "text")
+                        .map_err(crate::error::RcnError::XmlSplitError)?;
                     out.extend_from_slice(&streams.text[ti..ti + len]);
                     ti += len;
                 }

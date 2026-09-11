@@ -1,7 +1,7 @@
 # Rcn Optimization Opportunity Log
 
-Last updated: 2026-09-09
-Test status: 162/162 passing
+Last updated: 2026-09-11
+Test status: 186/186 passing (`cargo test --lib`, with or without `no_avx2`)
 
 Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
@@ -35,7 +35,7 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 | C1 | Wire SSE/APM/APM2 cascade | Integrated in slow-path encoder/decoder. | -2-4pt on text | Completed |
 | C2 | Re-benchmark fixed PPMd config | Order-8 PPMd with SEE + sparse de Bruijn. | +1.5-2pt on webster | Completed |
 | C3 | XWRT dictionary before BWT | Per-block XWRT before BWT→MTF→RLE0→CM. | 2-4pt on text | Completed |
-| C4 | Exec/Binary transforms | DP-LZP default; E8E9; delta/stride. | 2-5pt on mr/nci | Completed |
+| C4 | Exec/Binary transforms | DP-LZP default; E8E9 kept. Delta/stride transform was never wired into the codec and was removed 2026-09-11. | 2-5pt on mr/nci | Completed (E8E9/DP) |
 | C5 | Corpus-wide global XWRT-128 | Top-128 dict once in header. | −4-5pt on text | Completed |
 | C6 | Global XWRT 128 → 512 with ESC | `0x80..=0xFE` ids 0..126; `0xFF\|\|u16` ids 127..511; ESC only for words len>3. | −1 to −2pt on text | Completed |
 | C7 | Adaptive DP LZP threshold | Text ≥12; Binary/Exec stay 16 (≥24 regressed mr). | Help text; avoid mr hit | Completed |
@@ -77,7 +77,13 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 ### Fast Path (`--mode fast`)
 
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
-- AVX2 SIMD walk_dist
+- AVX2 SIMD walk_dist (scalar fallback + parity tests; CI uses `no_avx2`)
+
+### Correctness / container hardening (2026-09-11)
+
+- Structured BWT decode (JSON/CSV/XML/XWRT) returns `RcnError` on truncated or invalid payloads (no silent empty `Vec`)
+- Global-dict read and decompress payload/`num_blocks` bounds fail closed
+- Shared `split_common` framing helpers; unified method↔pipeline maps in `codec`
 
 ### Default-mode gate
 
@@ -115,3 +121,4 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 |------|-------|
 | 2026-09-08 | C5 global XWRT-128 |
 | 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |
+| 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |

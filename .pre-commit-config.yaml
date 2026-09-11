@@ -15,7 +15,7 @@ repos:
         always_run: true
       - id: cargo-test
         name: Run cargo tests (mirrors CI rust.yml test step)
-        entry: cargo test --locked
+        entry: cargo test --locked --features no_avx2
         language: system
         pass_filenames: false
         always_run: true

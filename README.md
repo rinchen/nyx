@@ -98,7 +98,9 @@ structure across the stream. The fused probability drives an rANS bit coder
 (via the audited [`ans`](https://crates.io/crates/ans) crate).
 
 Because modeling is causal, the decoder reconstructs identical model state from
-the coded stream, so round-trips are lossless.
+the coded stream, so round-trips are lossless. Decompress also checks per-block
+CRC32 and rejects truncated containers, overlong block payloads, and corrupt
+JSON/CSV/XML/XWRT structured transforms (hard error — not an empty output).
 
 ## Build
 

@@ -4,7 +4,7 @@ Optimization tickets, A/B history, CI/testing notes, and roadmaps.
 For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-Last updated: 2026-09-09. Test status: 162/162 passing (`cargo test --lib`).
+Last updated: 2026-09-11. Test status: see `cargo test --lib` / CI.
 
 ---
 
@@ -46,9 +46,11 @@ Gap to beat `zstd -19` on text is tracked in the README headline table (dickens/
 ## CI / testing
 
 GitHub Actions runs on `ubuntu-latest` (x86_64). The AVX2 SIMD path in
-`bytecodec` is compiled there, but until it is fully verified on Linux runners,
-CI runs tests with the `no_avx2` feature (scalar path only). Local builds still
-use AVX2 by default on x86_64. Apple Silicon (arm64) always uses the scalar path.
+`bytecodec` is compiled there, but CI runs tests with the `no_avx2` feature
+(scalar path only) for a stable Linux gate. Local builds still use AVX2 by
+default on x86_64. Apple Silicon (arm64) always uses the scalar path.
+AVX2↔scalar bit-identity is covered by unit tests that force both paths when
+AVX2 is available (`walk_dist_avx2_matches_scalar_*`).
 
 ```bash
 cargo test --lib
@@ -57,7 +59,8 @@ cargo test --lib --features no_avx2       # CI-like scalar path
 rcn self-test                             # wraps cargo test --lib
 ```
 
-Pre-commit: `.pre-commit-config.yaml` runs `cargo build` + `cargo test` (mirrors CI).
+Pre-commit: `.pre-commit-config.yaml` runs `cargo build` +
+`cargo test --features no_avx2` (mirrors CI).
 
 ---
 
@@ -164,5 +167,7 @@ is default and SSM is isolated from DP.
 | change | files tested | result | action |
 |---|---|---|---|
 | round-trip verification | all 5 | lossless | every pass round-trip verified |
-| test suite | all | 162/162 green | kept |
+| test suite | all | 186/186 green (`cargo test --lib`) | kept |
 | bit-identical output | dickens 2MB | each pass `cmp`-identical to prior where claimed | kept |
+| container / BWT hardening (2026-09-11) | unit + Fast/CSV/XML round-trips | corrupt payloads/`comp_len`/dict → `RcnError`; AVX2↔scalar parity | kept |
+| orphan delta transform | — | never wired into codec | **deleted** (`src/model/delta.rs`) |

@@ -320,76 +320,47 @@ impl ByteCountModel {
 
         #[cfg(all(target_arch = "x86_64", not(feature = "no_avx2")))]
         {
-            use std::arch::x86_64::*;
             // AVX2 path is bit-identical to scalar only when `cnt * inv < 2^32`.
             // inv = floor(2^32/t). Wrap occurs iff t is a power of two and cnt == t
             // (single symbol dominates the context). Guard: disable AVX2 for power-of-two totals.
-            let t = u64::from(self.totals[ctx].max(1));
             let use_avx2 = is_x86_feature_detected!("avx2") && !t.is_power_of_two();
             if use_avx2 {
                 return unsafe { walk_dist_avx2(self.counts.as_ptr(), base, inv, target, cdf) };
             }
         }
 
-        // Scalar fallback (original implementation).
-        let mut acc = 0u64;
-        let mut prev = 0u64;
-        let mut cum = 0u32;
-        let mut cum_before_255 = 0u32;
-        let mut f255 = 0u32;
-        let mut found_sym = -1i32;
-        let mut found_freq = 0u32;
-        let mut found_cum = 0u32;
+        walk_dist_scalar(&self.counts, base, inv, target, cdf)
+    }
 
-        for s in 0..256 {
-            let cnt = u64::from(self.counts[base + s]);
-            let idx = (cnt * u64::from(inv)) >> 20;
-            acc += idx * u64::from(BUDGET);
-            let r = (acc + FRAC_ROUND) >> FRAC_BITS;
-            let base_s = r - prev;
-            prev = r;
-            let f = 1u32 + base_s as u32;
+    /// Force the scalar `walk_dist` implementation (for AVX2↔scalar parity tests).
+    #[cfg(test)]
+    fn walk_dist_scalar_only(
+        &self,
+        ctx: usize,
+        target: Option<u8>,
+        cdf: Option<u32>,
+    ) -> WalkResult {
+        let base = ctx * 256;
+        let t = u64::from(self.totals[ctx].max(1));
+        let inv = u32::from(reciprocal_table()[t as usize]);
+        walk_dist_scalar(&self.counts, base, inv, target, cdf)
+    }
 
-            if s == 255 {
-                f255 = f;
-                cum_before_255 = cum;
-            }
-
-            if let Some(b) = target {
-                if s == usize::from(b) {
-                    found_cum = cum;
-                    found_freq = f;
-                }
-            }
-            cum += f;
-
-            if let Some(c) = cdf {
-                if found_sym < 0 && cum > c {
-                    found_sym = s as i32;
-                    found_freq = f;
-                    found_cum = cum - f;
-                }
-            }
+    /// Call the AVX2 path directly when available and safe for this total.
+    #[cfg(all(test, target_arch = "x86_64", not(feature = "no_avx2")))]
+    fn walk_dist_avx2_only(
+        &self,
+        ctx: usize,
+        target: Option<u8>,
+        cdf: Option<u32>,
+    ) -> Option<WalkResult> {
+        let t = u64::from(self.totals[ctx].max(1));
+        if !is_x86_feature_detected!("avx2") || t.is_power_of_two() {
+            return None;
         }
-
-        let total = cum;
-        let sym = if found_sym >= 0 {
-            found_sym as u8
-        } else if cdf.is_some() {
-            255
-        } else {
-            target.unwrap_or(0)
-        };
-        if sym == 255 {
-            found_freq = f255 + (BYTE_SCALE - total);
-            found_cum = cum_before_255;
-        }
-
-        WalkResult {
-            sym,
-            freq: found_freq,
-            cum: found_cum,
-        }
+        let base = ctx * 256;
+        let inv = u32::from(reciprocal_table()[t as usize]);
+        Some(unsafe { walk_dist_avx2(self.counts.as_ptr(), base, inv, target, cdf) })
     }
 
     fn update(&mut self, ctx: usize, byte: u8) {
@@ -422,6 +393,75 @@ struct WalkResult {
     sym: u8,
     freq: u32,
     cum: u32,
+}
+
+/// Scalar `walk_dist` implementation shared by the dispatcher and tests.
+#[inline(always)]
+fn walk_dist_scalar(
+    counts: &[u16],
+    base: usize,
+    inv: u32,
+    target: Option<u8>,
+    cdf: Option<u32>,
+) -> WalkResult {
+    let mut acc = 0u64;
+    let mut prev = 0u64;
+    let mut cum = 0u32;
+    let mut cum_before_255 = 0u32;
+    let mut f255 = 0u32;
+    let mut found_sym = -1i32;
+    let mut found_freq = 0u32;
+    let mut found_cum = 0u32;
+
+    for s in 0..256 {
+        let cnt = u64::from(counts[base + s]);
+        let idx = (cnt * u64::from(inv)) >> 20;
+        acc += idx * u64::from(BUDGET);
+        let r = (acc + FRAC_ROUND) >> FRAC_BITS;
+        let base_s = r - prev;
+        prev = r;
+        let f = 1u32 + base_s as u32;
+
+        if s == 255 {
+            f255 = f;
+            cum_before_255 = cum;
+        }
+
+        if let Some(b) = target {
+            if s == usize::from(b) {
+                found_cum = cum;
+                found_freq = f;
+            }
+        }
+        cum += f;
+
+        if let Some(c) = cdf {
+            if found_sym < 0 && cum > c {
+                found_sym = s as i32;
+                found_freq = f;
+                found_cum = cum - f;
+            }
+        }
+    }
+
+    let total = cum;
+    let sym = if found_sym >= 0 {
+        found_sym as u8
+    } else if cdf.is_some() {
+        255
+    } else {
+        target.unwrap_or(0)
+    };
+    if sym == 255 {
+        found_freq = f255 + (BYTE_SCALE - total);
+        found_cum = cum_before_255;
+    }
+
+    WalkResult {
+        sym,
+        freq: found_freq,
+        cum: found_cum,
+    }
 }
 
 /// PPM-style deterministic order selection: pick the highest-order context
@@ -666,5 +706,117 @@ mod tests {
             Order::Order2,
             "concentrated order-2 wins at equal scale"
         );
+    }
+
+    #[test]
+    fn walk_dist_avx2_matches_scalar_encode_target() {
+        let mut m = ByteCountModel::new(1);
+        // Non-power-of-two total so AVX2 may run.
+        for b in [1u8, 2, 3, 5, 8, 13, 21, 34, 55, 89] {
+            for _ in 0..3 {
+                m.update(0, b);
+            }
+        }
+        assert!(!u64::from(m.total(0)).is_power_of_two());
+        for b in 0..=255u8 {
+            let scalar = m.walk_dist_scalar_only(0, Some(b), None);
+            let dispatched = m.walk_dist(0, Some(b), None);
+            assert_eq!(
+                (dispatched.sym, dispatched.freq, dispatched.cum),
+                (scalar.sym, scalar.freq, scalar.cum),
+                "dispatch≠scalar for target={b}"
+            );
+            #[cfg(all(target_arch = "x86_64", not(feature = "no_avx2")))]
+            if let Some(avx) = m.walk_dist_avx2_only(0, Some(b), None) {
+                assert_eq!(
+                    (avx.sym, avx.freq, avx.cum),
+                    (scalar.sym, scalar.freq, scalar.cum),
+                    "avx2≠scalar for target={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn walk_dist_avx2_matches_scalar_decode_cdf() {
+        let mut m = ByteCountModel::new(1);
+        for b in 0..=255u8 {
+            m.update(0, b);
+            m.update(0, b.wrapping_mul(3));
+        }
+        if u64::from(m.total(0)).is_power_of_two() {
+            m.update(0, 7);
+        }
+        assert!(!u64::from(m.total(0)).is_power_of_two());
+        for cdf in (0..BYTE_SCALE).step_by(17) {
+            let scalar = m.walk_dist_scalar_only(0, None, Some(cdf));
+            let dispatched = m.walk_dist(0, None, Some(cdf));
+            assert_eq!(
+                (dispatched.sym, dispatched.freq, dispatched.cum),
+                (scalar.sym, scalar.freq, scalar.cum),
+                "dispatch≠scalar for cdf={cdf}"
+            );
+            #[cfg(all(target_arch = "x86_64", not(feature = "no_avx2")))]
+            if let Some(avx) = m.walk_dist_avx2_only(0, None, Some(cdf)) {
+                assert_eq!(
+                    (avx.sym, avx.freq, avx.cum),
+                    (scalar.sym, scalar.freq, scalar.cum),
+                    "avx2≠scalar for cdf={cdf}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn walk_dist_avx2_disabled_for_power_of_two_total() {
+        let mut m = ByteCountModel::new(1);
+        // Exactly 8 updates of one symbol → total 8 = 2^3.
+        for _ in 0..8 {
+            m.update(0, b'A');
+        }
+        assert!(u64::from(m.total(0)).is_power_of_two());
+        #[cfg(all(target_arch = "x86_64", not(feature = "no_avx2")))]
+        assert!(
+            m.walk_dist_avx2_only(0, Some(b'A'), None).is_none(),
+            "AVX2 must refuse power-of-two totals"
+        );
+        let scalar = m.walk_dist_scalar_only(0, Some(b'A'), None);
+        let dispatched = m.walk_dist(0, Some(b'A'), None);
+        assert_eq!(
+            (dispatched.sym, dispatched.freq, dispatched.cum),
+            (scalar.sym, scalar.freq, scalar.cum)
+        );
+    }
+
+    #[test]
+    fn walk_dist_avx2_matches_scalar_after_many_updates() {
+        let mut m = ByteCountModel::new(1);
+        let mut x = 0xC0FF_EE00u32;
+        for _ in 0..4096 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            m.update(0, x as u8);
+        }
+        // Force a non-power-of-two total if needed.
+        if u64::from(m.total(0)).is_power_of_two() {
+            m.update(0, 7);
+        }
+        for b in [0u8, 1, 127, 128, 255] {
+            let scalar = m.walk_dist_scalar_only(0, Some(b), None);
+            let dispatched = m.walk_dist(0, Some(b), None);
+            assert_eq!(
+                (dispatched.freq, dispatched.cum),
+                (scalar.freq, scalar.cum),
+                "after many updates target={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_dist_parity_under_feature_no_avx2() {
+        // Smoke: round-trips still work when this crate is built with no_avx2
+        // (CI) or without it (local). The scalar path must always succeed.
+        roundtrip(b"parity-smoke-abcdefghijklmnopqrstuvwxyz0123456789");
     }
 }

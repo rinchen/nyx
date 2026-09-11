@@ -102,14 +102,26 @@ impl BlockEntry {
 }
 
 /// Read a global XWRT dictionary from `data` starting at `offset`.
+///
 /// Returns `(dict_bytes, new_offset)` if present (flags bit 0 set),
 /// or `(Vec::new(), offset)` if not present.
-pub fn read_global_dict(data: &[u8], offset: usize, flags: u8) -> (Vec<u8>, usize) {
+///
+/// # Errors
+///
+/// Returns [`RcnError::InvalidContainer`] when the flag is set but the length
+/// prefix is truncated or the dictionary body overruns `data`.
+pub fn read_global_dict(
+    data: &[u8],
+    offset: usize,
+    flags: u8,
+) -> Result<(Vec<u8>, usize), crate::error::RcnError> {
     if (flags & FLAG_GLOBAL_DICT) == 0 {
-        return (Vec::new(), offset);
+        return Ok((Vec::new(), offset));
     }
     if offset + 4 > data.len() {
-        return (Vec::new(), offset);
+        return Err(crate::error::RcnError::InvalidContainer(
+            "truncated global dictionary length prefix".into(),
+        ));
     }
     let dict_len = u32::from_le_bytes([
         data[offset],
@@ -119,12 +131,14 @@ pub fn read_global_dict(data: &[u8], offset: usize, flags: u8) -> (Vec<u8>, usiz
     ]) as usize;
     let new_offset = offset + 4;
     if new_offset + dict_len > data.len() {
-        return (Vec::new(), new_offset);
+        return Err(crate::error::RcnError::InvalidContainer(format!(
+            "global dictionary length {dict_len} overruns container"
+        )));
     }
-    (
+    Ok((
         data[new_offset..new_offset + dict_len].to_vec(),
         new_offset + dict_len,
-    )
+    ))
 }
 
 /// Write a global XWRT dictionary to `out`.
@@ -194,5 +208,36 @@ mod tests {
         let buf = b"XXXX\x01\x00\x10\x00\x00\x00\x00";
         let mut cur = Cursor::new(buf.as_slice());
         assert!(Header::read(&mut cur).is_err());
+    }
+
+    #[test]
+    fn read_global_dict_truncated_length_prefix_errors() {
+        let err = read_global_dict(&[0, 1, 2], 0, FLAG_GLOBAL_DICT).unwrap_err();
+        assert!(matches!(err, crate::error::RcnError::InvalidContainer(_)));
+    }
+
+    #[test]
+    fn read_global_dict_overlong_dict_len_errors() {
+        let mut data = vec![10, 0, 0, 0]; // claims 10 bytes
+        data.extend_from_slice(b"short"); // only 5
+        let err = read_global_dict(&data, 0, FLAG_GLOBAL_DICT).unwrap_err();
+        assert!(matches!(err, crate::error::RcnError::InvalidContainer(_)));
+    }
+
+    #[test]
+    fn read_global_dict_absent_flag_is_empty() {
+        let (bytes, off) = read_global_dict(b"xxxx", 2, 0).expect("ok");
+        assert!(bytes.is_empty());
+        assert_eq!(off, 2);
+    }
+
+    #[test]
+    fn global_dict_flag_roundtrip_preserves_bytes() {
+        let dict = b"hello-dict";
+        let mut buf = Vec::new();
+        write_global_dict(&mut buf, dict);
+        let (got, end) = read_global_dict(&buf, 0, FLAG_GLOBAL_DICT).expect("read");
+        assert_eq!(got, dict);
+        assert_eq!(end, buf.len());
     }
 }

@@ -8,6 +8,10 @@
 //! one per row. [`fields_per_row`] records the true field count before padding
 //! so [`join`] can reconstruct the original delimiter layout exactly.
 
+use crate::split_common::{
+    read_len_prefixed, sample_prefix, skip_ascii_whitespace, write_len_prefixed,
+};
+
 /// Parsed CSV ready for per-column BWT.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsvStreams {
@@ -49,16 +53,12 @@ pub fn looks_like_csv(data: &[u8]) -> bool {
         return false;
     }
     // Reject obvious JSON / XML.
-    let mut idx = 0;
-    while idx < data.len() && data[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
+    let idx = skip_ascii_whitespace(data);
     if idx < data.len() && matches!(data[idx], b'{' | b'[' | b'<') {
         return false;
     }
 
-    let sample_end = data.len().min(8192);
-    let sample = &data[..sample_end];
+    let sample = sample_prefix(data);
     if !sample.is_ascii() {
         return false;
     }
@@ -138,13 +138,11 @@ fn split_row(line: &[u8], delim: u8) -> Vec<Vec<u8>> {
 }
 
 fn push_cell(col: &mut Vec<u8>, cell: &[u8]) {
-    let len = cell.len() as u32;
-    col.extend_from_slice(&len.to_le_bytes());
-    col.extend_from_slice(cell);
+    write_len_prefixed(col, cell);
 }
 
 fn detect_delim(data: &[u8]) -> u8 {
-    let sample = &data[..data.len().min(8192)];
+    let sample = sample_prefix(data);
     let commas = sample.iter().filter(|&&b| b == b',').count();
     let tabs = sample.iter().filter(|&&b| b == b'\t').count();
     if tabs > commas {
@@ -231,22 +229,11 @@ pub fn join(streams: &CsvStreams) -> Result<Vec<u8>, crate::error::RcnError> {
         let mut cells = Vec::with_capacity(nrows);
         let mut pos = 0usize;
         for _ in 0..nrows {
-            if pos + 4 > col.len() {
-                return Err(crate::error::RcnError::CsvSplitError(format!(
-                    "column {ci} truncated at cell {}",
-                    cells.len()
-                )));
-            }
-            let len = u32::from_le_bytes([col[pos], col[pos + 1], col[pos + 2], col[pos + 3]])
-                as usize;
-            pos += 4;
-            if pos + len > col.len() {
-                return Err(crate::error::RcnError::CsvSplitError(format!(
-                    "column {ci} cell length {len} overruns stream"
-                )));
-            }
-            cells.push(col[pos..pos + len].to_vec());
-            pos += len;
+            let (cell, new_pos) = read_len_prefixed(col, pos).map_err(|e| {
+                crate::error::RcnError::CsvSplitError(format!("column {ci}: {e}"))
+            })?;
+            cells.push(cell);
+            pos = new_pos;
         }
         if pos != col.len() {
             return Err(crate::error::RcnError::CsvSplitError(format!(

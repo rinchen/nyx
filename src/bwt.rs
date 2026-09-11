@@ -518,6 +518,69 @@ where
     }
 }
 
+/// Pack `[orig_len:u32][selector:u8][len0..len_{n-2}:u32][body0..][body_{n-1}]`
+/// where the last stream consumes the remainder (no length prefix for the last body).
+fn pack_marked_streams(orig_len: usize, selector: u8, encoded: &[&[u8]]) -> Vec<u8> {
+    assert!(!encoded.is_empty());
+    let mut out = Vec::with_capacity(
+        5 + (encoded.len().saturating_sub(1)) * 4 + encoded.iter().map(|e| e.len()).sum::<usize>(),
+    );
+    out.extend_from_slice(&(orig_len as u32).to_le_bytes());
+    out.push(selector);
+    for enc in &encoded[..encoded.len() - 1] {
+        out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+    }
+    for enc in encoded {
+        out.extend_from_slice(enc);
+    }
+    out
+}
+
+/// Inverse of [`pack_marked_streams`]: parse header + `n_streams - 1` length prefixes;
+/// last stream is the remainder.
+fn unpack_marked_streams(
+    payload: &[u8],
+    n_streams: usize,
+) -> crate::error::Result<(usize, u8, Vec<&[u8]>)> {
+    use crate::split_common::read_u32_le;
+    if n_streams == 0 {
+        return Err(crate::error::RcnError::CorruptBlock(
+            "unpack_marked_streams requires at least one stream".into(),
+        ));
+    }
+    let header_lens = n_streams - 1;
+    let min_len = 5 + header_lens * 4;
+    if payload.len() < min_len {
+        return Err(crate::error::RcnError::CorruptBlock(format!(
+            "structured-split payload truncated: need {min_len} header bytes, got {}",
+            payload.len()
+        )));
+    }
+    let orig_len = read_u32_le(payload, 0)
+        .map_err(crate::error::RcnError::CorruptBlock)? as usize;
+    let selector = payload[4];
+    let mut pos = 5;
+    let mut lens = Vec::with_capacity(header_lens);
+    for _ in 0..header_lens {
+        let len = read_u32_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)? as usize;
+        lens.push(len);
+        pos += 4;
+    }
+    let prefixed_total: usize = lens.iter().sum();
+    if pos + prefixed_total > payload.len() {
+        return Err(crate::error::RcnError::CorruptBlock(
+            "structured-split stream lengths overrun payload".into(),
+        ));
+    }
+    let mut streams = Vec::with_capacity(n_streams);
+    for &len in &lens {
+        streams.push(&payload[pos..pos + len]);
+        pos += len;
+    }
+    streams.push(&payload[pos..]);
+    Ok((orig_len, selector, streams))
+}
+
 impl BwtPipeline {
     /// Encode `data` using this pipeline, returning the payload that CM/rANS will
     /// compress. For `RawCm`, the payload IS the original data.
@@ -546,17 +609,16 @@ impl BwtPipeline {
                     | (nums_pipe << 6);
 
                 // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
-                let mut out = Vec::with_capacity(data.len() + 21);
-                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                out.push(selector);
-                out.extend_from_slice(&(struct_encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(keys_encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(vals_encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&struct_encoded);
-                out.extend_from_slice(&keys_encoded);
-                out.extend_from_slice(&vals_encoded);
-                out.extend_from_slice(&nums_encoded);
-                out
+                pack_marked_streams(
+                    data.len(),
+                    selector,
+                    &[
+                        &struct_encoded,
+                        &keys_encoded,
+                        &vals_encoded,
+                        &nums_encoded,
+                    ],
+                )
             }
             BwtPipeline::CsvSplit => {
                 let streams = crate::csv_split::split(data);
@@ -599,15 +661,11 @@ impl BwtPipeline {
                 let (text_pipe, text_encoded) = encode_stream_pick(&streams.text);
                 let selector = tags_pipe | (attrs_pipe << 2) | (text_pipe << 4);
                 // Layout: [orig_len:u32][selector:u8][t_len:u32][a_len:u32][tags][attrs][text]
-                let mut out = Vec::with_capacity(data.len() + 13);
-                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                out.push(selector);
-                out.extend_from_slice(&(tags_encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(attrs_encoded.len() as u32).to_le_bytes());
-                out.extend_from_slice(&tags_encoded);
-                out.extend_from_slice(&attrs_encoded);
-                out.extend_from_slice(&text_encoded);
-                out
+                pack_marked_streams(
+                    data.len(),
+                    selector,
+                    &[&tags_encoded, &attrs_encoded, &text_encoded],
+                )
             }
             BwtPipeline::XwrtBwtMtfRle => {
                 // Use global dictionary if provided (stored once in the container
@@ -634,103 +692,92 @@ impl BwtPipeline {
     ///
     /// For `XwrtBwtMtfRle`, a `Some` `global_dict` (stored once in the container
     /// header) is used instead of an embedded per-block dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RcnError::CorruptBlock`] (or a split-specific variant) when the
+    /// payload is truncated or structurally invalid.
     pub fn decode(
         self,
         payload: &[u8],
         orig_len: usize,
         global_dict: Option<&crate::model::word::XwrtDictionary>,
-    ) -> Vec<u8> {
+    ) -> crate::error::Result<Vec<u8>> {
+        use crate::split_common::{read_u16_le, read_u32_le};
         match self {
-            BwtPipeline::RawCm => payload.to_vec(),
-            BwtPipeline::BwtMtfRle => bwt_mtf_rle_decode(payload),
+            BwtPipeline::RawCm => Ok(payload.to_vec()),
+            BwtPipeline::BwtMtfRle => Ok(bwt_mtf_rle_decode(payload)),
             BwtPipeline::LzpBwtMtf => {
                 let mtf = bwt_mtf_decode(payload);
-                lzp_decode(&mtf, orig_len)
+                Ok(lzp_decode(&mtf, orig_len))
             }
             BwtPipeline::JsonSplit => {
-                // Layout: [orig_len:u32][selector:u8][s0_len:u32][s1_len:u32][s2_len:u32][s0][s1][s2][s3]
-                if payload.len() < 17 {
-                    return Vec::new();
-                }
-                let orig_len =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-                let selector = payload[4];
-                let s0_pipe = selector & 0x3;
-                let s1_pipe = (selector >> 2) & 0x3;
-                let s2_pipe = (selector >> 4) & 0x3;
-                let s3_pipe = (selector >> 6) & 0x3;
-
-                let s0_len =
-                    u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
-                let s1_len = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]])
-                    as usize;
-                let s2_len =
-                    u32::from_le_bytes([payload[13], payload[14], payload[15], payload[16]])
-                        as usize;
-                let mut pos = 17;
-                if pos + s0_len + s1_len + s2_len > payload.len() {
-                    return Vec::new();
-                }
-                let s0 = &payload[pos..pos + s0_len];
-                pos += s0_len;
-                let s1 = &payload[pos..pos + s1_len];
-                pos += s1_len;
-                let s2 = &payload[pos..pos + s2_len];
-                pos += s2_len;
-                let s3 = &payload[pos..];
-
+                let (orig_len, selector, parts) = unpack_marked_streams(payload, 4)?;
                 let streams = crate::json_split::JsonStreams {
-                    structural: decode_stream_pick(s0, s0_pipe),
-                    keys: decode_stream_pick(s1, s1_pipe),
-                    string_values: decode_stream_pick(s2, s2_pipe),
-                    numbers: decode_stream_pick(s3, s3_pipe),
+                    structural: decode_stream_pick(parts[0], selector & 0x3),
+                    keys: decode_stream_pick(parts[1], (selector >> 2) & 0x3),
+                    string_values: decode_stream_pick(parts[2], (selector >> 4) & 0x3),
+                    numbers: decode_stream_pick(parts[3], (selector >> 6) & 0x3),
                 };
-                crate::json_split::merge(&streams, orig_len).unwrap_or_default()
+                crate::json_split::merge(&streams, orig_len)
             }
             BwtPipeline::CsvSplit => {
-                // See encode layout comment.
                 if payload.len() < 12 {
-                    return Vec::new();
+                    return Err(crate::error::RcnError::CorruptBlock(
+                        "csv-split payload truncated".into(),
+                    ));
                 }
                 let mut pos = 0usize;
                 let _orig_len =
-                    u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+                    read_u32_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)?
+                        as usize;
                 pos += 4;
                 let delim = payload[pos];
                 pos += 1;
                 let trailing_newline = payload[pos] != 0;
                 pos += 1;
-                let ncols = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+                let ncols =
+                    read_u16_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)?
+                        as usize;
                 pos += 2;
-                let nrows = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+                let nrows =
+                    read_u32_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)?
+                        as usize;
                 pos += 4;
                 if pos + nrows * 2 > payload.len() {
-                    return Vec::new();
+                    return Err(crate::error::RcnError::CorruptBlock(
+                        "csv-split fields_per_row overruns payload".into(),
+                    ));
                 }
                 let mut fields_per_row = Vec::with_capacity(nrows);
                 for _ in 0..nrows {
-                    fields_per_row.push(u16::from_le_bytes(
-                        payload[pos..pos + 2].try_into().unwrap(),
-                    ));
+                    fields_per_row.push(
+                        read_u16_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)?,
+                    );
                     pos += 2;
                 }
                 let sel_len = ncols.div_ceil(4);
                 if pos + sel_len + ncols * 4 > payload.len() {
-                    return Vec::new();
+                    return Err(crate::error::RcnError::CorruptBlock(
+                        "csv-split selectors/col_lens overrun payload".into(),
+                    ));
                 }
                 let selectors = &payload[pos..pos + sel_len];
                 pos += sel_len;
                 let mut col_lens = Vec::with_capacity(ncols);
                 for _ in 0..ncols {
                     col_lens.push(
-                        u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize,
+                        read_u32_le(payload, pos).map_err(crate::error::RcnError::CorruptBlock)?
+                            as usize,
                     );
                     pos += 4;
                 }
                 let mut columns = Vec::with_capacity(ncols);
                 for (i, &clen) in col_lens.iter().enumerate() {
                     if pos + clen > payload.len() {
-                        return Vec::new();
+                        return Err(crate::error::RcnError::CorruptBlock(format!(
+                            "csv-split column {i} length {clen} overruns payload"
+                        )));
                     }
                     let pipe = unpack_selector(selectors, i);
                     columns.push(decode_stream_pick(&payload[pos..pos + clen], pipe));
@@ -742,58 +789,43 @@ impl BwtPipeline {
                     fields_per_row,
                     trailing_newline,
                 })
-                .unwrap_or_default()
             }
             BwtPipeline::XmlSplit => {
-                // Layout: [orig_len:u32][selector:u8][t_len:u32][a_len:u32][tags][attrs][text]
-                if payload.len() < 13 {
-                    return Vec::new();
-                }
-                let orig_len =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-                let selector = payload[4];
-                let tags_pipe = selector & 0x3;
-                let attrs_pipe = (selector >> 2) & 0x3;
-                let text_pipe = (selector >> 4) & 0x3;
-                let t_len =
-                    u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
-                let a_len =
-                    u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]) as usize;
-                let mut pos = 13;
-                if pos + t_len + a_len > payload.len() {
-                    return Vec::new();
-                }
-                let tags = decode_stream_pick(&payload[pos..pos + t_len], tags_pipe);
-                pos += t_len;
-                let attrs = decode_stream_pick(&payload[pos..pos + a_len], attrs_pipe);
-                pos += a_len;
-                let text = decode_stream_pick(&payload[pos..], text_pipe);
+                let (orig_len, selector, parts) = unpack_marked_streams(payload, 3)?;
                 crate::xml_split::join(
-                    &crate::xml_split::XmlStreams { tags, attrs, text },
+                    &crate::xml_split::XmlStreams {
+                        tags: decode_stream_pick(parts[0], selector & 0x3),
+                        attrs: decode_stream_pick(parts[1], (selector >> 2) & 0x3),
+                        text: decode_stream_pick(parts[2], (selector >> 4) & 0x3),
+                    },
                     orig_len,
                 )
-                .unwrap_or_default()
             }
             BwtPipeline::XwrtBwtMtfRle => {
-                // Layout: [orig_len:u32][encoded_len:u32][bwt_mtf_rle_encoded][dictionary_bytes]
                 if payload.len() < 8 {
-                    return Vec::new();
+                    return Err(crate::error::RcnError::CorruptBlock(
+                        "xwrt payload truncated".into(),
+                    ));
                 }
-                let orig_len =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-                let encoded_len =
-                    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                let orig_len = read_u32_le(payload, 0)
+                    .map_err(crate::error::RcnError::CorruptBlock)?
+                    as usize;
+                let encoded_len = read_u32_le(payload, 4)
+                    .map_err(crate::error::RcnError::CorruptBlock)?
+                    as usize;
                 if payload.len() < 8 + encoded_len {
-                    return Vec::new();
+                    return Err(crate::error::RcnError::CorruptBlock(
+                        "xwrt encoded body overruns payload".into(),
+                    ));
                 }
                 let mtf = bwt_mtf_rle_decode(&payload[8..8 + encoded_len]);
-                match global_dict {
+                Ok(match global_dict {
                     Some(gd) => crate::model::word::inverse_with_dict(&mtf, orig_len, gd),
                     None => {
                         let dict_data = &payload[8 + encoded_len..];
                         crate::model::word::xwrt_inverse_with_dict(&mtf, orig_len, dict_data)
                     }
-                }
+                })
             }
         }
     }
@@ -1113,7 +1145,9 @@ mod tests {
     fn bwt_pipeline_lzp_bwt_round_trip() {
         let text = b"the quick brown fox. \n".repeat(500);
         let encoded = BwtPipeline::LzpBwtMtf.encode(&text, None);
-        let decoded = BwtPipeline::LzpBwtMtf.decode(&encoded, text.len(), None);
+        let decoded = BwtPipeline::LzpBwtMtf
+            .decode(&encoded, text.len(), None)
+            .expect("decode");
         assert_eq!(decoded, text);
     }
 
@@ -1133,7 +1167,9 @@ mod tests {
     fn bwt_pipeline_json_split_round_trip() {
         let text = b"{\"name\":\"John\",\"age\":42,\"city\":\"New York\"}\n".repeat(500);
         let encoded = BwtPipeline::JsonSplit.encode(&text, None);
-        let decoded = BwtPipeline::JsonSplit.decode(&encoded, text.len(), None);
+        let decoded = BwtPipeline::JsonSplit
+            .decode(&encoded, text.len(), None)
+            .expect("decode");
         assert_eq!(decoded, text);
     }
 
@@ -1141,7 +1177,9 @@ mod tests {
     fn bwt_pipeline_csv_split_round_trip() {
         let text = b"name,age,city\nJohn,30,NYC\nAnna,28,LA\nBob,45,CHI\n".repeat(200);
         let encoded = BwtPipeline::CsvSplit.encode(&text, None);
-        let decoded = BwtPipeline::CsvSplit.decode(&encoded, text.len(), None);
+        let decoded = BwtPipeline::CsvSplit
+            .decode(&encoded, text.len(), None)
+            .expect("decode");
         assert_eq!(decoded, text);
     }
 
@@ -1150,7 +1188,9 @@ mod tests {
         let text = b"<catalog><book id=\"1\">Alpha</book><book id=\"2\">Beta</book></catalog>\n"
             .repeat(200);
         let encoded = BwtPipeline::XmlSplit.encode(&text, None);
-        let decoded = BwtPipeline::XmlSplit.decode(&encoded, text.len(), None);
+        let decoded = BwtPipeline::XmlSplit
+            .decode(&encoded, text.len(), None)
+            .expect("decode");
         assert_eq!(decoded, text);
     }
 
@@ -1159,8 +1199,67 @@ mod tests {
         let text = b"hello world hello world hello world".to_vec();
         let encoded = BwtPipeline::XwrtBwtMtfRle.encode(&text, None);
         eprintln!("XWRT encode len={} content={:?}", encoded.len(), encoded);
-        let decoded = BwtPipeline::XwrtBwtMtfRle.decode(&encoded, text.len(), None);
+        let decoded = BwtPipeline::XwrtBwtMtfRle
+            .decode(&encoded, text.len(), None)
+            .expect("decode");
         eprintln!("XWRT decode len={} content={:?}", decoded.len(), decoded);
         assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn bwt_pipeline_json_split_decode_truncated_payload_returns_err() {
+        let err = BwtPipeline::JsonSplit
+            .decode(&[0u8; 8], 0, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::RcnError::CorruptBlock(_)
+        ));
+    }
+
+    #[test]
+    fn bwt_pipeline_csv_split_decode_bad_col_len_returns_err() {
+        // Header claims 1 column with length 100 but no body bytes follow.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&10u32.to_le_bytes()); // orig_len
+        payload.push(b','); // delim
+        payload.push(1); // trailing_nl
+        payload.extend_from_slice(&1u16.to_le_bytes()); // ncols
+        payload.extend_from_slice(&1u32.to_le_bytes()); // nrows
+        payload.extend_from_slice(&1u16.to_le_bytes()); // fields_per_row[0]
+        payload.push(0); // selectors (ceil(1/4)=1)
+        payload.extend_from_slice(&100u32.to_le_bytes()); // col_len claims 100
+        // no column body
+        let err = BwtPipeline::CsvSplit
+            .decode(&payload, 10, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::RcnError::CorruptBlock(_) | crate::error::RcnError::CsvSplitError(_)
+        ));
+    }
+
+    #[test]
+    fn bwt_pipeline_xml_split_decode_truncated_payload_returns_err() {
+        let err = BwtPipeline::XmlSplit
+            .decode(&[0u8; 5], 0, None)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::RcnError::CorruptBlock(_)));
+    }
+
+    #[test]
+    fn bwt_pipeline_json_split_decode_merge_failure_not_empty_vec() {
+        // Valid-looking header with absurd stream lengths that fail merge.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u32.to_le_bytes()); // orig_len
+        payload.push(0); // selector
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        // empty streams → merge length mismatch
+        let err = BwtPipeline::JsonSplit
+            .decode(&payload, 100, None)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::RcnError::JsonSplitError(_)));
     }
 }

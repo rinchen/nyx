@@ -152,6 +152,8 @@ pub const METHOD_BYTE_XWRT_BWT_MTF_RLE: u8 = 12;
 pub const METHOD_BYTE_CSV_SPLIT: u8 = 17;
 /// Text XML split path, byte-coded (fast).
 pub const METHOD_BYTE_XML_SPLIT: u8 = 18;
+/// Exec E8E9 transform, byte-coded (fast).
+pub const METHOD_BYTE_EXEC_E8E9: u8 = 14;
 
 /// One block's compression summary, reported by [`compress_mode_diag`] for
 /// `--verbose` progress output.
@@ -189,11 +191,60 @@ pub fn method_label(method: u8) -> &'static str {
         METHOD_BYTE_XWRT_BWT_MTF_RLE => "byte-XWRT→BWT→MTF→RLE0",
         METHOD_BYTE_CSV_SPLIT => "byte-CSV-split→BWT",
         METHOD_BYTE_XML_SPLIT => "byte-XML-split→BWT",
+        METHOD_BYTE_EXEC_E8E9 => "byte-E8E9→CM",
         _ => "?",
     }
 }
-/// Exec E8E9 transform, byte-coded (fast).
-pub const METHOD_BYTE_EXEC_E8E9: u8 = 14;
+
+/// Map a chosen BWT pipeline to the container method byte for `mode`.
+fn method_for_pipeline(pipeline: bwt::BwtPipeline, mode: CodecMode) -> u8 {
+    match (mode, pipeline) {
+        (CodecMode::Slow, bwt::BwtPipeline::RawCm) => METHOD_TEXT,
+        (CodecMode::Slow, bwt::BwtPipeline::BwtMtfRle) => METHOD_BWT_MTF_RLE,
+        (CodecMode::Slow, bwt::BwtPipeline::LzpBwtMtf) => METHOD_LZP_BWT_MTF,
+        (CodecMode::Slow, bwt::BwtPipeline::JsonSplit) => METHOD_JSON_SPLIT,
+        (CodecMode::Slow, bwt::BwtPipeline::XwrtBwtMtfRle) => METHOD_XWRT_BWT_MTF_RLE,
+        (CodecMode::Slow, bwt::BwtPipeline::CsvSplit) => METHOD_CSV_SPLIT,
+        (CodecMode::Slow, bwt::BwtPipeline::XmlSplit) => METHOD_XML_SPLIT,
+        (CodecMode::Fast, bwt::BwtPipeline::RawCm) => METHOD_BYTE_CM,
+        (CodecMode::Fast, bwt::BwtPipeline::BwtMtfRle) => METHOD_BYTE_BWT_MTF_RLE,
+        (CodecMode::Fast, bwt::BwtPipeline::LzpBwtMtf) => METHOD_BYTE_LZP_BWT_MTF,
+        (CodecMode::Fast, bwt::BwtPipeline::JsonSplit) => METHOD_BYTE_JSON_SPLIT,
+        (CodecMode::Fast, bwt::BwtPipeline::XwrtBwtMtfRle) => METHOD_BYTE_XWRT_BWT_MTF_RLE,
+        (CodecMode::Fast, bwt::BwtPipeline::CsvSplit) => METHOD_BYTE_CSV_SPLIT,
+        (CodecMode::Fast, bwt::BwtPipeline::XmlSplit) => METHOD_BYTE_XML_SPLIT,
+    }
+}
+
+/// Reverse BWT / E8E9 / structured-split transforms after entropy decode.
+fn inverse_transform_for_method(
+    method: u8,
+    decoded: Vec<u8>,
+    orig_len: usize,
+    global_dict: Option<&XwrtDictionary>,
+) -> Result<Vec<u8>> {
+    match method {
+        METHOD_BYTE_BWT_MTF_RLE | METHOD_BWT_MTF_RLE => Ok(bwt::bwt_mtf_rle_decode(&decoded)),
+        METHOD_BYTE_LZP_BWT_MTF | METHOD_LZP_BWT_MTF => {
+            let mtf = bwt::bwt_mtf_decode(&decoded);
+            Ok(bwt::lzp_decode(&mtf, orig_len))
+        }
+        METHOD_BYTE_JSON_SPLIT | METHOD_JSON_SPLIT => {
+            bwt::BwtPipeline::JsonSplit.decode(&decoded, orig_len, global_dict)
+        }
+        METHOD_BYTE_XWRT_BWT_MTF_RLE | METHOD_XWRT_BWT_MTF_RLE => {
+            bwt::BwtPipeline::XwrtBwtMtfRle.decode(&decoded, orig_len, global_dict)
+        }
+        METHOD_BYTE_CSV_SPLIT | METHOD_CSV_SPLIT => {
+            bwt::BwtPipeline::CsvSplit.decode(&decoded, orig_len, global_dict)
+        }
+        METHOD_BYTE_XML_SPLIT | METHOD_XML_SPLIT => {
+            bwt::BwtPipeline::XmlSplit.decode(&decoded, orig_len, global_dict)
+        }
+        METHOD_BYTE_EXEC_E8E9 | METHOD_EXEC => Ok(crate::model::e8e9::e8e9_inverse(&decoded)),
+        _ => Ok(decoded),
+    }
+}
 
 /// Encoding strategy for [`compress_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,36 +449,8 @@ fn encode_block_fast(block_data: &[u8], kind: crate::classify::BlockKind) -> (Ve
         // byte-coded (one rANS symbol per byte instead of per bit).
         let trial = bwt::compress_text_with_trial(block_data, None);
         let transformed = trial.pipeline.encode(block_data, None);
-        let (comp, method) = match trial.pipeline {
-            bwt::BwtPipeline::RawCm => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_CM,
-            ),
-            bwt::BwtPipeline::BwtMtfRle => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_BWT_MTF_RLE,
-            ),
-            bwt::BwtPipeline::LzpBwtMtf => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_LZP_BWT_MTF,
-            ),
-            bwt::BwtPipeline::JsonSplit => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_JSON_SPLIT,
-            ),
-            bwt::BwtPipeline::XwrtBwtMtfRle => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_XWRT_BWT_MTF_RLE,
-            ),
-            bwt::BwtPipeline::CsvSplit => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_CSV_SPLIT,
-            ),
-            bwt::BwtPipeline::XmlSplit => (
-                crate::bytecodec::compress_block(&transformed),
-                METHOD_BYTE_XML_SPLIT,
-            ),
-        };
+        let method = method_for_pipeline(trial.pipeline, CodecMode::Fast);
+        let comp = crate::bytecodec::compress_block(&transformed);
         (comp, method, transformed.len())
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
@@ -465,15 +488,7 @@ fn encode_block_slow(
     } else if kind == crate::classify::BlockKind::Text {
         // Per-block trial: pick the best BWT pipeline for this Text block.
         let trial = bwt::compress_text_with_trial(block_data, global_dict);
-        let method = match trial.pipeline {
-            bwt::BwtPipeline::RawCm => METHOD_TEXT,
-            bwt::BwtPipeline::BwtMtfRle => METHOD_BWT_MTF_RLE,
-            bwt::BwtPipeline::LzpBwtMtf => METHOD_LZP_BWT_MTF,
-            bwt::BwtPipeline::JsonSplit => METHOD_JSON_SPLIT,
-            bwt::BwtPipeline::XwrtBwtMtfRle => METHOD_XWRT_BWT_MTF_RLE,
-            bwt::BwtPipeline::CsvSplit => METHOD_CSV_SPLIT,
-            bwt::BwtPipeline::XmlSplit => METHOD_XML_SPLIT,
-        };
+        let method = method_for_pipeline(trial.pipeline, CodecMode::Slow);
         // Transform the block data through the chosen pipeline, then CM-encode.
         let transformed = trial.pipeline.encode(block_data, global_dict);
         // For BWT paths, `orig_len` stores the *transformed* length (what the
@@ -1098,9 +1113,22 @@ where
     // Consume the global XWRT dictionary (if present) from between the header
     // and the BlockEntry table; every XWRT block refers back to it.
     let (global_dict_bytes, dict_end) =
-        read_global_dict(data, cur.position() as usize, header.flags);
+        read_global_dict(data, cur.position() as usize, header.flags)?;
     cur.set_position(dict_end as u64);
     let global_dict = XwrtDictionary::from_bytes(&global_dict_bytes);
+
+    // Bound entry-table size against remaining bytes (13 bytes each).
+    let entry_start = cur.position() as usize;
+    let entry_bytes = (header.num_blocks as usize).saturating_mul(13);
+    if entry_start.saturating_add(entry_bytes) > data.len() {
+        return Err(RcnError::InvalidContainer(format!(
+            "num_blocks {} requires {} entry bytes past offset {}, only {} available",
+            header.num_blocks,
+            entry_bytes,
+            entry_start,
+            data.len().saturating_sub(entry_start)
+        )));
+    }
 
     let mut entries = Vec::with_capacity(header.num_blocks as usize);
     for _ in 0..header.num_blocks {
@@ -1118,8 +1146,12 @@ where
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
     for (bi, entry) in entries.iter().enumerate() {
-        let comp = &payloads[pos..pos + entry.comp_len as usize];
-        pos += entry.comp_len as usize;
+        let comp_len = entry.comp_len as usize;
+        if pos.saturating_add(comp_len) > payloads.len() {
+            return Err(RcnError::TruncatedStream(bi));
+        }
+        let comp = &payloads[pos..pos + comp_len];
+        pos += comp_len;
 
         let block = if entry.method == METHOD_COPY {
             comp.to_vec()
@@ -1140,35 +1172,12 @@ where
                     RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
                     other => other,
                 })?;
-            match entry.method {
-                METHOD_BYTE_BWT_MTF_RLE => bwt::bwt_mtf_rle_decode(&decoded),
-                METHOD_BYTE_LZP_BWT_MTF => {
-                    let mtf = bwt::bwt_mtf_decode(&decoded);
-                    bwt::lzp_decode(&mtf, entry.orig_len as usize)
-                }
-                METHOD_BYTE_JSON_SPLIT => bwt::BwtPipeline::JsonSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_BYTE_XWRT_BWT_MTF_RLE => bwt::BwtPipeline::XwrtBwtMtfRle.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_BYTE_CSV_SPLIT => bwt::BwtPipeline::CsvSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_BYTE_XML_SPLIT => bwt::BwtPipeline::XmlSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_BYTE_EXEC_E8E9 => crate::model::e8e9::e8e9_inverse(&decoded),
-                _ => decoded,
-            }
+            inverse_transform_for_method(
+                entry.method,
+                decoded,
+                entry.orig_len as usize,
+                global_dict.as_ref(),
+            )?
         } else {
             let kind = kind_for_method(entry.method)?;
             if last_kind != Some(kind) {
@@ -1189,36 +1198,12 @@ where
                 RcnError::Entropy(s) => RcnError::CorruptBlock(s),
                 other => other,
             })?;
-            // Reverse BWT transforms for method 5/6, mirroring the encoder's trial.
-            match entry.method {
-                METHOD_BWT_MTF_RLE => bwt::bwt_mtf_rle_decode(&decoded),
-                METHOD_LZP_BWT_MTF => {
-                    let mtf = bwt::bwt_mtf_decode(&decoded);
-                    bwt::lzp_decode(&mtf, entry.orig_len as usize)
-                }
-                METHOD_JSON_SPLIT => bwt::BwtPipeline::JsonSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_XWRT_BWT_MTF_RLE => bwt::BwtPipeline::XwrtBwtMtfRle.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_CSV_SPLIT => bwt::BwtPipeline::CsvSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_XML_SPLIT => bwt::BwtPipeline::XmlSplit.decode(
-                    &decoded,
-                    entry.orig_len as usize,
-                    global_dict.as_ref(),
-                ),
-                METHOD_EXEC => crate::model::e8e9::e8e9_inverse(&decoded),
-                _ => decoded,
-            }
+            inverse_transform_for_method(
+                entry.method,
+                decoded,
+                entry.orig_len as usize,
+                global_dict.as_ref(),
+            )?
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -1411,5 +1396,134 @@ mod tests {
         let data = b"abcabcabcabc";
         let d = find_match_distance(data, 6, 3);
         assert_eq!(d, 3, "expected distance 3, got {}", d);
+    }
+
+    #[test]
+    fn compress_fast_then_decompress_returns_original() {
+        let original = mixed_fixture();
+        let comp = compress_fast(&original).expect("compress_fast");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "fast round-trip mismatch");
+    }
+
+    #[test]
+    fn compress_mode_fast_empty_input_round_trips() {
+        let comp = compress_mode(&[], CodecMode::Fast).expect("compress");
+        let back = decompress(&comp).expect("decompress");
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn compress_mode_fast_json_round_trips() {
+        let json = b"{\"name\":\"rcn\",\"level\":3,\"models\":[\"order0\",\"order1\"],\"ratio\":0.42}\n";
+        let original: Vec<u8> = std::iter::repeat(json.as_ref())
+            .take(4000)
+            .flatten()
+            .copied()
+            .collect();
+        let comp = compress_fast(&original).expect("compress_fast");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn compress_csv_round_trips() {
+        let csv = b"name,age,city\nJohn,30,NYC\nAnna,28,LA\nBob,45,CHI\n";
+        let original = csv.repeat(6000);
+        assert!(original.len() >= 256 * 1024);
+        let comp = compress(&original).expect("compress");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn compress_mode_fast_csv_round_trips() {
+        let csv = b"name,age,city\nJohn,30,NYC\nAnna,28,LA\nBob,45,CHI\n";
+        let original = csv.repeat(6000);
+        let comp = compress_fast(&original).expect("compress_fast");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn compress_xml_round_trips() {
+        let xml = b"<catalog><book id=\"1\">Alpha</book><book id=\"2\">Beta</book></catalog>\n";
+        let original = xml.repeat(5000);
+        assert!(original.len() >= 256 * 1024);
+        let comp = compress(&original).expect("compress");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn compress_mode_fast_xml_round_trips() {
+        let xml = b"<catalog><book id=\"1\">Alpha</book><book id=\"2\">Beta</book></catalog>\n";
+        let original = xml.repeat(5000);
+        let comp = compress_fast(&original).expect("compress_fast");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn method_label_covers_method_byte_exec_e8e9() {
+        assert_ne!(method_label(METHOD_BYTE_EXEC_E8E9), "?");
+    }
+
+    #[test]
+    fn decompress_unknown_method_errors() {
+        let mut buf = Vec::new();
+        Header {
+            version: VERSION,
+            flags: 0,
+            block_size_log: 16,
+            num_blocks: 1,
+        }
+        .write(&mut buf);
+        BlockEntry {
+            comp_len: 3,
+            orig_len: 3,
+            method: 99,
+            crc32: 0,
+        }
+        .write(&mut buf);
+        buf.extend_from_slice(b"abc");
+        let err = decompress(&buf).unwrap_err();
+        assert!(matches!(err, RcnError::InvalidContainer(_)));
+    }
+
+    #[test]
+    fn decompress_crc_mismatch_errors() {
+        let original = b"hello world hello world hello world".repeat(100);
+        // Fast path has no global dict, so the first BlockEntry starts at offset 11.
+        let mut comp = compress_fast(&original).expect("compress_fast");
+        let crc_off = 4 + 7 + 4 + 4 + 1; // magic+header+comp_len+orig_len+method
+        comp[crc_off] ^= 0xFF;
+        let err = decompress(&comp).unwrap_err();
+        assert!(matches!(err, RcnError::CrcMismatch(_, _, _)));
+    }
+
+    #[test]
+    fn decompress_rejects_comp_len_past_end_without_panic() {
+        let mut buf = Vec::new();
+        Header {
+            version: VERSION,
+            flags: 0,
+            block_size_log: 16,
+            num_blocks: 1,
+        }
+        .write(&mut buf);
+        BlockEntry {
+            comp_len: 1_000_000,
+            orig_len: 4,
+            method: METHOD_COPY,
+            crc32: 0,
+        }
+        .write(&mut buf);
+        buf.extend_from_slice(b"tiny");
+        let err = decompress(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            RcnError::TruncatedStream(_) | RcnError::InvalidContainer(_)
+        ));
     }
 }

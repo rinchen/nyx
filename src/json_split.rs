@@ -13,9 +13,10 @@
 //! cannot appear in JSON structural data (all JSON chars are ASCII < 128),
 //! making the merge unambiguous.
 
-/// Prefix byte that marks a length-prefixed fragment in the structural stream.
-/// Cannot appear in JSON structural data (all JSON chars are ASCII < 0x80).
-const MARK_PREFIX: u8 = 0xFE;
+use crate::split_common::{
+    check_stream_bounds, emit_marked_fragment, parse_marked_fragment, skip_ascii_whitespace,
+    MARK_PREFIX,
+};
 
 /// Stream channel identifier (appears after MARK_PREFIX + 4-byte length).
 const CHANNEL_KEY: u8 = b'K';
@@ -43,21 +44,6 @@ impl JsonStreams {
     pub fn total_len(&self) -> usize {
         self.structural.len() + self.keys.len() + self.string_values.len() + self.numbers.len()
     }
-}
-
-/// Helper: emit a length-prefixed fragment header + content to the structural stream.
-fn emit_fragment(
-    structural: &mut Vec<u8>,
-    content_stream: &mut Vec<u8>,
-    buf: &mut Vec<u8>,
-    channel: u8,
-) {
-    let len = buf.len() as u32;
-    structural.push(MARK_PREFIX);
-    structural.extend_from_slice(&len.to_le_bytes());
-    structural.push(channel);
-    content_stream.extend_from_slice(buf);
-    buf.clear();
 }
 
 /// Split `data` (a JSON text block) into four component streams.
@@ -101,14 +87,14 @@ pub fn split(data: &[u8]) -> JsonStreams {
                     let is_key = j < data.len() && data[j] == b':';
 
                     if is_key {
-                        emit_fragment(
+                        emit_marked_fragment(
                             &mut out.structural,
                             &mut out.keys,
                             &mut string_buf,
                             CHANNEL_KEY,
                         );
                     } else {
-                        emit_fragment(
+                        emit_marked_fragment(
                             &mut out.structural,
                             &mut out.string_values,
                             &mut string_buf,
@@ -136,7 +122,7 @@ pub fn split(data: &[u8]) -> JsonStreams {
             b'"' => {
                 // Start of a new string. Flush any pending number content first.
                 if !string_buf.is_empty() {
-                    emit_fragment(
+                    emit_marked_fragment(
                         &mut out.structural,
                         &mut out.numbers,
                         &mut string_buf,
@@ -149,7 +135,7 @@ pub fn split(data: &[u8]) -> JsonStreams {
             b'{' | b'}' | b'[' | b']' | b':' | b',' => {
                 // Flush any pending number content.
                 if !string_buf.is_empty() {
-                    emit_fragment(
+                    emit_marked_fragment(
                         &mut out.structural,
                         &mut out.numbers,
                         &mut string_buf,
@@ -161,7 +147,7 @@ pub fn split(data: &[u8]) -> JsonStreams {
             b' ' | b'\t' | b'\n' | b'\r' => {
                 // Flush any pending number content before whitespace.
                 if !string_buf.is_empty() {
-                    emit_fragment(
+                    emit_marked_fragment(
                         &mut out.structural,
                         &mut out.numbers,
                         &mut string_buf,
@@ -180,7 +166,7 @@ pub fn split(data: &[u8]) -> JsonStreams {
 
     // Flush any trailing number content.
     if !string_buf.is_empty() {
-        emit_fragment(
+        emit_marked_fragment(
             &mut out.structural,
             &mut out.numbers,
             &mut string_buf,
@@ -216,29 +202,29 @@ pub fn merge(
         let b = s[si];
 
         if b == MARK_PREFIX {
-            // Read 4-byte LE length + 1-byte channel tag.
-            if si + 5 >= s.len() {
-                return Err(crate::error::RcnError::JsonSplitError(format!(
+            let (len, channel, new_si) = parse_marked_fragment(s, si).ok_or_else(|| {
+                crate::error::RcnError::JsonSplitError(format!(
                     "truncated marker at structural offset {si}"
-                )));
-            }
-            let len = u32::from_le_bytes([s[si + 1], s[si + 2], s[si + 3], s[si + 4]]) as usize;
-            let channel = s[si + 5];
-            si += 6; // consume prefix + 4 length bytes + 1 channel byte
+                ))
+            })?;
+            si = new_si;
 
             match channel {
                 CHANNEL_KEY => {
-                    check_bounds(ki, len, keys.len(), "keys")?;
+                    check_stream_bounds(ki, len, keys.len(), "keys")
+                        .map_err(crate::error::RcnError::JsonSplitError)?;
                     out.extend_from_slice(&keys[ki..ki + len]);
                     ki += len;
                 }
                 CHANNEL_VALUE => {
-                    check_bounds(vi, len, vals.len(), "string_values")?;
+                    check_stream_bounds(vi, len, vals.len(), "string_values")
+                        .map_err(crate::error::RcnError::JsonSplitError)?;
                     out.extend_from_slice(&vals[vi..vi + len]);
                     vi += len;
                 }
                 CHANNEL_NUMBER => {
-                    check_bounds(ni, len, nums.len(), "numbers")?;
+                    check_stream_bounds(ni, len, nums.len(), "numbers")
+                        .map_err(crate::error::RcnError::JsonSplitError)?;
                     out.extend_from_slice(&nums[ni..ni + len]);
                     ni += len;
                 }
@@ -265,23 +251,6 @@ pub fn merge(
     Ok(out)
 }
 
-#[inline]
-fn check_bounds(
-    start: usize,
-    len: usize,
-    total: usize,
-    name: &str,
-) -> Result<(), crate::error::RcnError> {
-    if start + len > total {
-        Err(crate::error::RcnError::JsonSplitError(format!(
-            "stream '{name}' exhausted: need {len} bytes at offset {start}, only {} remaining",
-            total.saturating_sub(start)
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 /// Naive fallback merge — same as [`merge`] but without the final length check.
 pub fn merge_naive(streams: &JsonStreams, _original_len: usize) -> Vec<u8> {
     merge(streams, 0).unwrap_or_default()
@@ -295,10 +264,7 @@ pub fn looks_like_json(data: &[u8]) -> bool {
     }
 
     // JSON documents start with `[` or `{` (after optional whitespace).
-    let mut idx = 0;
-    while idx < data.len() && data[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
+    let idx = skip_ascii_whitespace(data);
     if idx >= data.len() {
         return false;
     }
@@ -309,7 +275,7 @@ pub fn looks_like_json(data: &[u8]) -> bool {
     }
 
     // Check for "key": pattern density in the first 8KB.
-    let sample = data.iter().take(8192).copied().collect::<Vec<_>>();
+    let sample = crate::split_common::sample_prefix(data);
     let colon_count = sample.iter().filter(|&&b| b == b':').count();
     let quote_count = sample.iter().filter(|&&b| b == b'"').count();
 
