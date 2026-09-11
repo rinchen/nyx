@@ -3,7 +3,7 @@
 # bench_vs_sota.sh — compare `rcn` against reference compressors on a corpus.
 #
 # Builds rcn (release), then for every regular file in the corpus directory runs
-# rcn (slow + fast), zstd -1 (fast baseline), zstd -19 (goal), xz -9, brotli -11,
+# rcn (slow + fast + hybrid), zstd -1 (fast baseline), zstd -19 (goal), xz -9, brotli -11,
 # lz4 -9, gzip -9 (skipping any not installed) and tabulates
 # (name, orig_kb, comp_kb, ratio%, cmp_MBps, dec_MBps).
 #
@@ -82,7 +82,7 @@ get_ratio() {
 }
 
 clear_ratios() {
-    unset RATIO_rcn RATIO_rcn_fast RATIO_zstd_1 RATIO_zstd_19 \
+    unset RATIO_rcn RATIO_rcn_fast RATIO_rcn_hybrid RATIO_zstd_1 RATIO_zstd_19 \
           RATIO_xz_9 RATIO_brotli_11 RATIO_lz4_9 RATIO_gzip_9 2>/dev/null || true
 }
 
@@ -111,7 +111,7 @@ print_file_scorecard() {
     local peers="zstd-19 xz-9 brotli-11 gzip-9 lz4-9 zstd-1"
     local any=0
 
-    for mode in rcn rcn-fast; do
+    for mode in rcn rcn-fast rcn-hybrid; do
         rcn_r="$(get_ratio "$mode")"
         [[ -n "$rcn_r" ]] || continue
         if [[ $any -eq 0 ]]; then
@@ -137,7 +137,7 @@ print_corpus_summary() {
     local peers="zstd-19 xz-9 brotli-11 gzip-9 lz4-9 zstd-1"
     local any=0
 
-    for mode in rcn rcn-fast; do
+    for mode in rcn rcn-fast rcn-hybrid; do
         for peer in $peers; do
             base="$(ratio_key "${mode}_${peer}")"
             eval "w=\${TALLY_${base}_w:-0}"
@@ -189,6 +189,15 @@ for f in "$CORPUS"/*; do
         t2="$(run_and_time "$WORK/nf.out" "$RCN" decompress "$WORK/nf.rcn" "$WORK/nf.out")"
         r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
         emit_row "rcn-fast" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
+    fi
+
+    # --- rcn hybrid (CLI default) ---
+    if [[ "${SKIP_RCN:-0}" != "1" && -x "$RCN" ]]; then
+        t="$(run_and_time "$WORK/nh.rcn" "$RCN" compress --mode hybrid "$f" "$WORK/nh.rcn")"
+        c="$(wc -c <"$WORK/nh.rcn" | tr -d '[:space:]')"
+        t2="$(run_and_time "$WORK/nh.out" "$RCN" decompress "$WORK/nh.rcn" "$WORK/nh.out")"
+        r="$(awk -v b="$c" -v o="$orig" 'BEGIN { printf "%.1f", b/o*100 }')"
+        emit_row "rcn-hybrid" "$okb" "$(awk -v b="$c" 'BEGIN{printf "%.1f",b/1024}')" "$r" "$(mbps "$orig" "$t")" "$(mbps "$orig" "$t2")"
     fi
 
     # --- zstd -1 (fast baseline; not the goal) ---

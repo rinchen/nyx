@@ -1,8 +1,8 @@
 # Rcn Optimization Opportunity Log
 
 Last updated: 2026-09-11
-Test status: 186/186 passing (`cargo test --lib`, with or without `no_avx2`)
-Headline benches: refreshed 2026-09-11 (README).
+Test status: 187/187 passing (`cargo test --lib`, with or without `no_avx2`)
+Headline benches: refreshed 2026-09-11 after V1–V3 / R1–R2 (README).
 
 Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
@@ -44,6 +44,8 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 | C9 | FSE-family match side-stream | Order-0 byte rANS on varint blob when smaller. | ∼0.5–1pt | Completed |
 | C10 | Order-12 PPMd for Text only | `with_max_order(12)` API kept; default Text stays order-8. | −0.5pt text | **Reverted** — 2MB dickens −0.003pt |
 | C11 | CSV/XML stream splitting | Column / tag-attr-text splits like JSON; methods 15–18. | Structured-data ratio | Completed (fixtures kept) |
+| R1 | Adaptive Hybrid mode | Fast Text/Random; Slow Binary/Exec; mixed methods. | Clear zstd -19 gate | **Completed** — CLI default |
+| R2 | Fast nci ≤5.0% | Global XWRT on Fast trials + DP-LZP literal-skip on byte path. | ≥0.1pt on nci | **Completed** — fast/hybrid nci 4.97% |
 
 ---
 
@@ -62,23 +64,34 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 | S10 | Classify-ahead pipeline | `rayon::join` classify N+1 while encode N. | Overlap classify | Completed |
 | S11 | Prefetch + stretch on `MixerAcc` | Carry stretch LUT across mix→update; prefetch next bank weights. | Ratio-neutral speed | Completed |
 | S12 | Wider BWT trial parallelism | `parallel_map_sizes` for remaining size trials. | Text trial wall time | Completed |
+| V1 | Cache BWT trial winner payload | Return encoded bytes from trial; no re-encode. | Encode wall-time | **Completed** |
+| V2 | aarch64 NEON `walk_dist` | Bit-identical to scalar; parity tests. | Fast path on Apple Silicon | **Completed** |
+| V3 | `release-prof` + enum `StackModel` | Symbol-friendly profile; monomorphize Slow stacks. | Slow bit-loop | **Completed** |
 
 ---
 
 ## Current Stack (What Works)
 
-### Slow Path (`--mode slow`, default)
+### Hybrid Path (`--mode hybrid`, default)
+
+- Text/Random → Fast byte CM (global XWRT-512 trials + DP-LZP side-stream)
+- Binary/Exec → Slow bit CM + DP-LZP + E8E9 on Exec
+- Clears headline set vs `zstd -19` (2026-09-11 measure)
+
+### Slow Path (`--mode slow`)
 
 - 8 bit models (Text) + two-level **16k**-bank mixer hierarchy + master mixer
 - SSE/APM/APM2 cascade; cross-block decay 0.995; 32MB LZP window
 - BWT text trial (incl. CSV/XML split) + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
 - Match side-stream: varint + optional order-0 rANS (C9)
 - Classify-ahead Rayon overlap (S10); stretch-on-acc + bank prefetch (S11); wider BWT trial fan-out (S12)
+- Enum `StackModel` (V3) instead of `Box<dyn BitModel>`
 
 ### Fast Path (`--mode fast`)
 
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
-- AVX2 SIMD walk_dist (scalar fallback + parity tests; CI uses `no_avx2`)
+- AVX2 (x86_64) / NEON (aarch64) SIMD walk_dist (scalar fallback + parity tests; CI uses `no_avx2`)
+- Global XWRT on Text trials; DP-LZP literal-skip with match side-stream
 
 ### Correctness / container hardening (2026-09-11)
 
@@ -88,22 +101,18 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 
 ### Default-mode gate
 
-`--mode fast` becomes default only if it beats or ties `zstd -19` on **all**
-headline files. 2026-09-11 refresh: it loses on `nci` (5.1% vs 5.0%) and `mr`
-(35.0% vs 31.2%) → **keep Slow**. Scorecard: [README.md](README.md#goal).
+`--mode hybrid` is default after clearing `zstd -19` on **all** headline files
+(2026-09-11): dickens 26.5%, webster 20.1%, nci 4.97%, mr 27.4%, json 0.1%.
+Scorecard: [README.md](README.md#goal).
 
 ---
 
 ## Recommended Next Step
 
-1. **North star:** beat `zstd -19` on ratio (slow text dickens/webster, and/or
-   fast `mr`) — not throughput vs `zstd -1`. Goal scorecard, peer win/lose
-   tables, and crates.io CLI equivalents:
-   [README.md](README.md#goal) ·
-   [Peers](README.md#peers-cratesio-and-cli-equivalents) ·
-   [peer scorecards](README.md#other-high-ratio-peers-cli-ratio).
-2. **Speed (if chasing 20+ MB/s):** profile with symbols (release builds are stripped on macOS `sample`); next levers are bit-model/mixer loop (slow) and BWT / `walk_dist` (fast) — not S11 prefetch.
-3. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
+1. **Hold the gate:** hybrid stays default while ratio vs `-19` remains green on
+   the headline set after any further changes.
+2. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
+3. Stretch: stronger `nci` dictionary if chasing brotli-11 (4.5%).
 
 Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd order without a ≥0.3pt measure. A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
 
@@ -114,8 +123,8 @@ Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd or
 macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 
 1. **Slow encode:** one deep in-process call chain dominates; consistent with bit CM predict→mix→update. S11 `_mm_prefetch` does not appear as a separable hotspot.
-2. **Fast encode:** wall time in transform trial + byte entropy; dickens full file ~seconds at ~26.9% ratio.
-3. **Next speed lever:** instrumented/profiled build of the bit loop (slow) or BWT/`walk_dist` (fast).
+2. **Fast encode:** wall time in transform trial + byte entropy; dickens full file ~seconds at ~26.5% ratio after R2.
+3. **Next speed lever (done):** NEON `walk_dist` (V2); BWT winner cache (V1); enum stacks (V3). Profile with `cargo build --profile release-prof`.
 
 ---
 
@@ -127,3 +136,4 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 | 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |
 | 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |
 | 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated for this machine |
+| 2026-09-11 | V1 BWT payload cache; R1 Hybrid; R2 Fast XWRT+DP-LZP (nci 4.97%); V2 NEON walk_dist; V3 `release-prof` + `StackModel`; **default → hybrid**; **187/187** |

@@ -172,7 +172,7 @@ where
     F: FnMut(
         rcn::classify::BlockKind,
     ) -> (
-        Vec<Box<dyn rcn::model::BitModel>>,
+        Vec<rcn::model::stack_enum::StackModel>,
         rcn::model::mixer_bank::MixerBank,
         Option<usize>,
     ),

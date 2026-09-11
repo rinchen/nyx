@@ -40,9 +40,12 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum, Default)]
 enum ModeArg {
-    /// Bit-level CM (default). Stronger on some binary; much slower; loses text to zstd -19.
+    /// Adaptive: Fast for Text, Slow for Binary/Exec (beats/ties zstd -19 on headline set).
+    #[default]
+    Hybrid,
+    /// Bit-level CM. Stronger on some binary; much slower; loses text to zstd -19.
     Slow,
     /// Byte-level CM. Usually better text ratio + throughput; loses to zstd -19 on mr.
     Fast,
@@ -61,8 +64,8 @@ enum Cmd {
         /// Entropy backend (only `rans` is built in).
         #[arg(long, default_value = "rans")]
         backend: String,
-        /// Entropy mode: `slow` (bit-level CM, default) or `fast` (byte-level CM).
-        #[arg(long, value_enum, default_value_t = ModeArg::Slow)]
+        /// Entropy mode: `hybrid` (default; Text→fast, Binary→slow), `slow`, or `fast`.
+        #[arg(long, value_enum, default_value_t = ModeArg::Hybrid)]
         mode: ModeArg,
         /// Print per-block kind, method, and sizes to stderr.
         #[arg(long, short = 'v')]
@@ -88,6 +91,9 @@ enum Cmd {
         /// Use the byte-level (fast) entropy mode.
         #[arg(long)]
         fast: bool,
+        /// Use Hybrid mode (Text→fast, Binary→slow). Default when neither flag set.
+        #[arg(long)]
+        hybrid: bool,
     },
     /// Run the library test suite and report PASS/FAIL.
     SelfTest,
@@ -111,7 +117,12 @@ fn run() -> Result<(), String> {
             verbose,
         } => cmd_compress(&input, &output, &backend, mode, verbose),
         Cmd::Decompress { input, output } => cmd_decompress(&input, &output),
-        Cmd::Bench { corpus, vs, fast } => cmd_bench(&corpus, vs.as_deref(), fast),
+        Cmd::Bench {
+            corpus,
+            vs,
+            fast,
+            hybrid,
+        } => cmd_bench(&corpus, vs.as_deref(), fast, hybrid),
         Cmd::SelfTest => cmd_selftest(),
     }
 }
@@ -132,6 +143,7 @@ fn cmd_compress(
     let mode = match mode {
         ModeArg::Slow => CodecMode::Slow,
         ModeArg::Fast => CodecMode::Fast,
+        ModeArg::Hybrid => CodecMode::Hybrid,
     };
     let (compressed, diags) = codec::compress_mode_diag(&data, mode)
         .map_err(|e| format!("compress failed: {e}"))?;
@@ -172,14 +184,21 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool) -> Result<(), String> {
+fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool, hybrid: bool) -> Result<(), String> {
     if !corpus.is_dir() {
         return Err(format!(
             "corpus path {} is not a directory",
             corpus.display()
         ));
     }
-    let mode = if fast { CodecMode::Fast } else { CodecMode::Slow };
+    let mode = if fast {
+        CodecMode::Fast
+    } else if hybrid {
+        CodecMode::Hybrid
+    } else {
+        // Bench default matches CLI compress default.
+        CodecMode::Hybrid
+    };
     println!(
         "{:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",
         "name", "orig_kb", "comp_kb", "ratio%", "cmp_MBps", "dec_MBps"

@@ -18,6 +18,7 @@ pub mod ppmd_ssm;
 pub mod sparse;
 pub mod sse_apm;
 pub mod ssm;
+pub mod stack_enum;
 pub mod word;
 
 /// Assembles whole bytes from the per-bit [`BitModel::update`] stream so context

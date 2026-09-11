@@ -831,8 +831,10 @@ impl BwtPipeline {
     }
 }
 
-/// Result of running all three paths and comparing sizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of running all BWT paths and comparing sizes.
+///
+/// Includes the winning transformed payload so callers do not re-encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BwtPathResult {
     /// The chosen pipeline.
     pub pipeline: BwtPipeline,
@@ -840,6 +842,8 @@ pub struct BwtPathResult {
     pub encoded_size: usize,
     /// Whether this is a transform path (BWT-based) or raw CM.
     pub is_bwt: bool,
+    /// Winning pipeline output (ready for CM / byte rANS).
+    pub payload: Vec<u8>,
 }
 
 /// Fast-path threshold: blocks smaller than this skip the BWT/JSON trials and
@@ -858,8 +862,8 @@ const TRIAL_MAX_SHANNON: f32 = 7.2;
 /// only help long-range structure that short blocks lack). Blocks under 1 MB
 /// (256 KB..1 MB) skip trials *unless* they look like JSON/CSV/XML — structured
 /// stream-splitting pays off from 256 KB up. Blocks above 1 MB use a Shannon
-/// guard: near-random text skips trials too. Only the **pipeline** and **size**
-/// are returned; the caller re-encodes with the chosen pipeline.
+/// guard: near-random text skips trials too. Returns the winning **pipeline**,
+/// **size**, and **payload** so callers do not re-encode.
 ///
 /// When detectors fire, structured-split paths (JSON / CSV / XML) are tried.
 /// When `global_dict` is `Some`, `XwrtBwtMtfRle` is also tried (ASCII-only).
@@ -880,31 +884,33 @@ pub fn compress_text_with_trial(
             pipeline: BwtPipeline::RawCm,
             encoded_size: data.len(),
             is_bwt: false,
+            payload: data.to_vec(),
         };
     }
 
     // Collect applicable size-trial closures (B, C, optional structured, optional XWRT)
-    // and run them concurrently via nested rayon::join.
+    // and run them concurrently via nested rayon::join. Each job returns the full
+    // payload so the winner need not be re-encoded by the caller.
     let try_xwrt = global_dict.is_some() && data.is_ascii();
-    type Trial = (BwtPipeline, usize);
+    type Trial = (BwtPipeline, Vec<u8>);
     let mut jobs: Vec<Box<dyn FnOnce() -> Trial + Send>> = Vec::new();
     jobs.push(Box::new(|| {
         (
             BwtPipeline::BwtMtfRle,
-            BwtPipeline::BwtMtfRle.encode(data, global_dict).len(),
+            BwtPipeline::BwtMtfRle.encode(data, global_dict),
         )
     }));
     jobs.push(Box::new(|| {
         (
             BwtPipeline::LzpBwtMtf,
-            BwtPipeline::LzpBwtMtf.encode(data, global_dict).len(),
+            BwtPipeline::LzpBwtMtf.encode(data, global_dict),
         )
     }));
     if is_json {
         jobs.push(Box::new(|| {
             (
                 BwtPipeline::JsonSplit,
-                BwtPipeline::JsonSplit.encode(data, global_dict).len(),
+                BwtPipeline::JsonSplit.encode(data, global_dict),
             )
         }));
     }
@@ -912,7 +918,7 @@ pub fn compress_text_with_trial(
         jobs.push(Box::new(|| {
             (
                 BwtPipeline::CsvSplit,
-                BwtPipeline::CsvSplit.encode(data, global_dict).len(),
+                BwtPipeline::CsvSplit.encode(data, global_dict),
             )
         }));
     }
@@ -920,7 +926,7 @@ pub fn compress_text_with_trial(
         jobs.push(Box::new(|| {
             (
                 BwtPipeline::XmlSplit,
-                BwtPipeline::XmlSplit.encode(data, global_dict).len(),
+                BwtPipeline::XmlSplit.encode(data, global_dict),
             )
         }));
     }
@@ -928,23 +934,25 @@ pub fn compress_text_with_trial(
         jobs.push(Box::new(|| {
             (
                 BwtPipeline::XwrtBwtMtfRle,
-                BwtPipeline::XwrtBwtMtfRle.encode(data, global_dict).len(),
+                BwtPipeline::XwrtBwtMtfRle.encode(data, global_dict),
             )
         }));
     }
 
-    let mut candidates: Vec<Trial> = vec![(BwtPipeline::RawCm, data.len())];
+    let mut candidates: Vec<Trial> = vec![(BwtPipeline::RawCm, data.to_vec())];
     candidates.extend(parallel_map_sizes(jobs));
 
-    let (best_pipeline, best_size) = candidates
+    let (best_pipeline, best_payload) = candidates
         .into_iter()
-        .min_by_key(|&(_, size)| size)
+        .min_by_key(|(_, payload)| payload.len())
         .unwrap();
+    let best_size = best_payload.len();
 
     BwtPathResult {
         pipeline: best_pipeline,
         encoded_size: best_size,
         is_bwt: best_pipeline != BwtPipeline::RawCm,
+        payload: best_payload,
     }
 }
 

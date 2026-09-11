@@ -36,6 +36,12 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+# Symbol-friendly release build for macOS `sample` / Instruments (V3).
+[profile.release-prof]
+inherits = "release"
+strip = "none"
+debug = 1
+
 [[bin]]
 name = "rcn"
 path = "src/main.rs"

@@ -27,7 +27,10 @@ is a ratio-first context-mixing compressor. The success metric is beating
 on compressed size (ratio), not matching
 .B zstd \-1
 on throughput. It stages BWT, LZP, and online logistic mixing, then
-entropy-codes with rANS into a .rcn (RCN1) container.
+entropy-codes with rANS into a .rcn (RCN1) container. The default mode is
+.B hybrid
+(Fast byte CM on Text blocks, Slow bit CM on Binary/Exec), which clears the
+headline corpus vs zstd \-19.
 .PP
 Invoke
 .B rcn \-h
@@ -58,13 +61,13 @@ is built in (default:
 .TP
 .BI \-\-mode \ mode
 Entropy mode:
+.B hybrid
+(default; Fast for Text/Random, Slow for Binary/Exec — clears zstd \-19 on the
+headline set),
 .B slow
-(bit-level CM, default; stronger on some binary) or
+(bit-level CM on every block), or
 .B fast
-(byte-level CM; better text/nci ratio and speed than slow; loses to zstd \-19 on nci/mr).
-Default stays
-.B slow
-until a mode also beats or ties zstd \-19 on the full headline set.
+(byte-level CM on every block; loses to zstd \-19 on mr).
 .TP
 .B \-v\fR, \fB\-\-verbose
 Print per-block kind, method, and sizes to stderr.
@@ -98,6 +101,9 @@ for peer numbers only).
 .TP
 .B \-\-fast
 Use the byte-level (fast) entropy mode.
+.TP
+.B \-\-hybrid
+Use Hybrid mode (also the bench default when neither flag is set).
 .RE
 .TP
 .B self-test

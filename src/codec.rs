@@ -18,22 +18,22 @@
 //!
 //! Strategy per block:
 //! - `Random` blocks are stored verbatim (copy record, method 0).
-//! - `Text` blocks (method 2) use a text-optimized stack: orders 0–2, Sparse,
-//!   Exec, Lzp, PpmModel order-3, WordModel, IndirectModel.
-//! - `Binary` blocks (method 3) use the full stack (orders 0–2, Sparse, Exec,
-//!   LZP, PPM order-3) — same as the legacy `method 1` CM path, since mixed binary
-//!   benefits from every signal.
-//! - `Exec` blocks (method 4) use a stack without the `Exec` model (redundant on
-//!   already-classified machine code) but keep orders 0–2, Sparse, LZP, PPM order-3.
-//! - Fallback / unknown (method 1) is the full heterogeneous stack, identical to the
-//!   original CM path. This is also the decoder default for any future method value,
-//!   so old streams remain valid.
+//! - `Text` blocks use a text-optimized stack: orders 0–2, Sparse, Exec, Lzp,
+//!   PpmdSsm (order-8), WordModel. (IndirectModel is in-tree but not default.)
+//! - `Binary` blocks use orders 0–2, Sparse, Exec, LZP, PPM order-3.
+//! - `Exec` blocks use orders 0–2, Sparse, LZP, PPM order-3 (no Exec model).
+//! - Fallback / unknown (method 1) is the Binary-like heterogeneous stack.
+//!   This is also the decoder default for any future method value, so old
+//!   streams remain valid.
+//!
+//! Default compress mode is **Hybrid**: Text/Random use the Fast byte path;
+//! Binary/Exec use the Slow bit path above.
 //!
 //! ## DP-optimal LZP match pre-pass (default)
 //!
 //! rcn runs a forward LZP match pre-pass
 //! with **DP optimal parsing** and emits explicit `(len, dist)` records for long
-//! matches (adaptive min length: Text ≥12, Binary/Exec ≥24, Random/other ≥16).
+//! matches (adaptive min length: Text ≥12, Binary/Exec ≥16).
 //! Matched bytes are **skipped** in the rANS stream —
 //! only literals (non-matched bytes) are CM-encoded. The decoder reconstructs
 //! matched bytes by copying from history.
@@ -58,7 +58,6 @@ use crate::model::lzp::Lzp;
 use crate::model::mixer_bank::MixerBank;
 use crate::model::sse_apm::SseApmCascade;
 use crate::model::word::XwrtDictionary;
-use crate::model::BitModel;
 
 /// Varint encoding: read/write unsigned LEB128. Most values in the match
 /// side-stream (pos deltas, lengths, distances) are small, so varint
@@ -198,6 +197,11 @@ pub fn method_label(method: u8) -> &'static str {
 
 /// Map a chosen BWT pipeline to the container method byte for `mode`.
 fn method_for_pipeline(pipeline: bwt::BwtPipeline, mode: CodecMode) -> u8 {
+    // Hybrid Text uses Fast method bytes; Hybrid Binary/Exec never calls this.
+    let mode = match mode {
+        CodecMode::Hybrid => CodecMode::Fast,
+        other => other,
+    };
     match (mode, pipeline) {
         (CodecMode::Slow, bwt::BwtPipeline::RawCm) => METHOD_TEXT,
         (CodecMode::Slow, bwt::BwtPipeline::BwtMtfRle) => METHOD_BWT_MTF_RLE,
@@ -213,6 +217,7 @@ fn method_for_pipeline(pipeline: bwt::BwtPipeline, mode: CodecMode) -> u8 {
         (CodecMode::Fast, bwt::BwtPipeline::XwrtBwtMtfRle) => METHOD_BYTE_XWRT_BWT_MTF_RLE,
         (CodecMode::Fast, bwt::BwtPipeline::CsvSplit) => METHOD_BYTE_CSV_SPLIT,
         (CodecMode::Fast, bwt::BwtPipeline::XmlSplit) => METHOD_BYTE_XML_SPLIT,
+        (CodecMode::Hybrid, _) => unreachable!("Hybrid remapped above"),
     }
 }
 
@@ -249,10 +254,12 @@ fn inverse_transform_for_method(
 /// Encoding strategy for [`compress_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecMode {
-    /// Bit-level CM: 8–9 models + two-level bank mixer + bit rANS (current default).
+    /// Bit-level CM: 8–9 models + two-level bank mixer + bit rANS.
     Slow,
     /// Byte-level CM: orders 0–2 count models + byte rANS.
     Fast,
+    /// Per-block adaptive: Fast entropy for Text/Random, Slow+DP-LZP for Binary/Exec.
+    Hybrid,
 }
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
@@ -262,11 +269,13 @@ const BLOCK_DECAY: f32 = 0.995;
 
 /// Compress `buf` into a `RCN1` container using classifier-aware stacks.
 ///
+/// Default mode is [`CodecMode::Hybrid`] (Fast Text, Slow Binary/Exec).
+///
 /// # Errors
 ///
 /// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress(buf: &[u8]) -> Result<Vec<u8>> {
-    compress_mode(buf, CodecMode::Slow)
+    compress_mode(buf, CodecMode::Hybrid)
 }
 
 /// Compress `buf` using the byte-level (fast) path.
@@ -278,9 +287,18 @@ pub fn compress_fast(buf: &[u8]) -> Result<Vec<u8>> {
     compress_mode(buf, CodecMode::Fast)
 }
 
+/// Compress `buf` using Hybrid mode: Fast for Text/Random, Slow for Binary/Exec.
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if an entropy primitive fails.
+pub fn compress_hybrid(buf: &[u8]) -> Result<Vec<u8>> {
+    compress_mode(buf, CodecMode::Hybrid)
+}
+
 pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
-    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
     Ok(compress_impl(buf, CodecMode::Slow, build_stack)?.0)
 }
@@ -311,7 +329,7 @@ fn compress_impl<F>(
     build_stack: &mut F,
 ) -> Result<(Vec<u8>, Vec<BlockDiag>)>
 where
-    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
     let mut out = Vec::new();
     let mut entries: Vec<BlockEntry> = Vec::new();
@@ -320,18 +338,15 @@ where
     let mut offset = 0usize;
 
     let mut last_kind: Option<crate::classify::BlockKind> = None;
-    let mut models: Vec<Box<dyn BitModel>> = Vec::new();
+    let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
 
-    // First pass: build a global XWRT dictionary from the entire corpus.
-    // Stored once in the container header and shared by all Text-block XWRT
-    // trials (replaces the per-block dictionary, which costs ~0.5-1pt).
-    let global_dict: Option<XwrtDictionary> =
-        (mode == CodecMode::Slow).then(|| XwrtDictionary::build_from_data(buf));
+    // Global XWRT dictionary for Text BWT trials (Slow, Fast, and Hybrid Text).
+    let global_dict: Option<XwrtDictionary> = Some(XwrtDictionary::build_from_data(buf));
 
-    // Prefetched (end, kind) for the next Slow-mode block — filled by overlapping
-    // classify of N+1 while encoding N (bit-identical: encode stays serial).
+    // Prefetched (end, kind) for the next block — filled by overlapping classify
+    // of N+1 while encoding N (bit-identical: encode stays serial).
     let mut pending_next: Option<(usize, crate::classify::BlockKind)> = None;
 
     while offset < buf.len() {
@@ -344,7 +359,18 @@ where
         };
         let block_data = &buf[offset..end];
 
-        if mode == CodecMode::Slow && last_kind != Some(kind) {
+        // Hybrid: Text/Random → Fast; Binary/Exec → Slow. Pure Slow always uses
+        // the bit stack; Fast never does.
+        let use_slow = match mode {
+            CodecMode::Slow => true,
+            CodecMode::Fast => false,
+            CodecMode::Hybrid => matches!(
+                kind,
+                crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
+            ),
+        };
+
+        if use_slow && last_kind != Some(kind) {
             let (new_models, new_mixer, new_lzp_idx) = build_stack(kind);
             models = new_models;
             mixer = new_mixer;
@@ -353,43 +379,43 @@ where
         }
 
         let next_start = end;
-        let (comp, method, store_orig_len) = match mode {
-            CodecMode::Fast => encode_block_fast(block_data, kind),
-            CodecMode::Slow if next_start < buf.len() => {
-                // Overlap classify+size of block N+1 with encode of block N.
-                let ((c, m, o), next) = rayon::join(
-                    || {
-                        encode_block_slow(
-                            block_data,
-                            kind,
-                            &mut models,
-                            &mut mixer,
-                            lzp_idx,
-                            global_dict.as_ref(),
-                        )
-                    },
-                    || {
-                        let next_kind = crate::classify::classify(&buf[next_start..]);
-                        let next_size = block_size_for_kind(
-                            next_kind,
-                            &buf[next_start..],
-                            next_start,
-                            buf.len(),
-                        );
-                        ((next_start + next_size).min(buf.len()), next_kind)
-                    },
-                );
-                pending_next = Some(next);
-                (c, m, o)
-            }
-            CodecMode::Slow => encode_block_slow(
+        let overlap_classify = use_slow && next_start < buf.len();
+        let (comp, method, store_orig_len) = if overlap_classify {
+            let ((c, m, o), next) = rayon::join(
+                || {
+                    encode_block_slow(
+                        block_data,
+                        kind,
+                        &mut models,
+                        &mut mixer,
+                        lzp_idx,
+                        global_dict.as_ref(),
+                    )
+                },
+                || {
+                    let next_kind = crate::classify::classify(&buf[next_start..]);
+                    let next_size = block_size_for_kind(
+                        next_kind,
+                        &buf[next_start..],
+                        next_start,
+                        buf.len(),
+                    );
+                    ((next_start + next_size).min(buf.len()), next_kind)
+                },
+            );
+            pending_next = Some(next);
+            (c, m, o)
+        } else if use_slow {
+            encode_block_slow(
                 block_data,
                 kind,
                 &mut models,
                 &mut mixer,
                 lzp_idx,
                 global_dict.as_ref(),
-            ),
+            )
+        } else {
+            encode_block_fast(block_data, kind, global_dict.as_ref())
         };
 
         let entry = BlockEntry {
@@ -409,10 +435,10 @@ where
         offset = end;
 
         // Decay (not reset) at block boundaries: preserve learned weight
-        // structure across same-kind blocks in the stream. Skip for copy blocks
+        // structure across same-kind Slow blocks. Skip for copy blocks
         // (no models were trained, no mixer state to decay) — mirrors the
         // decoder's `entry.method != METHOD_COPY` guard.
-        if mode == CodecMode::Slow && method != METHOD_COPY {
+        if use_slow && method != METHOD_COPY {
             mixer.decay(BLOCK_DECAY);
         }
     }
@@ -441,41 +467,54 @@ where
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
-fn encode_block_fast(block_data: &[u8], kind: crate::classify::BlockKind) -> (Vec<u8>, u8, usize) {
+fn encode_block_fast(
+    block_data: &[u8],
+    kind: crate::classify::BlockKind,
+    global_dict: Option<&crate::model::word::XwrtDictionary>,
+) -> (Vec<u8>, u8, usize) {
     if kind == crate::classify::BlockKind::Random {
         (block_data.to_vec(), METHOD_COPY, block_data.len())
     } else if kind == crate::classify::BlockKind::Text {
-        // Same BWT trial as the bit path; the chosen pipeline's output is then
-        // byte-coded (one rANS symbol per byte instead of per bit).
-        let trial = bwt::compress_text_with_trial(block_data, None);
-        let transformed = trial.pipeline.encode(block_data, None);
+        // Same BWT trial as the bit path; the chosen pipeline's payload is then
+        // byte-coded with DP-LZP literal-skip (R2).
+        let trial = bwt::compress_text_with_trial(block_data, global_dict);
         let method = method_for_pipeline(trial.pipeline, CodecMode::Fast);
-        let comp = crate::bytecodec::compress_block(&transformed);
-        (comp, method, transformed.len())
+        let transformed = trial.payload;
+        let store_len = transformed.len();
+        let comp = compress_byte_with_matches(&transformed, kind);
+        (comp, method, store_len)
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
         // making them much more compressible.
         let transformed = crate::model::e8e9::e8e9_transform(block_data);
-        (
-            crate::bytecodec::compress_block(&transformed),
-            METHOD_BYTE_EXEC_E8E9,
-            transformed.len(),
-        )
+        let comp = compress_byte_with_matches(&transformed, kind);
+        (comp, METHOD_BYTE_EXEC_E8E9, transformed.len())
     } else {
-        // Binary: raw byte CM.
-        (
-            crate::bytecodec::compress_block(block_data),
-            METHOD_BYTE_CM,
-            block_data.len(),
-        )
+        // Binary: raw byte CM + DP-LZP.
+        let comp = compress_byte_with_matches(block_data, kind);
+        (comp, METHOD_BYTE_CM, block_data.len())
     }
+}
+
+/// Byte CM with DP-LZP match side-stream (same framing as the bit path).
+fn compress_byte_with_matches(data: &[u8], kind: crate::classify::BlockKind) -> Vec<u8> {
+    let runs = scan_matches(data, kind);
+    let byte_runs: Vec<crate::bytecodec::ByteMatchRun> = runs
+        .iter()
+        .map(|r| crate::bytecodec::ByteMatchRun {
+            pos: r.pos,
+            len: r.len,
+            dist: r.dist,
+        })
+        .collect();
+    crate::bytecodec::compress_block_with_matches(data, &byte_runs)
 }
 
 /// Slow-mode per-block encode: bit-level CM with the classifier-aware stacks.
 fn encode_block_slow(
     block_data: &[u8],
     kind: crate::classify::BlockKind,
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     global_dict: Option<&crate::model::word::XwrtDictionary>,
@@ -489,13 +528,14 @@ fn encode_block_slow(
         // Per-block trial: pick the best BWT pipeline for this Text block.
         let trial = bwt::compress_text_with_trial(block_data, global_dict);
         let method = method_for_pipeline(trial.pipeline, CodecMode::Slow);
-        // Transform the block data through the chosen pipeline, then CM-encode.
-        let transformed = trial.pipeline.encode(block_data, global_dict);
+        // Winning payload is returned by the trial — do not re-encode.
+        let transformed = trial.payload;
         // For BWT paths, `orig_len` stores the *transformed* length (what the
         // decoder must decode from rANS). The original length is recovered
         // during BWT reversal; correctness is verified by CRC.
+        let store_len = transformed.len();
         let comp = compress_block(models, mixer, lzp_idx, &transformed, kind);
-        (comp, method, transformed.len())
+        (comp, method, store_len)
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
         // making them much more compressible.
@@ -546,57 +586,60 @@ pub const fn method_for_kind(kind: crate::classify::BlockKind) -> u8 {
 #[must_use]
 pub fn build_stack_for_kind(
     kind: crate::classify::BlockKind,
-) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
+) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>) {
     match kind {
         // Random: copy, no models needed (encoder won't call compress_block).
         crate::classify::BlockKind::Random => {
-            let models: Vec<Box<dyn BitModel>> = vec![];
+            let models: Vec<crate::model::stack_enum::StackModel> = vec![];
             (models, MixerBank::new(0), None)
         }
         crate::classify::BlockKind::Text => {
             // Text stack: orders 0–2, Sparse, Exec, LZP, PPMd+SSM, Word.
             // IndirectModel was tried with 16k banks (C8); kept in-tree but not
             // in the default stack after prior dickens regressions.
+            use crate::model::stack_enum::StackModel;
             let n = 8;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::exec::Exec::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
+            let models: Vec<StackModel> = vec![
+                StackModel::Order(crate::model::order::OrderN::new(0)),
+                StackModel::Order(crate::model::order::OrderN::new(1)),
+                StackModel::Order(crate::model::order::OrderN::new(2)),
+                StackModel::Sparse(crate::model::sparse::Sparse::new()),
+                StackModel::Exec(crate::model::exec::Exec::new()),
+                StackModel::Lzp(crate::model::lzp::Lzp::new()),
                 // C10 Order-12 measured ~0pt on text (2MB dickens −0.003pt); keep default order-8.
-                Box::new(crate::model::ppmd_ssm::PpmdSsm::new()),
-                Box::new(crate::model::word::WordModel::new()),
+                StackModel::Ppmd(crate::model::ppmd_ssm::PpmdSsm::new()),
+                StackModel::Word(crate::model::word::WordModel::new()),
             ];
             (models, MixerBank::new(n), Some(5))
         }
         crate::classify::BlockKind::Binary => {
             // Binary stack (best configuration, no SSM).
             // with orders 0-2, Sparse, Exec, LZP, PPM order-3
+            use crate::model::stack_enum::StackModel;
             let n = 7;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::exec::Exec::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
+            let models: Vec<StackModel> = vec![
+                StackModel::Order(crate::model::order::OrderN::new(0)),
+                StackModel::Order(crate::model::order::OrderN::new(1)),
+                StackModel::Order(crate::model::order::OrderN::new(2)),
+                StackModel::Sparse(crate::model::sparse::Sparse::new()),
+                StackModel::Exec(crate::model::exec::Exec::new()),
+                StackModel::Lzp(crate::model::lzp::Lzp::new()),
+                StackModel::Ppm(crate::model::ppm::PpmModel::new(3)),
             ];
             (models, MixerBank::new(n), Some(5))
         }
         crate::classify::BlockKind::Exec => {
             // Exec stack (best configuration, no SSM).
             // with orders 0-2, Sparse, LZP, PPM order-3; no Exec model
+            use crate::model::stack_enum::StackModel;
             let n = 6;
-            let models: Vec<Box<dyn BitModel>> = vec![
-                Box::new(crate::model::order::OrderN::new(0)),
-                Box::new(crate::model::order::OrderN::new(1)),
-                Box::new(crate::model::order::OrderN::new(2)),
-                Box::new(crate::model::sparse::Sparse::new()),
-                Box::new(crate::model::lzp::Lzp::new()),
-                Box::new(crate::model::ppm::PpmModel::new(3)),
+            let models: Vec<StackModel> = vec![
+                StackModel::Order(crate::model::order::OrderN::new(0)),
+                StackModel::Order(crate::model::order::OrderN::new(1)),
+                StackModel::Order(crate::model::order::OrderN::new(2)),
+                StackModel::Sparse(crate::model::sparse::Sparse::new()),
+                StackModel::Lzp(crate::model::lzp::Lzp::new()),
+                StackModel::Ppm(crate::model::ppm::PpmModel::new(3)),
             ];
             (models, MixerBank::new(n), Some(4))
         }
@@ -605,7 +648,7 @@ pub fn build_stack_for_kind(
 
 /// Legacy alias kept for benchmark tooling (`src/stacks.rs`).
 #[must_use]
-pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) {
+pub fn build_full_stack() -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>) {
     build_stack_for_kind(crate::classify::BlockKind::Binary)
 }
 
@@ -615,7 +658,7 @@ pub fn build_full_stack() -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>) 
 /// side-stream records, then rANS-encodes only **literal** (non-matched) bytes.
 /// Matched bytes are reconstructed by the decoder from the side-stream.
 fn compress_block(
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     block: &[u8],
@@ -627,7 +670,7 @@ fn compress_block(
 
 /// Plain CM encoding (no match side-stream).
 fn encode_block_plain(
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     block: &[u8],
@@ -680,7 +723,7 @@ fn encode_block_plain(
 }
 
 fn encode_block_with_matches(
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     block: &[u8],
@@ -896,7 +939,7 @@ fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
 fn decode_block(
     comp: &[u8],
     orig_len: usize,
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
@@ -906,7 +949,7 @@ fn decode_block(
 fn decode_block_plain(
     comp: &[u8],
     orig_len: usize,
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
@@ -949,7 +992,7 @@ fn decode_block_plain(
 fn decode_block_with_matches(
     comp: &[u8],
     orig_len: usize,
-    models: &mut [Box<dyn BitModel>],
+    models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
 ) -> Result<Vec<u8>> {
@@ -1092,14 +1135,14 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 /// garbage and the CRC check will fail.
 pub fn decompress_with<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
-    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
     decompress_impl(data, build_stack)
 }
 
 fn decompress_impl<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
-    F: FnMut(crate::classify::BlockKind) -> (Vec<Box<dyn BitModel>>, MixerBank, Option<usize>),
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
     use std::io::Cursor;
     let mut cur = Cursor::new(data);
@@ -1142,7 +1185,7 @@ where
     let mut out = Vec::new();
     let mut pos = 0usize;
     let mut last_kind: Option<crate::classify::BlockKind> = None;
-    let mut models: Vec<Box<dyn BitModel>> = Vec::new();
+    let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
     for (bi, entry) in entries.iter().enumerate() {
@@ -1166,12 +1209,13 @@ where
                 | METHOD_BYTE_XML_SPLIT
                 | METHOD_BYTE_EXEC_E8E9
         ) {
-            // Byte-level (fast) path: one rANS symbol per byte.
-            let decoded = crate::bytecodec::decompress_block(comp, entry.orig_len as usize)
-                .map_err(|e| match e {
-                    RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
-                    other => other,
-                })?;
+            // Byte-level (fast) path: DP-LZP side-stream + rANS on literals.
+            let decoded =
+                crate::bytecodec::decompress_block_with_matches(comp, entry.orig_len as usize)
+                    .map_err(|e| match e {
+                        RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
+                        other => other,
+                    })?;
             inverse_transform_for_method(
                 entry.method,
                 decoded,
@@ -1407,6 +1451,14 @@ mod tests {
     }
 
     #[test]
+    fn compress_hybrid_then_decompress_returns_original() {
+        let original = mixed_fixture();
+        let comp = compress_hybrid(&original).expect("compress_hybrid");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "hybrid round-trip mismatch");
+    }
+
+    #[test]
     fn compress_mode_fast_empty_input_round_trips() {
         let comp = compress_mode(&[], CodecMode::Fast).expect("compress");
         let back = decompress(&comp).expect("decompress");
@@ -1494,9 +1546,18 @@ mod tests {
     #[test]
     fn decompress_crc_mismatch_errors() {
         let original = b"hello world hello world hello world".repeat(100);
-        // Fast path has no global dict, so the first BlockEntry starts at offset 11.
         let mut comp = compress_fast(&original).expect("compress_fast");
-        let crc_off = 4 + 7 + 4 + 4 + 1; // magic+header+comp_len+orig_len+method
+        // Locate first BlockEntry CRC (after magic+header+optional global dict).
+        let mut cur = std::io::Cursor::new(comp.as_slice());
+        let header = crate::container::Header::read(&mut cur).expect("header");
+        let (_, dict_end) = crate::container::read_global_dict(
+            &comp,
+            cur.position() as usize,
+            header.flags,
+        )
+        .expect("dict");
+        // BlockEntry: comp_len(4)+orig_len(4)+method(1)+crc32(4); CRC starts at +9.
+        let crc_off = dict_end + 9;
         comp[crc_off] ^= 0xFF;
         let err = decompress(&comp).unwrap_err();
         assert!(matches!(err, RcnError::CrcMismatch(_, _, _)));

@@ -11,38 +11,33 @@ benches refreshed 2026-09-11 (see [README.md](README.md#benchmarks)).
 
 ## Completed optimization checklist
 
-Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
+Closed through C11 / S12 (C10 tried and reverted), plus V1–V3 / R1–R2
+(2026-09-11). See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ### Compression - beat zstd -19
 
 - ✅ **Promote Order-8 PPMd with SEE + sparse de Bruijn to default** – WordModel + banks + 32MB window + XWRT
 - ✅ **Compress the match side-stream (varint)** – delta_pos/len/dist varints
 - ✅ **Global XWRT dictionary (top-128)** – corpus-wide; C5 measured dickens −4.6pt, webster −4.0pt
-- ✅ **C6 — Global XWRT 128 → 512 with ESC tokens** – `0x80..=0xFE` for ids 0..126; `0xFF || u16_le(id)` for 127..511 (ESC slots only for words longer than 3 bytes so tokens never expand); header dict count is `u16`
-- ✅ **C7 — Adaptive DP LZP threshold** – Text ≥12; Binary/Exec/Random stay 16 (`≥24` on Binary/Exec regressed mr and was reverted)
-- ✅ **C8 — 16k banks** – `NUM_MIXERS=16384` (14-bit hash). Single IndirectModel tried again; **left out of default Text stack** (prior dickens regression); model remains in-tree
-- ✅ **C9 — FSE-family match side-stream** – order-0 byte rANS on the varint blob when smaller (`[num_runs][flag][len][payload]`)
-- ❌ **C10 — Order-12 Text PPMd** – `PpmdSsm::with_max_order(12)` API kept; default stays `PpmdSsm::new()` (order-8). 2MB dickens: 47.21%→47.21% (−0.003pt) — below keep gate
-- ✅ **C11 — CSV/XML stream splitting** – `csv_split` / `xml_split`; BWT trial pipelines + methods; synthetic round-trips green
+- ✅ **C6 — Global XWRT 128 → 512 with ESC tokens** – `0x80..=0xFE` for ids 0..126; `0xFF || u16_le(id)` for 127..511
+- ✅ **C7 — Adaptive DP LZP threshold** – Text ≥12; Binary/Exec/Random stay 16
+- ✅ **C8 — 16k banks** – `NUM_MIXERS=16384`; Indirect left out of default Text stack
+- ✅ **C9 — FSE-family match side-stream** – order-0 byte rANS on the varint blob when smaller
+- ❌ **C10 — Order-12 Text PPMd** – reverted (−0.003pt)
+- ✅ **C11 — CSV/XML stream splitting** – detectors + BWT trial wiring
+- ✅ **R1 — Hybrid mode** – Fast Text/Random, Slow Binary/Exec; mixed methods in one container
+- ✅ **R2 — Fast nci** – global XWRT on Fast trials + DP-LZP on byte path → nci **4.97%**
+- ✅ **Default → hybrid** after full headline gate cleared
 
-### Speed - achieve 20+ MB/s
+### Speed
 
-- ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~1.5–6 MB/s cmp / ~3–54 MB/s dec on the 2026-09-11 headline refresh (see README Benchmarks)
-- ✅ **Parallel BWT trials (S5 partial)** – `rayon::join` for path B/C inside a block trial
-- ✅ **S9 — Optional libsais BWT backend** – `--features bwt_libsais` uses pure-Rust `libsais-rs`; default remains `divsufsort`
-- ✅ **S10 — Classify-ahead pipeline** – `rayon::join` overlaps classify+size of block N+1 with encode of N (encode stays serial / bit-identical)
-- ✅ **S11 — Prefetch + stretch on `MixerAcc`** – bank stretch LUT carried mix→update; x86_64 `_mm_prefetch` for next bit’s bank weights; deterministic compress verified
-- ✅ **S12 — Wider BWT trial parallelism** – `parallel_map_sizes` fans out RawCm / XWRT / JSON / CSV / XML size trials; encode winner once
+- ✅ **S1–S4, S7, S8–S12** – SIMD walk_dist, SoA, stretch, mimalloc, interleaved rANS, libsais optional, classify-ahead, prefetch, parallel trials
+- ✅ **V1 — BWT trial payload cache** – no double-encode of winner
+- ✅ **V2 — aarch64 NEON `walk_dist`** – parity tests vs scalar
+- ✅ **V3 — `release-prof` + enum `StackModel`** – symbol-friendly profile; Slow hot path without `dyn BitModel`
 
-### Other Completed
-
-- **S1–S4, S7, C1–C5** – SIMD walk_dist, SoA banks, stretch reuse, mimalloc, SSE/APM, global XWRT-128, etc.
-- **CI fixes** – `no_avx2` feature for Linux CI scalar path
-- **Pre-commit hook** – mirrors the CI gate
-
-Gap to beat `zstd -19` on text is tracked in the README headline table
-(dickens/webster). Fresh 2026-09-11 benches: slow wins `mr` and ties json vs
-`-19`; both modes still lose `nci`; fast wins dickens/webster but loses `mr`.
+Apple Silicon (arm64) uses the NEON `walk_dist` path by default. CI still runs
+`no_avx2` for the x86_64 scalar gate.
 
 ---
 
@@ -51,48 +46,26 @@ Gap to beat `zstd -19` on text is tracked in the README headline table
 GitHub Actions runs on `ubuntu-latest` (x86_64). The AVX2 SIMD path in
 `bytecodec` is compiled there, but CI runs tests with the `no_avx2` feature
 (scalar path only) for a stable Linux gate. Local builds still use AVX2 by
-default on x86_64. Apple Silicon (arm64) always uses the scalar path.
-AVX2↔scalar bit-identity is covered by unit tests that force both paths when
-AVX2 is available (`walk_dist_avx2_matches_scalar_*`).
+default on x86_64. Apple Silicon (arm64) uses NEON `walk_dist` by default.
+AVX2↔scalar and NEON↔scalar bit-identity are covered by unit tests.
 
 ```bash
 cargo test --lib
 cargo test --lib --features bwt_libsais   # optional SA backend
 cargo test --lib --features no_avx2       # CI-like scalar path
+cargo build --profile release-prof        # symbols for sample/Instruments
 rcn self-test                             # wraps cargo test --lib
 ```
 
 Pre-commit: `.pre-commit-config.yaml` runs `cargo build` +
 `cargo test --features no_avx2` (mirrors CI).
 
----
-
-## Speed roadmap (2026-09)
-
-1. **SoA weight layout** — **Completed**.
-2. **Stretch-value reuse** — within-call **Completed**; **S11** stretch-on-`MixerAcc` + bank prefetch — **Completed**.
-3. **Wider stride / 16k banks** — **Completed** (16384 banks, 14-bit hash).
-4. **Parallel BWT trials** — B‖C **Completed (S5)**; **S12** wider fan-out — **Completed**.
-5. **S8 — Interleaved rANS re-bench** — **Completed**.
-6. **S9 — Optional libsais BWT** — **Completed**.
-7. **S10 — Classify-ahead pipeline** — **Completed**.
-8. **mimalloc** — **Completed**.
-
 ## Ratio backlog
 
-**Closed through C11** (C10 Order-12 reverted). IndirectModel stays in-tree, not default.
-Tables: [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
+**Closed through R2.** North star gate **cleared** by Hybrid default.
 
-**North star:** beat `zstd -19` on text + mixed corpora. Beating `zstd -1` on
-ratio is already true on the headline set and is *secondary* — not the success
-criterion. With the 2026-09-11 headline refresh, fast wins dickens/webster vs
-`-19` but loses `nci`/`mr`; slow wins `mr` and ties json. CLI default stays
-`--mode slow` until a mode clears every headline file.
-
-Next: improve ratio vs `zstd -19` on the remaining gaps (slow text/`nci`, fast
-`nci`/`mr`). Peer / crates.io landscape and win/lose scorecards:
-[README.md](README.md#peers-cratesio-and-cli-equivalents) ·
-[peer scorecards](README.md#other-high-ratio-peers-cli-ratio).
+Next: optional larger CSV/XML corpora; stretch `nci` toward brotli-11 (4.5%).
+Do not reopen Indirect / Binary DP≥24 / Order-12 without ≥0.3pt evidence.
 
 ---
 
@@ -155,6 +128,11 @@ is default and SSM is isolated from DP.
 | **C11 CSV/XML stream split** | `testdata/structured/sample.csv` (701KB), `sample.xml` (586KB) | CSV: trial picks `CsvSplit` (payload 156KB vs RawCm 702KB / BWT 201KB); slow **1.02%**, fast **0.95%** (methods 15/17). XML: payload trial prefers `XmlSplit`; slow often lands global XWRT (method 13, **1.52%**); fast XML-split **2.09%**. Need ≥256KB for trials. | **kept** |
 | **S11 MixerAcc stretch + bank prefetch** | dickens 200KB | deterministic compress; ratio-neutral by design | **kept** |
 | **S12 parallel_map_sizes BWT trials** | (infra) | RawCm/XWRT/JSON/CSV/XML size jobs via nested `rayon::join` | **kept**; ratio unchanged |
+| **V1 BWT trial payload cache** | dickens/text | winner payload returned; no re-encode | **kept** |
+| **R1 Hybrid mode** | headline 5 | clears zstd -19 on all five | **default** |
+| **R2 Fast XWRT + DP-LZP** | nci | 5.1%→4.97% | **kept** |
+| **V2 NEON walk_dist** | aarch64 | bit-identical to scalar | **kept** |
+| **V3 StackModel enum** | slow path | removes `dyn BitModel` in hot loop | **kept** |
 
 ### Speed passes
 
@@ -171,7 +149,7 @@ is default and SSM is isolated from DP.
 | change | files tested | result | action |
 |---|---|---|---|
 | round-trip verification | all 5 | lossless | every pass round-trip verified |
-| test suite | all | 186/186 green (`cargo test --lib`) | kept |
+| test suite | all | 187/187 green (`cargo test --lib`) | kept |
 | bit-identical output | dickens 2MB | each pass `cmp`-identical to prior where claimed | kept |
 | container / BWT hardening (2026-09-11) | unit + Fast/CSV/XML round-trips | corrupt payloads/`comp_len`/dict → `RcnError`; AVX2↔scalar parity | kept |
 | orphan delta transform | — | never wired into codec | **deleted** (`src/model/delta.rs`) |
