@@ -61,10 +61,10 @@ Entropy mode:
 .B slow
 (bit-level CM, default; stronger on some binary) or
 .B fast
-(byte-level CM; usually better text ratio and speed; loses to zstd \-19 on mr).
+(byte-level CM; better text/nci ratio and speed than slow; loses to zstd \-19 on nci/mr).
 Default stays
 .B slow
-until fast also beats or ties zstd \-19 on the full headline set.
+until a mode also beats or ties zstd \-19 on the full headline set.
 .TP
 .B \-v\fR, \fB\-\-verbose
 Print per-block kind, method, and sizes to stderr.

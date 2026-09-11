@@ -2,6 +2,7 @@
 
 Last updated: 2026-09-11
 Test status: 186/186 passing (`cargo test --lib`, with or without `no_avx2`)
+Headline benches: refreshed 2026-09-11 (README).
 
 Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
@@ -88,8 +89,8 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 ### Default-mode gate
 
 `--mode fast` becomes default only if it beats or ties `zstd -19` on **all**
-headline files. Today it loses on `nci` (~5.1% vs ~5.0%) and `mr` (~35% vs ~31%)
-→ **keep Slow**. Scorecard: [README.md](README.md#goal).
+headline files. 2026-09-11 refresh: it loses on `nci` (5.1% vs 5.0%) and `mr`
+(35.0% vs 31.2%) → **keep Slow**. Scorecard: [README.md](README.md#goal).
 
 ---
 
@@ -122,3 +123,4 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 | 2026-09-08 | C5 global XWRT-128 |
 | 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |
 | 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |
+| 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated for this machine |

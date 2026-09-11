@@ -4,7 +4,8 @@ Optimization tickets, A/B history, CI/testing notes, and roadmaps.
 For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-Last updated: 2026-09-11. Test status: see `cargo test --lib` / CI.
+Last updated: 2026-09-11. Test status: see `cargo test --lib` / CI. Headline
+benches refreshed 2026-09-11 (see [README.md](README.md#benchmarks)).
 
 ---
 
@@ -26,7 +27,7 @@ Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPT
 
 ### Speed - achieve 20+ MB/s
 
-- ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~2–5 MB/s cmp / ~4–10 MB/s dec (see README Benchmarks)
+- ✅ **S8 — Interleaved rANS re-bench** – already wired (`RansByteEncoder32`/`Decoder32`); post-AVX2 `walk_dist` fast path ~1.5–6 MB/s cmp / ~3–54 MB/s dec on the 2026-09-11 headline refresh (see README Benchmarks)
 - ✅ **Parallel BWT trials (S5 partial)** – `rayon::join` for path B/C inside a block trial
 - ✅ **S9 — Optional libsais BWT backend** – `--features bwt_libsais` uses pure-Rust `libsais-rs`; default remains `divsufsort`
 - ✅ **S10 — Classify-ahead pipeline** – `rayon::join` overlaps classify+size of block N+1 with encode of N (encode stays serial / bit-identical)
@@ -39,7 +40,9 @@ Closed through C11 / S12 (C10 tried and reverted). See [OPTIMIZATION_LOG.md](OPT
 - **CI fixes** – `no_avx2` feature for Linux CI scalar path
 - **Pre-commit hook** – mirrors the CI gate
 
-Gap to beat `zstd -19` on text is tracked in the README headline table (dickens/webster). nci / mr / json already win on ratio vs `-19` in recent measures.
+Gap to beat `zstd -19` on text is tracked in the README headline table
+(dickens/webster). Fresh 2026-09-11 benches: slow wins `mr` and ties json vs
+`-19`; both modes still lose `nci`; fast wins dickens/webster but loses `mr`.
 
 ---
 
@@ -82,9 +85,9 @@ Tables: [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 **North star:** beat `zstd -19` on text + mixed corpora. Beating `zstd -1` on
 ratio is already true on the headline set and is *secondary* — not the success
-criterion. With refreshed zstd refs, fast wins dickens/webster vs `-19` but
-loses `nci`/`mr`; slow wins `mr`. CLI default stays `--mode slow` until a mode
-clears every headline file.
+criterion. With the 2026-09-11 headline refresh, fast wins dickens/webster vs
+`-19` but loses `nci`/`mr`; slow wins `mr` and ties json. CLI default stays
+`--mode slow` until a mode clears every headline file.
 
 Next: improve ratio vs `zstd -19` on the remaining gaps (slow text/`nci`, fast
 `nci`/`mr`). Peer / crates.io landscape:
