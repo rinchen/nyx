@@ -36,14 +36,11 @@
 //! only produces/consumes the rANS byte stream for one block. Uncompressed
 //! length travels in the container `BlockEntry`.
 //!
-//! ## AVX2 `walk_dist` (x86_64 only)
+//! ## AVX2 / NEON `walk_dist`
 //!
-//! On AVX2-capable CPUs the 256-symbol cumulative walk is vectorized:
-//! 8 lanes of `(cnt * inv) >> 20` are computed in parallel with
-//! `_mm256_mullo_epi32`, then a 3-pass prefix sum builds the cumulative
-//! distribution in SIMD. The search for the target symbol or the CDF
-//! threshold still runs scalar (the critical path is the multiply+prefix,
-//! not the branching).  Bit-identical to the scalar path for all inputs.
+//! On AVX2-capable x86_64 CPUs the 256-symbol cumulative walk is vectorized
+//! (unless `no_avx2`). On aarch64, a NEON path is used by default. Both are
+//! bit-identical to the scalar path (parity tests in this module).
 
 use crate::entropy::byterans::{RansByteDecoder32, RansByteEncoder32, BYTE_SCALE};
 use crate::error::{RcnError, Result};
