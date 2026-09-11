@@ -14,7 +14,10 @@
 //!
 //! Block size classifier-aware:
 //! - Text blocks: 1–4 MB (longer window for repeated phrases, quotes, boilerplate).
-//! - Binary/Exec/Random: 64 KiB.
+//! - Binary/Exec: 1 MiB (W1 — longer DP-LZP match span within a block).
+//! - Random: 64 KiB (verbatim).
+//! - Binary/Exec also keep up to 4 MiB of prior same-kind bytes as match history
+//!   so DP-LZP distances can cross block boundaries.
 
 use super::BitModel;
 use super::ByteAssembler;

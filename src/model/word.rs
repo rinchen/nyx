@@ -389,19 +389,22 @@ mod tests {
     }
 
     #[test]
-    fn xwrt_dictionary_serialization_caps_at_512() {
-        // A corpus with hundreds of distinct words must serialize only the
-        // top 512 (ESC + u16 extends past the old 128 single-byte slots).
+    fn xwrt_dictionary_serialization_caps_at_max() {
+        // A corpus with many distinct words must serialize only MAX_XWRT_WORDS
+        // (ESC + u16 extends past the old 128 single-byte slots).
         let mut text = Vec::new();
-        for i in 0..600 {
+        for i in 0..1500 {
             text.extend_from_slice(format!("word{i} ").as_bytes());
         }
         let dict = XwrtDictionary::build_from_data(&text);
         let bytes = dict.to_bytes();
         let n = u16::from_le_bytes([bytes[0], bytes[1]]);
-        assert_eq!(n, 512, "dict must serialize exactly 512 words");
+        assert_eq!(
+            n as usize, MAX_XWRT_WORDS,
+            "dict must serialize exactly MAX_XWRT_WORDS"
+        );
         let back = XwrtDictionary::from_bytes(&bytes).expect("parses");
-        assert_eq!(back.id_to_word.len(), 512);
+        assert_eq!(back.id_to_word.len(), MAX_XWRT_WORDS);
     }
 
     #[test]
@@ -457,14 +460,14 @@ the quick brown fox jumps over the lazy dog\n"
 /// Builds a static dictionary of the top words in the input text, then
 /// replaces each word occurrence with a token:
 /// - ids **0..126**: single byte `0x80..=0xFE`
-/// - ids **127..511**: escape `0xFF` + `u16` LE id (3 bytes)
+/// - ids **127..MAX-1**: escape `0xFF` + `u16` LE id (3 bytes)
 ///
-/// Vocab is capped at [`MAX_XWRT_WORDS`] (512). Non-word bytes (including
+/// Vocab is capped at [`MAX_XWRT_WORDS`] (1024). Non-word bytes (including
 /// word-break chars) pass through unchanged. ASCII-gated streams never emit
 /// literal high bytes, so the high range is free for tokens.
 ///
 /// Returns: transformed bytes where word tokens use the encoding above.
-pub const MAX_XWRT_WORDS: usize = 512;
+pub const MAX_XWRT_WORDS: usize = 1024;
 /// Longest word kept by the XWRT scanner. Also the max that fits the
 /// `u8` length byte in [`XwrtDictionary::to_bytes`]; anything longer is a
 /// breakless run (base64/hex/garbage) rather than a real word.

@@ -4,6 +4,7 @@
 //! enum so the compiler can monomorphize / inline per-variant calls.
 
 use super::exec::Exec;
+use super::indirect_dmc::IndirectModel;
 use super::lzp::Lzp;
 use super::order::OrderN;
 use super::ppm::PpmModel;
@@ -21,6 +22,8 @@ pub enum StackModel {
     Ppmd(PpmdSsm),
     Word(WordModel),
     Ppm(PpmModel),
+    /// Binary-only (W5); not used on Text after prior regressions.
+    Indirect(IndirectModel),
 }
 
 impl StackModel {
@@ -34,6 +37,7 @@ impl StackModel {
             Self::Ppmd(m) => m.predict(),
             Self::Word(m) => m.predict(),
             Self::Ppm(m) => m.predict(),
+            Self::Indirect(m) => m.predict(),
         }
     }
 
@@ -47,6 +51,7 @@ impl StackModel {
             Self::Ppmd(m) => m.update(bit),
             Self::Word(m) => m.update(bit),
             Self::Ppm(m) => m.update(bit),
+            Self::Indirect(m) => m.update(bit),
         }
     }
 
@@ -60,6 +65,7 @@ impl StackModel {
             Self::Ppmd(m) => m.prepare_block(block),
             Self::Word(m) => m.prepare_block(block),
             Self::Ppm(m) => m.prepare_block(block),
+            Self::Indirect(m) => m.prepare_block(block),
         }
     }
 
@@ -73,6 +79,7 @@ impl StackModel {
             Self::Ppmd(m) => m.reset(),
             Self::Word(m) => m.reset(),
             Self::Ppm(m) => m.reset(),
+            Self::Indirect(m) => m.reset(),
         }
     }
 }

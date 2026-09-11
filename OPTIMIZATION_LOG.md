@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-11
 Test status: 187/187 passing (`cargo test --lib`, with or without `no_avx2`)
-Headline benches: refreshed 2026-09-11 after V1–V3 / R1–R2 (README).
+Headline benches: refreshed 2026-09-11 after W1–W7 (README).
 
 Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
@@ -74,25 +74,27 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 
 ### Hybrid Path (`--mode hybrid`, default)
 
-- Text/Random → Fast byte CM (global XWRT-512 trials + DP-LZP side-stream)
-- Binary/Exec → Slow bit CM + DP-LZP + E8E9 on Exec
-- Clears headline set vs `zstd -19` (2026-09-11 measure)
+- Text/Random → Fast byte CM (global XWRT-1024 trials + DP-LZP side-stream);
+  Fast Text/Random blocks encoded in parallel (W3)
+- Binary/Exec → Slow bit CM + DP-LZP + E8E9 on Exec; 1 MiB blocks + match hist (W1)
+- Clears headline set vs `zstd -19` (2026-09-11 W1–W7 measure)
 
 ### Slow Path (`--mode slow`)
 
 - 8 bit models (Text) + two-level **16k**-bank mixer hierarchy + master mixer
 - SSE/APM/APM2 cascade; cross-block decay 0.995; 32MB LZP window
-- BWT text trial (incl. CSV/XML split) + global XWRT-512 (ESC) + DP-LZP with adaptive thresholds
-- Match side-stream: varint + optional order-0 rANS (C9)
+- BWT text trial (incl. CSV/XML split) + global XWRT-1024 (ESC) + DP-LZP with adaptive thresholds
+- Match side-stream: varint + optional order-0 rANS (C9); Binary/Exec 1 MiB + hist
 - Classify-ahead Rayon overlap (S10); stretch-on-acc + bank prefetch (S11); wider BWT trial fan-out (S12)
-- Enum `StackModel` (V3) instead of `Box<dyn BitModel>`
+- Enum `StackModel` (V3) instead of `Box<dyn BitModel>`; default `bwt_libsais` (W7)
 
 ### Fast Path (`--mode fast`)
 
 - Orders 0-2 count models + **wired** 32-way interleaved byte rANS
+- Binary/Exec: hashed order-3 + large o2 tables (W2)
 - AVX2 (x86_64) / NEON (aarch64) SIMD walk_dist (scalar fallback + parity tests; CI uses `no_avx2`)
 - Global XWRT on Text trials; DP-LZP literal-skip with match side-stream
-
+- Parallel Text/Random block encode (W3)
 ### Correctness / container hardening (2026-09-11)
 
 - Structured BWT decode (JSON/CSV/XML/XWRT) returns `RcnError` on truncated or invalid payloads (no silent empty `Vec`)
@@ -102,8 +104,8 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 ### Default-mode gate
 
 `--mode hybrid` is default after clearing `zstd -19` on **all** headline files
-(2026-09-11): dickens 26.5%, webster 20.1%, nci 4.97%, mr 27.4%, json 0.1%.
-Scorecard: [README.md](README.md#goal).
+(2026-09-11 W1–W7 refresh): dickens 26.5%, webster 20.1%, nci 4.99%, mr 27.3%,
+json 0.1%. Scorecard: [README.md](README.md#goal).
 
 ---
 
@@ -111,10 +113,25 @@ Scorecard: [README.md](README.md#goal).
 
 1. **Hold the gate:** hybrid stays default while ratio vs `-19` remains green on
    the headline set after any further changes.
-2. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
-3. Stretch: stronger `nci` dictionary if chasing brotli-11 (4.5%).
+2. Stretch: stronger `nci` if still above brotli-11 (4.5%); Fast `mr` is 31.5%
+   (was 35.1%) — still just above the 31.2% `-19` line.
 
-Do **not** re-default Indirect, re-open Binary DP ≥24, or re-bump Text PPMd order without a ≥0.3pt measure. A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
+Do **not** re-default Text Indirect, re-open Binary DP ≥24, or re-bump Text PPMd
+order without a ≥0.3pt measure. A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
+
+---
+
+## W1–W7 (2026-09-11)
+
+| Ticket | Change | Notes |
+|--------|--------|-------|
+| W1 | Binary/Exec block **1 MiB** + cross-block DP-LZP match history (4 MiB cap) | Encoder/decoder keep same-kind hist |
+| W2 | Fast Binary/Exec hashed **order-3** + large o2 tables | Text Fast residuals unchanged |
+| W3 | Parallel Fast Text/Random block encode (Rayon) | Ordered assemble; Slow stays serial |
+| W4 | Global XWRT **1024** words | Was 512 |
+| W5 | Binary-only Indirect A/B | **Killed** — mr 27.52% vs prior 27.4% |
+| W6 | Kind-specific DP `avg_bits` (Binary/Exec 5.0, else 4.0) | No min-len change |
+| W7 | Default `bwt_libsais`; PGO recipe in DEVELOPMENT.md | CI stays non-PGO |
 
 ---
 
@@ -137,3 +154,4 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 | 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |
 | 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated for this machine |
 | 2026-09-11 | V1 BWT payload cache; R1 Hybrid; R2 Fast XWRT+DP-LZP (nci 4.97%); V2 NEON walk_dist; V3 `release-prof` + `StackModel`; **default → hybrid**; **187/187** |
+| 2026-09-11 | **W1–W7:** Binary 1 MiB + match hist; Fast o3 (mr 35.1%→31.5%); parallel Fast Text; XWRT-1024; Binary Indirect A/B **killed**; kind DP costs; libsais default + PGO docs. Hybrid gate held (mr 27.33%, nci 4.99%). **187/187** |

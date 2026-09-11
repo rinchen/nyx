@@ -31,11 +31,14 @@ scale):
 | json | tie | tie | tie |
 
 **Mode vs mode (ratio only):** fast beats slow on dickens/webster/`nci` and
-matches on json; slow beats fast on `mr`. **Hybrid** picks Fast for Text and
-Slow for Binary/Exec, so it clears the full headline set vs `zstd -19`.
+matches on json; slow beats fast on `mr` (27.3% vs 31.5%). **Hybrid** picks Fast
+for Text and Slow for Binary/Exec, so it clears the full headline set vs
+`zstd -19`.
 
-**vs goal (`zstd -19`):** hybrid wins dickens/webster/`nci`/`mr` and ties json
+**Goal (ratio vs `zstd -19`):** hybrid wins dickens/webster/`nci`/`mr` and ties json
 → CLI default is `--mode hybrid`. Details: [Benchmarks](#benchmarks).
+
+Fast alone loses `mr` (31.5% vs 31.2%); slow alone loses text/`nci`.
 
 ## Design methodology
 
@@ -89,7 +92,9 @@ by a cheap order-0 Shannon estimate into `Text` / `Binary` / `Exec` / `Random`:
 - `Random` blocks are stored verbatim — no prediction cost.
 - `Text` blocks can be up to 4 MB (enabling BWT trials that turn long-range
   word repeats into local runs).
-- `Binary`, `Exec`, and `Random` use the default 64 KiB chunk size.
+- `Binary` / `Exec` blocks use **1 MiB** chunks (with up to 4 MiB of prior
+  same-kind bytes as DP-LZP match history across block boundaries).
+- `Random` blocks use 64 KiB and are stored verbatim.
 
 The bit-level path runs an online logistic mixer hierarchy:
 
@@ -205,10 +210,10 @@ prints the same scorecard when rcn is included.
 ## Benchmarks
 
 All numbers below are from a **refresh on 2026-09-11** (release `rcn` 0.2.0,
-Apple Silicon) against `.work/bench5/` (dickens/webster/nci/mr/json). Hybrid /
-fast ratios re-measured after V1–V3 / R1–R2 (BWT payload cache, global XWRT +
-DP-LZP on fast, NEON `walk_dist`, enum stacks); peer CLI columns unchanged from
-the earlier same-day pass unless noted.
+Apple Silicon) against `.work/bench5/` (dickens/webster/nci/mr/json), after
+**W1–W7** (1 MiB Binary blocks + match hist, Fast Binary order-3, parallel Fast
+Text encode, XWRT-1024, kind-specific DP costs, default `bwt_libsais`). Peer CLI
+columns re-measured the same day (`SKIP_RCN=1 scripts/bench_vs_sota.sh`).
 
 - Hybrid (default): `rcn bench .work/bench5` or `rcn bench --hybrid .work/bench5`
 - Fast: `rcn bench --fast .work/bench5`
@@ -227,49 +232,50 @@ Slow bit CM + DP-LZP.
 
 | file | orig (KB) | rcn ratio% | cmp MB/s | dec MB/s | vs zstd -19 |
 |------|----------:|-----------:|---------:|---------:|:-----------:|
-| dickens | 9953.6 | 26.5 | 2.00 | 4.18 | **win** (28.0) |
-| webster | 40487.0 | 20.1 | 1.72 | 5.76 | **win** (20.9) |
-| nci | 32767.0 | 5.0 | 2.26 | 10.03 | **win** (5.0 → 4.97) |
-| mr | 9736.9 | 27.4 | 0.03 | 0.03 | **win** (31.2) |
-| json | 478.5 | 0.1 | 9.76 | 107.92 | tie |
+| dickens | 9953.6 | 26.5 | 3.23 | 5.00 | **win** (28.0) |
+| webster | 40487.0 | 20.1 | 6.62 | 7.00 | **win** (20.9) |
+| nci | 32767.0 | 5.0 | 8.29 | 12.25 | **win** (5.0 → 4.99) |
+| mr | 9736.9 | 27.3 | 0.03 | 0.03 | **win** (31.2) |
+| json | 478.5 | 0.1 | 14.33 | 113.70 | tie |
 
 ### Fast path (`--mode fast`)
 
 | file | orig (KB) | rcn ratio% | cmp MB/s | dec MB/s | zstd -19 ratio% |
 |------|----------:|-----------:|---------:|---------:|---------------:|
-| dickens | 9953.6 | 26.5 | 2.09 | 5.19 | 28.0 |
-| webster | 40487.0 | 20.1 | 1.85 | 7.24 | 20.9 |
-| nci | 32767.0 | 5.0 | 2.37 | 13.93 | 5.0 |
-| mr | 9736.9 | 35.1 | 2.57 | 5.46 | 31.2 |
-| json | 478.5 | 0.1 | 9.97 | 112.36 | 0.0 |
+| dickens | 9953.6 | 26.5 | 3.26 | 5.10 | 28.0 |
+| webster | 40487.0 | 20.1 | 6.67 | 6.75 | 20.9 |
+| nci | 32767.0 | 5.0 | 8.29 | 11.95 | 5.0 |
+| mr | 9736.9 | 31.5 | 4.31 | 5.23 | 31.2 |
+| json | 478.5 | 0.1 | 14.14 | 116.74 | 0.0 |
 
 **Goal (ratio vs `zstd -19`):** fast wins dickens/webster/`nci`, ties json, loses
-`mr` (35.1% vs 31.2%). Hybrid covers `mr` via the Slow path.
+`mr` (31.5% vs 31.2%). Hybrid covers `mr` via the Slow path.
 
 ### Slow path (`--mode slow`)
 
 Stack: hybrid_ppm3, two-level 16k-bank mixer, classifier-aware method bytes,
 word model, cross-block decay, 32MB LZP window, BWT text trial,
 JSON/CSV/XML stream splitting, DP-optimal LZP parse, Exec E8E9, global
-XWRT-512 ESC, SSE/APM/APM2, adaptive DP thresholds, side-stream FSE-family,
-classify-ahead, MixerAcc stretch/prefetch, wider BWT trials, mimalloc, enum
-`StackModel` (V3).
+XWRT-1024 ESC, SSE/APM/APM2, adaptive DP thresholds, side-stream FSE-family,
+1 MiB Binary/Exec blocks + match hist, kind-specific DP costs, classify-ahead,
+MixerAcc stretch/prefetch, wider BWT trials, mimalloc, enum `StackModel` (V3),
+default `bwt_libsais`.
 
-Prior same-day slow ratios (unchanged by Hybrid work): dickens 40.2%, webster
-29.3%, nci 7.3%, mr 27.4%, json 0.1%. Slow still loses text/`nci` to `-19` and
-wins `mr`.
+Text/`nci` slow ratios are still far from `-19` (prior measure: dickens 40.2%,
+webster 29.3%, nci 7.3%, json 0.1%). Hybrid/Slow `mr` is **27.3%** after W1/W6
+(wins `-19` at 31.2%).
 
 ### Other high-ratio peers (CLI ratio%)
 
-Same 2026-09-11 peer pass (`brotli -q 11`). rcn slow from the earlier same-day
-pass; rcn fast/hybrid from the post–R1/R2 refresh.
+Same-day peer pass (`brotli -q 11`). rcn hybrid/fast from the W1–W7 refresh;
+rcn slow text columns from the earlier same-day pass; `mr` slow matches hybrid.
 
 | file | rcn hybrid | rcn slow | rcn fast | zstd -19 | xz -9 | brotli -11 | gzip -9 | lz4 -9 | zstd -1 |
 |------|-----------:|---------:|---------:|---------:|------:|-----------:|--------:|-------:|--------:|
 | dickens | 26.5 | 40.2 | 26.5 | 28.0 | 27.8 | 27.7 | 37.8 | 43.6 | 41.8 |
 | webster | 20.1 | 29.3 | 20.1 | 20.9 | 20.2 | 20.3 | 29.1 | 33.8 | 33.0 |
 | nci | 5.0 | 7.3 | 5.0 | 5.0 | 5.2 | 4.5 | 8.9 | 11.0 | 8.5 |
-| mr | 27.4 | 27.4 | 35.1 | 31.2 | 27.6 | 28.3 | 36.7 | 42.6 | 38.3 |
+| mr | 27.3 | 27.3 | 31.5 | 31.2 | 27.6 | 28.3 | 36.7 | 42.6 | 38.3 |
 | json | 0.1 | 0.1 | 0.1 | 0.0 | 0.1 | 0.0 | 0.4 | 0.4 | 0.0 |
 
 **Ratio scorecard** (win = strictly smaller `ratio%`; tie = equal, or both
@@ -309,8 +315,10 @@ above are CLI equivalents only.
 Notes (ratio only):
 
 - **`nci`:** brotli -11 (4.5%) leads the peer set; rcn fast/hybrid at **5.0%**
-  ties `zstd -19` (strict win at 4.97%).
-- **`mr`:** rcn slow/hybrid (27.4%) leads this peer set (ahead of xz -9 at 27.6%).
+  ties `zstd -19` (strict win at 4.99%).
+- **`mr`:** rcn slow/hybrid (**27.3%**) leads this peer set (ahead of xz -9 at
+  27.6%). Fast `mr` improved to **31.5%** (was 35.1%) but still loses `-19`
+  (31.2%).
 - crates.io counterparts: [`zstd`](https://crates.io/crates/zstd),
   [`xz2`](https://crates.io/crates/xz2), [`brotli`](https://crates.io/crates/brotli),
   [`flate2`](https://crates.io/crates/flate2),
@@ -330,9 +338,10 @@ Four comparisons, kept separate on purpose:
 4. **Mode choice:** fast better on text/`nci`; slow better on `mr`; hybrid
    combines both.
 
-**Throughput** (context only, this machine): slow ~0.03–0.2 MB/s on large
-files (json higher); fast ~2–10 cmp / ~5–110 dec MB/s after NEON. `zstd -1`
-remains far faster — expected, and outside the success criterion.
+**Throughput** (context only, this machine): hybrid Text encode is much faster
+after parallel Fast blocks (~3–8 cmp MB/s on dickens/webster/`nci`); Slow Binary
+`mr` remains ~0.03 MB/s. Fast ~3–14 cmp / ~5–117 dec MB/s. `zstd -1` remains far
+faster — expected, and outside the success criterion.
 
 ## License
 

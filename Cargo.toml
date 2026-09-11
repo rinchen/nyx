@@ -20,10 +20,10 @@ rayon = "1"
 libsais-rs = { version = "0.2.2", default-features = false, optional = true }
 
 [features]
-default = ["two_pass"]
+default = ["two_pass", "bwt_libsais"]
 two_pass = []
 no_avx2 = []
-# Optional libsais SA-IS BWT backend (pure-Rust libsais-rs). Default remains divsufsort.
+# Optional libsais SA-IS BWT backend (pure-Rust libsais-rs). Default on (W7).
 bwt_libsais = ["dep:libsais-rs"]
 
 [dev-dependencies]

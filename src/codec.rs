@@ -331,44 +331,90 @@ fn compress_impl<F>(
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
-    let mut out = Vec::new();
-    let mut entries: Vec<BlockEntry> = Vec::new();
-    let mut payloads: Vec<u8> = Vec::new();
-    let mut diags: Vec<BlockDiag> = Vec::new();
-    let mut offset = 0usize;
+    use rayon::prelude::*;
 
+    // Phase 1: classify the whole input into block segments (deterministic).
+    let mut segments: Vec<(usize, usize, crate::classify::BlockKind)> = Vec::new();
+    {
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let kind = crate::classify::classify(&buf[offset..]);
+            let block_size = block_size_for_kind(kind, &buf[offset..], offset, buf.len());
+            let end = (offset + block_size).min(buf.len());
+            segments.push((offset, end, kind));
+            offset = end;
+        }
+    }
+
+    let global_dict: Option<XwrtDictionary> = Some(XwrtDictionary::build_from_data(buf));
+
+    let use_slow_for = |kind: crate::classify::BlockKind| match mode {
+        CodecMode::Slow => true,
+        CodecMode::Fast => false,
+        CodecMode::Hybrid => matches!(
+            kind,
+            crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
+        ),
+    };
+
+    // W3: Fast Text/Random blocks are independent after the global dict (no
+    // match hist, no mixer). Encode them in parallel; results stay ordered by
+    // segment index for a deterministic container.
+    let mut encoded: Vec<Option<(Vec<u8>, u8, usize)>> = vec![None; segments.len()];
+
+    let parallel_idxs: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, kind))| {
+            !use_slow_for(*kind)
+                && matches!(
+                    kind,
+                    crate::classify::BlockKind::Text | crate::classify::BlockKind::Random
+                )
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if parallel_idxs.len() >= 2 {
+        let dict_ref = global_dict.as_ref();
+        let parallel_out: Vec<(usize, (Vec<u8>, u8, usize))> = parallel_idxs
+            .par_iter()
+            .map(|&i| {
+                let (start, end, kind) = segments[i];
+                let mut hist = Vec::new();
+                let r = encode_block_fast(&buf[start..end], kind, dict_ref, &mut hist);
+                (i, r)
+            })
+            .collect();
+        for (i, r) in parallel_out {
+            encoded[i] = Some(r);
+        }
+    } else if let Some(&i) = parallel_idxs.first() {
+        let (start, end, kind) = segments[i];
+        let mut hist = Vec::new();
+        encoded[i] = Some(encode_block_fast(
+            &buf[start..end],
+            kind,
+            global_dict.as_ref(),
+            &mut hist,
+        ));
+    }
+
+    // Phase 2: serial encode for Slow blocks and Fast Binary/Exec (match hist).
     let mut last_kind: Option<crate::classify::BlockKind> = None;
     let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
+    let mut match_hist: Vec<u8> = Vec::new();
 
-    // Global XWRT dictionary for Text BWT trials (Slow, Fast, and Hybrid Text).
-    let global_dict: Option<XwrtDictionary> = Some(XwrtDictionary::build_from_data(buf));
-
-    // Prefetched (end, kind) for the next block — filled by overlapping classify
-    // of N+1 while encoding N (bit-identical: encode stays serial).
-    let mut pending_next: Option<(usize, crate::classify::BlockKind)> = None;
-
-    while offset < buf.len() {
-        let (end, kind) = if let Some((pend_end, pend_kind)) = pending_next.take() {
-            (pend_end, pend_kind)
-        } else {
-            let kind = crate::classify::classify(&buf[offset..]);
-            let block_size = block_size_for_kind(kind, &buf[offset..], offset, buf.len());
-            ((offset + block_size).min(buf.len()), kind)
-        };
-        let block_data = &buf[offset..end];
-
-        // Hybrid: Text/Random → Fast; Binary/Exec → Slow. Pure Slow always uses
-        // the bit stack; Fast never does.
-        let use_slow = match mode {
-            CodecMode::Slow => true,
-            CodecMode::Fast => false,
-            CodecMode::Hybrid => matches!(
-                kind,
-                crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
-            ),
-        };
+    for (i, &(start, end, kind)) in segments.iter().enumerate() {
+        if encoded[i].is_some() {
+            // Already done in the parallel Fast Text/Random pass.
+            match_hist.clear();
+            continue;
+        }
+        let block_data = &buf[start..end];
+        let use_slow = use_slow_for(kind);
 
         if use_slow && last_kind != Some(kind) {
             let (new_models, new_mixer, new_lzp_idx) = build_stack(kind);
@@ -376,36 +422,10 @@ where
             mixer = new_mixer;
             lzp_idx = new_lzp_idx;
             last_kind = Some(kind);
+            match_hist.clear();
         }
 
-        let next_start = end;
-        let overlap_classify = use_slow && next_start < buf.len();
-        let (comp, method, store_orig_len) = if overlap_classify {
-            let ((c, m, o), next) = rayon::join(
-                || {
-                    encode_block_slow(
-                        block_data,
-                        kind,
-                        &mut models,
-                        &mut mixer,
-                        lzp_idx,
-                        global_dict.as_ref(),
-                    )
-                },
-                || {
-                    let next_kind = crate::classify::classify(&buf[next_start..]);
-                    let next_size = block_size_for_kind(
-                        next_kind,
-                        &buf[next_start..],
-                        next_start,
-                        buf.len(),
-                    );
-                    ((next_start + next_size).min(buf.len()), next_kind)
-                },
-            );
-            pending_next = Some(next);
-            (c, m, o)
-        } else if use_slow {
+        let (comp, method, store_orig_len) = if use_slow {
             encode_block_slow(
                 block_data,
                 kind,
@@ -413,37 +433,42 @@ where
                 &mut mixer,
                 lzp_idx,
                 global_dict.as_ref(),
+                &mut match_hist,
             )
         } else {
-            encode_block_fast(block_data, kind, global_dict.as_ref())
+            encode_block_fast(block_data, kind, global_dict.as_ref(), &mut match_hist)
         };
 
-        let entry = BlockEntry {
+        if use_slow && method != METHOD_COPY {
+            mixer.decay(BLOCK_DECAY);
+        }
+        encoded[i] = Some((comp, method, store_orig_len));
+    }
+
+    // Phase 3: assemble container in segment order.
+    let mut out = Vec::new();
+    let mut entries: Vec<BlockEntry> = Vec::new();
+    let mut payloads: Vec<u8> = Vec::new();
+    let mut diags: Vec<BlockDiag> = Vec::new();
+
+    for (i, &(start, end, kind)) in segments.iter().enumerate() {
+        let block_data = &buf[start..end];
+        let (comp, method, store_orig_len) = encoded[i].take().expect("block encoded");
+        entries.push(BlockEntry {
             comp_len: comp.len() as u32,
             orig_len: store_orig_len as u32,
             method,
             crc32: crc32(block_data),
-        };
+        });
         diags.push(BlockDiag {
             kind: format!("{:?}", kind),
             method,
             size_in: block_data.len(),
             size_out: comp.len(),
         });
-        entries.push(entry);
         payloads.extend_from_slice(&comp);
-        offset = end;
-
-        // Decay (not reset) at block boundaries: preserve learned weight
-        // structure across same-kind Slow blocks. Skip for copy blocks
-        // (no models were trained, no mixer state to decay) — mirrors the
-        // decoder's `entry.method != METHOD_COPY` guard.
-        if use_slow && method != METHOD_COPY {
-            mixer.decay(BLOCK_DECAY);
-        }
     }
 
-    // Write container: magic + header + entries + payloads
     let header = Header {
         version: VERSION,
         flags: if global_dict.is_some() {
@@ -467,38 +492,49 @@ where
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
+///
+/// `match_hist` mirrors the Slow Binary/Exec path (W1 cross-block matches).
 fn encode_block_fast(
     block_data: &[u8],
     kind: crate::classify::BlockKind,
     global_dict: Option<&crate::model::word::XwrtDictionary>,
+    match_hist: &mut Vec<u8>,
 ) -> (Vec<u8>, u8, usize) {
     if kind == crate::classify::BlockKind::Random {
+        match_hist.clear();
         (block_data.to_vec(), METHOD_COPY, block_data.len())
     } else if kind == crate::classify::BlockKind::Text {
+        match_hist.clear();
         // Same BWT trial as the bit path; the chosen pipeline's payload is then
         // byte-coded with DP-LZP literal-skip (R2).
         let trial = bwt::compress_text_with_trial(block_data, global_dict);
         let method = method_for_pipeline(trial.pipeline, CodecMode::Fast);
         let transformed = trial.payload;
         let store_len = transformed.len();
-        let comp = compress_byte_with_matches(&transformed, kind);
+        let comp = compress_byte_with_matches(&transformed, kind, &[]);
         (comp, method, store_len)
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
         // making them much more compressible.
         let transformed = crate::model::e8e9::e8e9_transform(block_data);
-        let comp = compress_byte_with_matches(&transformed, kind);
+        let comp = compress_byte_with_matches(&transformed, kind, match_hist);
+        append_match_hist(match_hist, &transformed);
         (comp, METHOD_BYTE_EXEC_E8E9, transformed.len())
     } else {
         // Binary: raw byte CM + DP-LZP.
-        let comp = compress_byte_with_matches(block_data, kind);
+        let comp = compress_byte_with_matches(block_data, kind, match_hist);
+        append_match_hist(match_hist, block_data);
         (comp, METHOD_BYTE_CM, block_data.len())
     }
 }
 
 /// Byte CM with DP-LZP match side-stream (same framing as the bit path).
-fn compress_byte_with_matches(data: &[u8], kind: crate::classify::BlockKind) -> Vec<u8> {
-    let runs = scan_matches(data, kind);
+fn compress_byte_with_matches(
+    data: &[u8],
+    kind: crate::classify::BlockKind,
+    hist: &[u8],
+) -> Vec<u8> {
+    let runs = scan_matches(data, kind, hist);
     let byte_runs: Vec<crate::bytecodec::ByteMatchRun> = runs
         .iter()
         .map(|r| crate::bytecodec::ByteMatchRun {
@@ -507,10 +543,18 @@ fn compress_byte_with_matches(data: &[u8], kind: crate::classify::BlockKind) -> 
             dist: r.dist,
         })
         .collect();
-    crate::bytecodec::compress_block_with_matches(data, &byte_runs)
+    let deep = matches!(
+        kind,
+        crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
+    );
+    crate::bytecodec::compress_block_with_matches(data, &byte_runs, deep)
 }
 
 /// Slow-mode per-block encode: bit-level CM with the classifier-aware stacks.
+///
+/// `match_hist` is prior same-kind Binary/Exec bytes (empty for Text/Random).
+/// Updated in place after Binary/Exec blocks so the next block can match across
+/// the boundary (W1).
 fn encode_block_slow(
     block_data: &[u8],
     kind: crate::classify::BlockKind,
@@ -518,13 +562,16 @@ fn encode_block_slow(
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
     global_dict: Option<&crate::model::word::XwrtDictionary>,
+    match_hist: &mut Vec<u8>,
 ) -> (Vec<u8>, u8, usize) {
     // Random blocks: store verbatim (method COPY). Don't run CM on
     // entropy-poor data — the rANS path would inflate and the decoder
     // treats METHOD_COPY as a passthrough anyway.
     if kind == crate::classify::BlockKind::Random {
+        match_hist.clear();
         (block_data.to_vec(), METHOD_COPY, block_data.len())
     } else if kind == crate::classify::BlockKind::Text {
+        match_hist.clear();
         // Per-block trial: pick the best BWT pipeline for this Text block.
         let trial = bwt::compress_text_with_trial(block_data, global_dict);
         let method = method_for_pipeline(trial.pipeline, CodecMode::Slow);
@@ -534,18 +581,36 @@ fn encode_block_slow(
         // decoder must decode from rANS). The original length is recovered
         // during BWT reversal; correctness is verified by CRC.
         let store_len = transformed.len();
-        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind);
+        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind, &[]);
         (comp, method, store_len)
     } else if kind == crate::classify::BlockKind::Exec {
         // Exec: apply E8E9 transform to convert x86 relative offsets to absolute,
         // making them much more compressible.
         let transformed = crate::model::e8e9::e8e9_transform(block_data);
-        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind);
+        let comp = compress_block(models, mixer, lzp_idx, &transformed, kind, match_hist);
+        append_match_hist(match_hist, &transformed);
         (comp, METHOD_EXEC, transformed.len())
     } else {
         // Binary: raw CM with the existing stack.
-        let comp = compress_block(models, mixer, lzp_idx, block_data, kind);
+        let comp = compress_block(models, mixer, lzp_idx, block_data, kind, match_hist);
+        append_match_hist(match_hist, block_data);
         (comp, method_for_kind(kind), block_data.len())
+    }
+}
+
+/// Binary/Exec block size (W1): 1 MiB so DP-LZP matches span farther within a
+/// block. Random stays 64 KiB (verbatim copy — no match gain).
+const BINARY_BLOCK_SIZE: usize = 1024 * 1024;
+
+/// Cross-block match history retained for Binary/Exec DP-LZP (W1). Caps lookback
+/// so dist in the side-stream can reference prior same-kind blocks.
+const MATCH_HIST_CAP: usize = 4 * 1024 * 1024;
+
+fn append_match_hist(hist: &mut Vec<u8>, data: &[u8]) {
+    hist.extend_from_slice(data);
+    if hist.len() > MATCH_HIST_CAP {
+        let drop = hist.len() - MATCH_HIST_CAP;
+        hist.drain(..drop);
     }
 }
 
@@ -561,9 +626,8 @@ fn block_size_for_kind(
             let size = (total - offset).min(max_text);
             size.max(64 * 1024)
         }
-        crate::classify::BlockKind::Binary
-        | crate::classify::BlockKind::Exec
-        | crate::classify::BlockKind::Random => 64 * 1024,
+        crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec => BINARY_BLOCK_SIZE,
+        crate::classify::BlockKind::Random => 64 * 1024,
     }
 }
 
@@ -614,7 +678,7 @@ pub fn build_stack_for_kind(
         }
         crate::classify::BlockKind::Binary => {
             // Binary stack (best configuration, no SSM).
-            // with orders 0-2, Sparse, Exec, LZP, PPM order-3
+            // Indirect (W5) A/B'd on headline mr and regressed ~0.1pt → not default.
             use crate::model::stack_enum::StackModel;
             let n = 7;
             let models: Vec<StackModel> = vec![
@@ -663,8 +727,9 @@ fn compress_block(
     lzp_idx: Option<usize>,
     block: &[u8],
     kind: crate::classify::BlockKind,
+    match_hist: &[u8],
 ) -> Vec<u8> {
-    let runs = scan_matches(block, kind);
+    let runs = scan_matches(block, kind, match_hist);
     encode_block_with_matches(models, mixer, lzp_idx, block, &runs)
 }
 
@@ -835,62 +900,58 @@ fn encode_block_with_matches(
     out
 }
 
-fn scan_matches(block: &[u8], kind: crate::classify::BlockKind) -> Vec<MatchRun> {
+fn scan_matches(block: &[u8], kind: crate::classify::BlockKind, hist: &[u8]) -> Vec<MatchRun> {
     let mut lzp = Lzp::new();
+    let base = hist.len();
     let n = block.len();
     let min_len = match_min_len(kind);
 
-    // AVG_BITS_PER_BYTE: estimated CM cost per byte for residual cost calculation.
-    // A well-trained CM predicts ~3-4 bits/byte on structured data. We use 4.0
-    // as a conservative estimate: matches must save more than this in CM cost.
-    const AVG_BITS_PER_BYTE: f64 = 4.0;
+    // W6: kind-specific residual cost — Binary/Exec CM is typically weaker than
+    // Text-after-BWT, so matches are worth taking slightly more aggressively.
+    let avg_bits_per_byte: f64 = match kind {
+        crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec => 5.0,
+        _ => 4.0,
+    };
     // Match record overhead: 1 (flag) + 8 (len) + 24 (dist) = 33 bits.
     const MATCH_OVERHEAD_BITS: f64 = 33.0;
     let window = 4 * 1024 * 1024;
 
-    // Phase 1: pre-compute the best match at every position.
-    // best_match[i] = Some((len, dist)) if a match of >= min_len exists at position i.
-    // The LZP chain walk reports (len, dist) in one pass — no O(window) backward
-    // re-scan per position, which was the pathological blow-up on large text blocks.
+    // Combined stream: prior same-kind history || current block (W1). Match
+    // positions are reported relative to the block start; distances may reach
+    // into `hist` (decoder keeps the same prefix).
+    let mut combined = Vec::with_capacity(base + n);
+    combined.extend_from_slice(hist);
+    combined.extend_from_slice(block);
+
+    // Phase 1: pre-compute the best match at every position in the block.
     let mut best_match: Vec<Option<(usize, usize)>> = vec![None; n];
-    for i in 0..n {
-        lzp.train_at(block, i);
-        if i + 1 >= min_len && i + min_len <= n {
-            if let Some((len, dist)) = lzp.best_match(block, i) {
-                let len = len.min(255);
+    for i in 0..base + n {
+        lzp.train_at(&combined, i);
+        if i < base {
+            continue;
+        }
+        let bi = i - base;
+        if bi + 1 >= min_len && bi + min_len <= n {
+            if let Some((len, dist)) = lzp.best_match(&combined, i) {
+                let len = len.min(255).min(n - bi);
                 if len >= min_len && dist > 0 && dist <= window {
-                    best_match[i] = Some((len, dist));
+                    best_match[bi] = Some((len, dist));
                 }
             }
         }
     }
 
-    // Phase 2: DP optimal parse.
-    // dp[i] = minimum total cost to encode from position i to the end.
-    // cost(literal) = AVG_BITS_PER_BYTE (1 byte × predicted bits)
-    // cost(match len,dist) = MATCH_OVERHEAD_BITS + (len * AVG_BITS_PER_BYTE)
-    //   — the matched bytes still get CM-encoded (for now), so residual_cost = len * AVG_BITS_PER_BYTE
-    //   — but the match flag/len/dist overhead is constant per match.
-    // A match is chosen when:
-    //   MATCH_OVERHEAD_BITS + len * AVG_BITS_PER_BYTE < len * AVG_BITS_PER_BYTE (literal cost)
-    //   i.e., when the match doesn't add overhead compared to literals.
-    // Actually: literal cost = len * AVG_BITS_PER_BYTE
-    // Match cost = MATCH_OVERHEAD_BITS + 0 (skip CM for matched bytes)
-    // So match is better when: MATCH_OVERHEAD_BITS < len * AVG_BITS_PER_BYTE
-    // i.e., len > MATCH_OVERHEAD_BITS / AVG_BITS_PER_BYTE = 33/4 = 8.25
-    // With threshold 16, matches of 16+ bytes save 16*4 - 33 = 31 bits. Take them.
+    // Phase 2: DP optimal parse over the current block only.
     let mut dp: Vec<f64> = vec![f64::INFINITY; n + 1];
-    let mut choice: Vec<bool> = vec![false; n]; // true = match taken, false = literal
+    let mut choice: Vec<bool> = vec![false; n];
     dp[n] = 0.0;
 
     for i in (0..n).rev() {
-        // Option 1: literal (cost = residual cost of 1 byte)
-        let literal_cost = AVG_BITS_PER_BYTE + dp[i + 1];
+        let literal_cost = avg_bits_per_byte + dp[i + 1];
         dp[i] = literal_cost;
         choice[i] = false;
 
-        // Option 2: match (if available)
-        if let Some((len, dist)) = best_match[i] {
+        if let Some((len, _dist)) = best_match[i] {
             let match_cost = MATCH_OVERHEAD_BITS + dp[i + len];
             if match_cost < dp[i] {
                 dp[i] = match_cost;
@@ -899,7 +960,7 @@ fn scan_matches(block: &[u8], kind: crate::classify::BlockKind) -> Vec<MatchRun>
         }
     }
 
-    // Phase 3: backtrack to extract match runs (with positions).
+    // Phase 3: backtrack to extract match runs (block-relative positions).
     let mut runs: Vec<MatchRun> = Vec::new();
     let mut i = 0usize;
     while i < n {
@@ -933,6 +994,26 @@ fn find_match_distance(data: &[u8], pos: usize, len: usize) -> usize {
     0
 }
 
+/// Resolve a match byte using prior same-kind history (W1) plus bytes already
+/// decoded in this block. `dist` is the LZ lookback from the current end of
+/// `out` (same convention as in-block-only matches).
+#[inline]
+fn match_byte_from_hist(hist: &[u8], out: &[u8], dist: usize) -> u8 {
+    if dist == 0 {
+        return 0;
+    }
+    if dist <= out.len() {
+        out[out.len() - dist]
+    } else {
+        let into_hist = dist - out.len();
+        if into_hist <= hist.len() {
+            hist[hist.len() - into_hist]
+        } else {
+            0
+        }
+    }
+}
+
 /// Decode a block.
 ///
 /// Reads match side-stream (validates records), then rANS-decodes all bytes.
@@ -942,8 +1023,9 @@ fn decode_block(
     models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
+    match_hist: &[u8],
 ) -> Result<Vec<u8>> {
-    decode_block_with_matches(comp, orig_len, models, mixer, lzp_idx)
+    decode_block_with_matches(comp, orig_len, models, mixer, lzp_idx, match_hist)
 }
 
 fn decode_block_plain(
@@ -995,6 +1077,7 @@ fn decode_block_with_matches(
     models: &mut [crate::model::stack_enum::StackModel],
     mixer: &mut MixerBank,
     lzp_idx: Option<usize>,
+    match_hist: &[u8],
 ) -> Result<Vec<u8>> {
     // Header: [num_runs:u32][flag:u8][payload_len:u32] = 9 bytes minimum.
     if comp.len() < 9 {
@@ -1075,12 +1158,8 @@ fn decode_block_with_matches(
             // Copy `len` bytes from history: out.len() - dist .. out.len() - dist + len
             // But we need to be careful about overlapping copies.
             let dist = run.dist;
-            for j in 0..run.len {
-                let byte = if i + j < orig_len && dist <= out.len() {
-                    out[out.len() - dist]
-                } else {
-                    0u8
-                };
+            for _j in 0..run.len {
+                let byte = match_byte_from_hist(match_hist, &out, dist);
                 skip_byte!(byte);
                 out.push(byte);
             }
@@ -1188,6 +1267,8 @@ where
     let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
+    let mut match_hist: Vec<u8> = Vec::new();
+    let mut hist_kind: Option<crate::classify::BlockKind> = None;
     for (bi, entry) in entries.iter().enumerate() {
         let comp_len = entry.comp_len as usize;
         if pos.saturating_add(comp_len) > payloads.len() {
@@ -1197,6 +1278,8 @@ where
         pos += comp_len;
 
         let block = if entry.method == METHOD_COPY {
+            match_hist.clear();
+            hist_kind = None;
             comp.to_vec()
         } else if matches!(
             entry.method,
@@ -1209,13 +1292,38 @@ where
                 | METHOD_BYTE_XML_SPLIT
                 | METHOD_BYTE_EXEC_E8E9
         ) {
-            // Byte-level (fast) path: DP-LZP side-stream + rANS on literals.
-            let decoded =
-                crate::bytecodec::decompress_block_with_matches(comp, entry.orig_len as usize)
-                    .map_err(|e| match e {
-                        RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
-                        other => other,
-                    })?;
+            let use_hist = matches!(
+                entry.method,
+                METHOD_BYTE_CM | METHOD_BYTE_EXEC_E8E9
+            );
+            let deep = use_hist; // W2: deep models on Binary/Exec Fast only
+            let hist = if use_hist { match_hist.as_slice() } else { &[] };
+            let decoded = crate::bytecodec::decompress_block_with_matches(
+                comp,
+                entry.orig_len as usize,
+                hist,
+                deep,
+            )
+            .map_err(|e| match e {
+                RcnError::CorruptBlock(s) => RcnError::CorruptBlock(s),
+                other => other,
+            })?;
+            if entry.method == METHOD_BYTE_CM {
+                if hist_kind != Some(crate::classify::BlockKind::Binary) {
+                    match_hist.clear();
+                    hist_kind = Some(crate::classify::BlockKind::Binary);
+                }
+                append_match_hist(&mut match_hist, &decoded);
+            } else if entry.method == METHOD_BYTE_EXEC_E8E9 {
+                if hist_kind != Some(crate::classify::BlockKind::Exec) {
+                    match_hist.clear();
+                    hist_kind = Some(crate::classify::BlockKind::Exec);
+                }
+                append_match_hist(&mut match_hist, &decoded);
+            } else {
+                match_hist.clear();
+                hist_kind = None;
+            }
             inverse_transform_for_method(
                 entry.method,
                 decoded,
@@ -1230,24 +1338,46 @@ where
                 mixer = new_mixer;
                 lzp_idx = new_lzp_idx;
                 last_kind = Some(kind);
+                match_hist.clear();
+                hist_kind = Some(kind);
             }
+            let hist = if matches!(
+                kind,
+                crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
+            ) {
+                match_hist.as_slice()
+            } else {
+                &[]
+            };
             let decoded = decode_block(
                 comp,
                 entry.orig_len as usize,
                 &mut models,
                 &mut mixer,
                 lzp_idx,
+                hist,
             )
             .map_err(|e| match e {
                 RcnError::Entropy(s) => RcnError::CorruptBlock(s),
                 other => other,
             })?;
-            inverse_transform_for_method(
+            let restored = inverse_transform_for_method(
                 entry.method,
-                decoded,
+                decoded.clone(),
                 entry.orig_len as usize,
                 global_dict.as_ref(),
-            )?
+            )?;
+            if matches!(
+                kind,
+                crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
+            ) {
+                // Entropy domain: decoded (pre-inverse). For Exec that's e8e9 space.
+                append_match_hist(&mut match_hist, &decoded);
+            } else {
+                match_hist.clear();
+                hist_kind = None;
+            }
+            restored
         };
 
         if crate::container::crc32(&block) != entry.crc32 {
@@ -1413,7 +1543,7 @@ mod tests {
     #[test]
     fn scan_matches_finds_repeats() {
         let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
-        let runs = scan_matches(data, crate::classify::BlockKind::Text);
+        let runs = scan_matches(data, crate::classify::BlockKind::Text, &[]);
         assert!(
             !runs.is_empty(),
             "expected at least one match in repeated data"
@@ -1431,7 +1561,7 @@ mod tests {
             x ^= x << 5;
             *b = x as u8;
         }
-        let runs = scan_matches(&data, crate::classify::BlockKind::Binary);
+        let runs = scan_matches(&data, crate::classify::BlockKind::Binary, &[]);
         assert!(runs.is_empty(), "expected no matches in random data");
     }
 

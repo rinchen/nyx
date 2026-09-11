@@ -50,6 +50,9 @@ const ORDER2_CTX: usize = 1 << 12;
 const ORDER2_MASK: usize = ORDER2_CTX - 1;
 /// Hashed order-2 contexts for small (binary/exec) blocks.
 const ORDER2_CTX_SMALL: usize = 1 << 10;
+/// Hashed order-3 contexts for deep Binary/Exec Fast path (W2).
+const ORDER3_CTX: usize = 1 << 12;
+const ORDER3_MASK: usize = ORDER3_CTX - 1;
 
 /// Halve a row when any count exceeds this → row total ≤ 256 · 256 = 65 536.
 const COUNT_CAP: u16 = 256;
@@ -59,6 +62,7 @@ const MAX_TOTAL: usize = COUNT_CAP as usize * 256;
 /// contexts don't win by accident. order-1: 2 bytes seen, order-2: 4 bytes.
 const MIN_T1: u32 = 2;
 const MIN_T2: u32 = 4;
+const MIN_T3: u32 = 6;
 
 /// Distribution scale of the normalized count row (movable mass, before the
 /// base-1 per symbol).
@@ -85,6 +89,11 @@ fn reciprocal_table() -> &'static [u32; MAX_TOTAL + 1] {
 
 fn hash2(a: u8, b: u8) -> usize {
     let x = u32::from(a) | (u32::from(b) << 8);
+    (x.wrapping_mul(0x9E37_79B1) >> 20) as usize
+}
+
+fn hash3(a: u8, b: u8, c: u8) -> usize {
+    let x = u32::from(a) | (u32::from(b) << 8) | (u32::from(c) << 16);
     (x.wrapping_mul(0x9E37_79B1) >> 20) as usize
 }
 
@@ -593,11 +602,29 @@ fn pick_order(t1: u32, d1: u32, t2: u32, d2: u32) -> Order {
     }
 }
 
+/// Deep Binary/Exec selector (W2): also considers hashed order-3.
+#[inline(always)]
+fn pick_order_deep(t1: u32, d1: u32, t2: u32, d2: u32, t3: u32, d3: u32) -> Order {
+    if t3 >= MIN_T3
+        && (t2 < MIN_T2
+            || u64::from(t3) * u64::from(d2 + 1) >= u64::from(t2) * u64::from(d3 + 1))
+    {
+        // Prefer o3 over o2 when concentrated; still fall through vs o1/o0.
+        if t1 < MIN_T1
+            || u64::from(t3) * u64::from(d1 + 1) >= u64::from(t1) * u64::from(d3 + 1)
+        {
+            return Order::Order3;
+        }
+    }
+    pick_order(t1, d1, t2, d2)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Order {
     Order0,
     Order1,
     Order2,
+    Order3,
 }
 
 /// Compress one block's worth of bytes into an rANS byte stream.
@@ -606,7 +633,7 @@ enum Order {
 /// copy method instead.
 #[must_use]
 pub fn compress_block(data: &[u8]) -> Vec<u8> {
-    compress_block_inner(data, &[])
+    compress_block_inner(data, &[], false)
 }
 
 /// One DP-LZP match run: start at `pos`, copy `len` bytes from `dist` back.
@@ -621,8 +648,10 @@ pub struct ByteMatchRun {
 ///
 /// Framing: `[num_runs:u32][flag:u8][payload_len:u32][side…][rANS…]` — same
 /// side-stream layout as the bit path so Hybrid/Fast can share match records.
+///
+/// `deep` enables hashed order-3 + large o2 tables (W2 Binary/Exec Fast path).
 #[must_use]
-pub fn compress_block_with_matches(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
+pub fn compress_block_with_matches(data: &[u8], runs: &[ByteMatchRun], deep: bool) -> Vec<u8> {
     use crate::entropy::side_fse;
 
     let mut raw_side = Vec::new();
@@ -640,7 +669,7 @@ pub fn compress_block_with_matches(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8
     out.push(flag);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&payload);
-    out.extend(compress_block_inner(data, runs));
+    out.extend(compress_block_inner(data, runs, deep));
     out
 }
 
@@ -675,13 +704,18 @@ fn read_varint(data: &[u8], mut offset: usize) -> Option<(usize, usize)> {
     }
 }
 
-fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
-    let big = data.len() >= 256 * 1024;
+fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun], deep: bool) -> Vec<u8> {
+    let big = deep || data.len() >= 256 * 1024;
     let order2_ctx = if big { ORDER2_CTX } else { ORDER2_CTX_SMALL };
     let order2_mask = order2_ctx - 1;
     let mut o0 = ByteCountModel::new(1);
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
+    let mut o3 = if deep {
+        Some(ByteCountModel::new(ORDER3_CTX))
+    } else {
+        None
+    };
     let mut enc = RansByteEncoder32::new();
 
     let mut match_len_at: Vec<usize> = vec![0; data.len()];
@@ -691,6 +725,7 @@ fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
         }
     }
 
+    let mut p_3 = 0u8;
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;
     let mut i = 0usize;
@@ -704,6 +739,11 @@ fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
                 o0.update(0, b);
                 o1.update(c1, b);
                 o2.update(c2, b);
+                if let Some(ref mut o3m) = o3 {
+                    let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                    o3m.update(c3, b);
+                }
+                p_3 = p_2;
                 p_2 = p_1;
                 p_1 = b;
             }
@@ -712,18 +752,39 @@ fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
             let b = data[i];
             let c1 = usize::from(p_1);
             let c2 = hash2(p_1, p_2) & order2_mask;
-            let ord = pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2));
+            let ord = if let Some(ref o3m) = o3 {
+                let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                pick_order_deep(
+                    o1.total(c1),
+                    o1.distinct(c1),
+                    o2.total(c2),
+                    o2.distinct(c2),
+                    o3m.total(c3),
+                    o3m.distinct(c3),
+                )
+            } else {
+                pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2))
+            };
             let wr = match ord {
                 Order::Order0 => o0.walk_dist(0, Some(b), None),
                 Order::Order1 => o1.walk_dist(c1, Some(b), None),
                 Order::Order2 => o2.walk_dist(c2, Some(b), None),
+                Order::Order3 => {
+                    let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                    o3.as_ref().unwrap().walk_dist(c3, Some(b), None)
+                }
             };
             enc.encode_fc(wr.freq, wr.cum);
 
             o0.update(0, b);
             o1.update(c1, b);
             o2.update(c2, b);
+            if let Some(ref mut o3m) = o3 {
+                let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                o3m.update(c3, b);
+            }
 
+            p_3 = p_2;
             p_2 = p_1;
             p_1 = b;
             i += 1;
@@ -739,15 +800,24 @@ fn compress_block_inner(data: &[u8], runs: &[ByteMatchRun]) -> Vec<u8> {
 /// Returns [`RcnError::CorruptBlock`] if the stream is truncated (fewer than
 /// the 4-byte rANS state tail).
 pub fn decompress_block(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
-    decompress_block_plain(comp, orig_len)
+    decompress_block_plain(comp, orig_len, false)
 }
 
 /// Decompress a block produced by [`compress_block_with_matches`].
 ///
+/// `match_hist` is prior same-kind Binary/Exec bytes (may be empty) so match
+/// distances can reach across block boundaries (W1).
+/// `deep` must match the encoder (W2 Binary/Exec hashed order-3).
+///
 /// # Errors
 ///
 /// Returns [`RcnError`] on truncated side-stream or corrupt rANS payload.
-pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
+pub fn decompress_block_with_matches(
+    comp: &[u8],
+    orig_len: usize,
+    match_hist: &[u8],
+    deep: bool,
+) -> Result<Vec<u8>> {
     use crate::entropy::side_fse;
 
     if comp.len() < 9 {
@@ -790,7 +860,7 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
     }
 
     if runs.is_empty() {
-        return decompress_block_plain(&comp[payload_end..], orig_len);
+        return decompress_block_plain(&comp[payload_end..], orig_len, deep);
     }
 
     let mut match_len_at: Vec<usize> = vec![0; orig_len];
@@ -817,15 +887,21 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
         orig_len.saturating_sub(matched)
     };
 
-    let big = orig_len >= 256 * 1024;
+    let big = deep || orig_len >= 256 * 1024;
     let order2_ctx = if big { ORDER2_CTX } else { ORDER2_CTX_SMALL };
     let order2_mask = order2_ctx - 1;
     let mut o0 = ByteCountModel::new(1);
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
+    let mut o3 = if deep {
+        Some(ByteCountModel::new(ORDER3_CTX))
+    } else {
+        None
+    };
     let mut dec = RansByteDecoder32::new(&comp[payload_end..], n_lits)
         .map_err(|_| RcnError::CorruptBlock("short rANS stream".into()))?;
 
+    let mut p_3 = 0u8;
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;
     let mut out = Vec::with_capacity(orig_len);
@@ -839,17 +915,29 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
             let len = match_len_at[i];
             let dist = match_dist_at[i];
             for _ in 0..len {
-                let byte = if dist <= out.len() {
+                let byte = if dist == 0 {
+                    0u8
+                } else if dist <= out.len() {
                     out[out.len() - dist]
                 } else {
-                    0u8
+                    let into_hist = dist - out.len();
+                    if into_hist <= match_hist.len() {
+                        match_hist[match_hist.len() - into_hist]
+                    } else {
+                        0u8
+                    }
                 };
                 let c1 = usize::from(p_1);
                 let c2 = hash2(p_1, p_2) & order2_mask;
                 o0.update(0, byte);
                 o1.update(c1, byte);
                 o2.update(c2, byte);
+                if let Some(ref mut o3m) = o3 {
+                    let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                    o3m.update(c3, byte);
+                }
                 out.push(byte);
+                p_3 = p_2;
                 p_2 = p_1;
                 p_1 = byte;
             }
@@ -867,12 +955,28 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
             }
             let c1 = usize::from(p_1);
             let c2 = hash2(p_1, p_2) & order2_mask;
-            let ord = pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2));
+            let ord = if let Some(ref o3m) = o3 {
+                let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                pick_order_deep(
+                    o1.total(c1),
+                    o1.distinct(c1),
+                    o2.total(c2),
+                    o2.distinct(c2),
+                    o3m.total(c3),
+                    o3m.distinct(c3),
+                )
+            } else {
+                pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2))
+            };
             let cdf = lane_cdfs[lane_i];
             let wr = match ord {
                 Order::Order0 => o0.walk_dist(0, None, Some(cdf)),
                 Order::Order1 => o1.walk_dist(c1, None, Some(cdf)),
                 Order::Order2 => o2.walk_dist(c2, None, Some(cdf)),
+                Order::Order3 => {
+                    let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                    o3.as_ref().unwrap().walk_dist(c3, None, Some(cdf))
+                }
             };
             dec.lane_advance(lane_i, wr.freq, wr.cum);
             lane_i += 1;
@@ -880,7 +984,12 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
             o0.update(0, wr.sym);
             o1.update(c1, wr.sym);
             o2.update(c2, wr.sym);
+            if let Some(ref mut o3m) = o3 {
+                let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                o3m.update(c3, wr.sym);
+            }
             out.push(wr.sym);
+            p_3 = p_2;
             p_2 = p_1;
             p_1 = wr.sym;
             i += 1;
@@ -889,44 +998,80 @@ pub fn decompress_block_with_matches(comp: &[u8], orig_len: usize) -> Result<Vec
     Ok(out)
 }
 
-fn decompress_block_plain(comp: &[u8], orig_len: usize) -> Result<Vec<u8>> {
-    let big = orig_len >= 256 * 1024;
+fn decompress_block_plain(comp: &[u8], orig_len: usize, deep: bool) -> Result<Vec<u8>> {
+    let big = deep || orig_len >= 256 * 1024;
     let order2_ctx = if big { ORDER2_CTX } else { ORDER2_CTX_SMALL };
     let order2_mask = order2_ctx - 1;
     let mut o0 = ByteCountModel::new(1);
     let mut o1 = ByteCountModel::new(256);
     let mut o2 = ByteCountModel::new(order2_ctx);
+    let mut o3 = if deep {
+        Some(ByteCountModel::new(ORDER3_CTX))
+    } else {
+        None
+    };
     let mut dec = RansByteDecoder32::new(comp, orig_len)
         .map_err(|_| RcnError::CorruptBlock("short rANS stream".into()))?;
 
+    let mut p_3 = 0u8;
     let mut p_2 = 0u8;
     let mut p_1 = 0u8;
 
     let mut out = Vec::with_capacity(orig_len);
-    while out.len() < orig_len {
-        let cdfs = dec.cdf_batch();
-        let in_group = dec.remaining().min(32);
-        for lane in 0..in_group {
-            let c1 = usize::from(p_1);
-            let c2 = hash2(p_1, p_2) & order2_mask;
-            let ord = pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2));
-            let wr = {
-                let cdf = cdfs[lane];
-                match ord {
-                    Order::Order0 => o0.walk_dist(0, None, Some(cdf)),
-                    Order::Order1 => o1.walk_dist(c1, None, Some(cdf)),
-                    Order::Order2 => o2.walk_dist(c2, None, Some(cdf)),
-                }
-            };
-            dec.lane_advance(lane, wr.freq, wr.cum);
-            o0.update(0, wr.sym);
-            o1.update(c1, wr.sym);
-            o2.update(c2, wr.sym);
+    let mut lane_cdfs = [0u32; 32];
+    let mut lane_i = 32usize;
+    let mut lanes_in_group = 0usize;
 
-            out.push(wr.sym);
-            p_2 = p_1;
-            p_1 = wr.sym;
+    while out.len() < orig_len {
+        if lane_i >= lanes_in_group {
+            if dec.remaining() == 0 {
+                return Err(RcnError::CorruptBlock(
+                    "byte plain decode: ran out of symbols".into(),
+                ));
+            }
+            lane_cdfs = dec.cdf_batch();
+            lanes_in_group = dec.remaining().min(32);
+            lane_i = 0;
         }
+        let c1 = usize::from(p_1);
+        let c2 = hash2(p_1, p_2) & order2_mask;
+        let ord = if let Some(ref o3m) = o3 {
+            let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+            pick_order_deep(
+                o1.total(c1),
+                o1.distinct(c1),
+                o2.total(c2),
+                o2.distinct(c2),
+                o3m.total(c3),
+                o3m.distinct(c3),
+            )
+        } else {
+            pick_order(o1.total(c1), o1.distinct(c1), o2.total(c2), o2.distinct(c2))
+        };
+        let cdf = lane_cdfs[lane_i];
+        let wr = match ord {
+            Order::Order0 => o0.walk_dist(0, None, Some(cdf)),
+            Order::Order1 => o1.walk_dist(c1, None, Some(cdf)),
+            Order::Order2 => o2.walk_dist(c2, None, Some(cdf)),
+            Order::Order3 => {
+                let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+                o3.as_ref().unwrap().walk_dist(c3, None, Some(cdf))
+            }
+        };
+        dec.lane_advance(lane_i, wr.freq, wr.cum);
+        lane_i += 1;
+
+        o0.update(0, wr.sym);
+        o1.update(c1, wr.sym);
+        o2.update(c2, wr.sym);
+        if let Some(ref mut o3m) = o3 {
+            let c3 = hash3(p_1, p_2, p_3) & ORDER3_MASK;
+            o3m.update(c3, wr.sym);
+        }
+        out.push(wr.sym);
+        p_3 = p_2;
+        p_2 = p_1;
+        p_1 = wr.sym;
     }
     Ok(out)
 }
@@ -971,6 +1116,7 @@ mod tests {
                 Order::Order0 => o0.walk_dist(0, Some(b), None),
                 Order::Order1 => o1.walk_dist(c1, Some(b), None),
                 Order::Order2 => o2.walk_dist(c2, Some(b), None),
+                Order::Order3 => unreachable!("pick_order never returns Order3"),
             };
             enc.encode_fc(wr.freq, wr.cum);
             e_triples.push((b, wr.freq, wr.cum));
@@ -997,6 +1143,7 @@ mod tests {
                 Order::Order0 => d0.walk_dist(0, None, Some(cdf)),
                 Order::Order1 => d1.walk_dist(c1, None, Some(cdf)),
                 Order::Order2 => d2.walk_dist(c2, None, Some(cdf)),
+                Order::Order3 => unreachable!("pick_order never returns Order3"),
             };
             let (eb, ef, ec) = e_triples[i];
             assert_eq!(

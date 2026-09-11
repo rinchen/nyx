@@ -5,7 +5,7 @@ For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 Last updated: 2026-09-11. Test status: see `cargo test --lib` / CI. Headline
-benches refreshed 2026-09-11 (see [README.md](README.md#benchmarks)).
+benches refreshed 2026-09-11 after W1–W7 (see [README.md](README.md#benchmarks)).
 
 ---
 
@@ -35,9 +35,16 @@ Closed through C11 / S12 (C10 tried and reverted), plus V1–V3 / R1–R2
 - ✅ **V1 — BWT trial payload cache** – no double-encode of winner
 - ✅ **V2 — aarch64 NEON `walk_dist`** – parity tests vs scalar
 - ✅ **V3 — `release-prof` + enum `StackModel`** – symbol-friendly profile; Slow hot path without `dyn BitModel`
+- ✅ **W1 — Binary 1 MiB + cross-block match hist** – hybrid mr 27.3%
+- ✅ **W2 — Fast Binary order-3** – fast mr 35.1%→31.5%
+- ✅ **W3 — Parallel Fast Text/Random encode** – large Text cmp MB/s uplift
+- ✅ **W4 — XWRT-1024** – nci ~4.99%
+- ❌ **W5 — Binary-only Indirect** – killed (mr regression)
+- ✅ **W6 — Kind-specific DP costs** – Binary/Exec avg_bits 5.0
+- ✅ **W7 — libsais default + PGO recipe + cold error helpers**
 
 Apple Silicon (arm64) uses the NEON `walk_dist` path by default. CI still runs
-`no_avx2` for the x86_64 scalar gate.
+`no_avx2` for the x86_64 scalar gate. `bwt_libsais` is on by default.
 
 ---
 
@@ -51,8 +58,7 @@ AVX2↔scalar and NEON↔scalar bit-identity are covered by unit tests.
 
 ```bash
 cargo test --lib
-cargo test --lib --features bwt_libsais   # optional SA backend
-cargo test --lib --features no_avx2       # CI-like scalar path
+cargo test --lib --features no_avx2       # CI-like scalar path (libsais still on by default)
 cargo build --profile release-prof        # symbols for sample/Instruments
 rcn self-test                             # wraps cargo test --lib
 ```
@@ -60,12 +66,30 @@ rcn self-test                             # wraps cargo test --lib
 Pre-commit: `.pre-commit-config.yaml` runs `cargo build` +
 `cargo test --features no_avx2` (mirrors CI).
 
+### Profile-guided optimization (W7)
+
+Release builds already use fat LTO + `codegen-units=1`. For an extra ~5–15% on
+hot loops, build with PGO (keep CI non-PGO):
+
+```bash
+# Requires cargo-pgo: cargo install cargo-pgo
+cargo pgo build -- --release --bin rcn
+# Instrument / run a short corpus, then:
+./target/release/rcn compress --mode hybrid path/to/dickens /tmp/out.rcn
+./target/release/rcn decompress /tmp/out.rcn /tmp/out.bin
+cargo pgo optimize -- --release --bin rcn
+```
+
+`bwt_libsais` is now a **default** feature (W7); disable with
+`--no-default-features --features two_pass` if needed.
+
 ## Ratio backlog
 
-**Closed through R2.** North star gate **cleared** by Hybrid default.
+**Closed through R2; W1–W7 landed 2026-09-11.** North star gate **cleared** by Hybrid default.
 
-Next: optional larger CSV/XML corpora; stretch `nci` toward brotli-11 (4.5%).
-Do not reopen Indirect / Binary DP≥24 / Order-12 without ≥0.3pt evidence.
+Hold Hybrid vs `zstd -19`. Stretch: `nci` toward brotli-11 (4.5%).
+Do not reopen Text Indirect / Binary DP≥24 / Order-12 without ≥0.3pt evidence.
+Binary-only Indirect was A/B'd (W5) and **killed** (mr regression).
 
 ---
 

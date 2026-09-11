@@ -38,5 +38,21 @@ pub enum RcnError {
     XmlSplitError(String),
 }
 
+impl RcnError {
+    /// Cold path: construct an invalid-container error (W7).
+    #[cold]
+    #[inline(never)]
+    pub fn invalid_container(msg: impl Into<String>) -> Self {
+        Self::InvalidContainer(msg.into())
+    }
+
+    /// Cold path: construct a corrupt-block error (W7).
+    #[cold]
+    #[inline(never)]
+    pub fn corrupt_block(msg: impl Into<String>) -> Self {
+        Self::CorruptBlock(msg.into())
+    }
+}
+
 /// Convenience alias for codec results.
 pub type Result<T> = std::result::Result<T, RcnError>;
