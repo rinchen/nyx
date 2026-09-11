@@ -91,7 +91,10 @@ Directory of files to compress.
 .BI \-\-vs \ label
 Reserved for SOTA comparison (see
 .I scripts/bench_vs_sota.sh
-in the source tree).
+in the source tree). That script prints ratio win/lose/tie vs peer CLIs when
+rcn is included (use
+.B SKIP_RCN=1
+for peer numbers only).
 .TP
 .B \-\-fast
 Use the byte-level (fast) entropy mode.

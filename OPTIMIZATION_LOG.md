@@ -97,8 +97,11 @@ headline files. 2026-09-11 refresh: it loses on `nci` (5.1% vs 5.0%) and `mr`
 ## Recommended Next Step
 
 1. **North star:** beat `zstd -19` on ratio (slow text dickens/webster, and/or
-   fast `mr`) — not throughput vs `zstd -1`. Scorecard and crates.io peers:
-   [README.md](README.md#goal).
+   fast `mr`) — not throughput vs `zstd -1`. Goal scorecard, peer win/lose
+   tables, and crates.io CLI equivalents:
+   [README.md](README.md#goal) ·
+   [Peers](README.md#peers-cratesio-and-cli-equivalents) ·
+   [peer scorecards](README.md#other-high-ratio-peers-cli-ratio).
 2. **Speed (if chasing 20+ MB/s):** profile with symbols (release builds are stripped on macOS `sample`); next levers are bit-model/mixer loop (slow) and BWT / `walk_dist` (fast) — not S11 prefetch.
 3. Optional: larger real-world CSV/XML corpora beyond `testdata/structured/`.
 

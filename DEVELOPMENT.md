@@ -90,8 +90,9 @@ criterion. With the 2026-09-11 headline refresh, fast wins dickens/webster vs
 `--mode slow` until a mode clears every headline file.
 
 Next: improve ratio vs `zstd -19` on the remaining gaps (slow text/`nci`, fast
-`nci`/`mr`). Peer / crates.io landscape:
-[README.md](README.md#peers-cratesio-and-cli-equivalents).
+`nci`/`mr`). Peer / crates.io landscape and win/lose scorecards:
+[README.md](README.md#peers-cratesio-and-cli-equivalents) ·
+[peer scorecards](README.md#other-high-ratio-peers-cli-ratio).
 
 ---
 

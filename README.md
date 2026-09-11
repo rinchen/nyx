@@ -192,8 +192,14 @@ counterparts for the same algorithms:
 | DEFLATE/gzip | `gzip -9` | [`flate2`](https://crates.io/crates/flate2) | Ubiquitous baseline |
 | Snappy | — | [`snap`](https://crates.io/crates/snap) | Speed-oriented |
 
-Re-run peers locally: `SKIP_RCN=1 scripts/bench_vs_sota.sh <corpus_dir>`
-(also includes `zstd -1` / `-19`, xz, brotli, lz4, gzip when installed).
+Ratio win/lose vs these peers (slow and fast): [Other high-ratio
+peers](#other-high-ratio-peers-cli-ratio). `scripts/bench_vs_sota.sh`
+prints the same scorecard when rcn is included.
+
+- Full comparison (rcn slow + fast + peers + scorecard):
+  `scripts/bench_vs_sota.sh <corpus_dir>`
+- Peers-only numbers (no scorecard):
+  `SKIP_RCN=1 scripts/bench_vs_sota.sh <corpus_dir>`
 
 ## Benchmarks
 
@@ -203,7 +209,8 @@ All numbers below are from a **single refresh on 2026-09-11** (release
 
 - Slow: `rcn bench .work/bench5`
 - Fast: `rcn bench --fast .work/bench5`
-- Peers: `SKIP_RCN=1 scripts/bench_vs_sota.sh .work/bench5`
+- Peers + scorecard: `scripts/bench_vs_sota.sh .work/bench5`
+- Peers-only numbers: `SKIP_RCN=1 scripts/bench_vs_sota.sh .work/bench5`
 
 Progress toward the goal is **"does rcn beat `zstd -19` on ratio?"** Other
 columns (`zstd -1`, peer CLIs) are supporting context. `ratio%` is compressed
@@ -260,18 +267,35 @@ benches above.
 | mr | 27.4 | 35.0 | 31.2 | 27.6 | 28.3 | 36.7 | 42.6 | 38.3 |
 | json | 0.1 | 0.1 | 0.0 | 0.1 | 0.0 | 0.4 | 0.4 | 0.0 |
 
-Takeaways (ratio only):
+**Ratio scorecard** (win = strictly smaller `ratio%`; tie = equal, or both
+`< 0.5` for near-zero json scale). Throughput is not scored. crates.io names
+above are CLI equivalents only.
 
-- **vs `zstd -19`:** same scorecard as [Goal](#goal) — fast leads on
-  dickens/webster; slow leads on `mr`; both lose `nci`; json is a near-tie.
-- **dickens:** rcn fast (26.9%) also beats xz -9 (27.8%) and brotli -11 (27.7%).
-- **webster:** rcn fast (20.3%) beats `zstd -19` (20.9%), ties brotli -11
-  (20.3%), and loses narrowly to xz -9 (20.2%).
-- **`nci`:** brotli -11 (4.5%) leads; then `zstd -19` (5.0%) ahead of rcn fast
-  (5.1%).
+**rcn slow vs peers:**
+
+| file | vs zstd-19 | vs xz-9 | vs brotli-11 | vs gzip-9 | vs lz4-9 | vs zstd-1 |
+|------|:----------:|:-------:|:-----------:|:---------:|:--------:|:---------:|
+| dickens | lose | lose | lose | lose | win | win |
+| webster | lose | lose | lose | lose | win | win |
+| nci | lose | lose | lose | win | win | win |
+| mr | win | win | win | win | win | win |
+| json | tie | tie | tie | tie | tie | tie |
+
+**rcn fast vs peers:**
+
+| file | vs zstd-19 | vs xz-9 | vs brotli-11 | vs gzip-9 | vs lz4-9 | vs zstd-1 |
+|------|:----------:|:-------:|:-----------:|:---------:|:--------:|:---------:|
+| dickens | win | win | win | win | win | win |
+| webster | win | lose | tie | win | win | win |
+| nci | lose | win | lose | win | win | win |
+| mr | lose | lose | lose | win | win | win |
+| json | tie | tie | tie | tie | tie | tie |
+
+Notes (ratio only):
+
+- **`nci`:** brotli -11 (4.5%) leads the peer set; then `zstd -19` (5.0%) ahead
+  of rcn fast (5.1%).
 - **`mr`:** rcn slow (27.4%) leads this peer set (ahead of xz -9 at 27.6%).
-- **Both rcn modes** beat `zstd -1`, gzip -9, and lz4 -9 on every headline file
-  in this table.
 - crates.io counterparts: [`zstd`](https://crates.io/crates/zstd),
   [`xz2`](https://crates.io/crates/xz2), [`brotli`](https://crates.io/crates/brotli),
   [`flate2`](https://crates.io/crates/flate2),
@@ -279,13 +303,17 @@ Takeaways (ratio only):
 
 ### Reading the tables
 
-Three comparisons, kept separate on purpose:
+Four comparisons, kept separate on purpose:
 
 1. **Goal — ratio vs `zstd -19`:** slow wins `mr`, ties json, loses
    dickens/webster/`nci`. Fast wins dickens/webster, ties json, loses `nci`/`mr`.
-2. **Baseline — ratio vs `zstd -1`:** both slow and fast win all five headline
-   files. This is not the success criterion.
-3. **Mode choice — rcn fast vs slow:** fast better ratio on
+2. **Baseline — ratio vs `zstd -1`:** both modes beat `-1` on every headline
+   file under the Goal scorecard’s strict compare (json `0.1` vs `0.0` counts
+   as win there). The peer scorecard’s near-zero rule (`both < 0.5` → tie)
+   treats json as a tie vs `-1`. Not the success criterion.
+3. **Peers — ratio vs xz/brotli/gzip/lz4:** see scorecards under
+   [Other high-ratio peers](#other-high-ratio-peers-cli-ratio).
+4. **Mode choice — rcn fast vs slow:** fast better ratio on
    dickens/webster/`nci`; slow better on `mr`. Neither clears every file vs
    `-19` yet.
 
