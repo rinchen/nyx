@@ -1,12 +1,13 @@
 # Rcn development notes
 
 Optimization tickets, A/B history, CI/testing notes, and roadmaps.
-For product overview and headline benchmarks, see [README.md](README.md).
+For product overview and win/lose charts, see [README.md](README.md).
+Measured numbers: [BENCHMARKS.md](BENCHMARKS.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 Last updated: 2026-09-12. Test status: see `cargo test --lib` / CI. Headline
 benches: W1–W7 on 2026-09-11; levels `-1`/`-3` + dual scorecards on
-2026-09-12 (see [README.md](README.md#benchmarks)).
+2026-09-12 (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ---
 

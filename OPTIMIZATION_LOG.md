@@ -105,7 +105,7 @@ Ideas from an external list that **collide with closed ticket IDs**. Status vs t
 
 `--mode hybrid` is default after clearing `zstd -19` on **all** headline files
 (2026-09-11 W1–W7 refresh): dickens 26.5%, webster 20.1%, nci 4.99%, mr 27.3%,
-json 0.1%. Scorecard: [README.md](README.md#goal).
+json 0.1%. Scorecard: [README.md](README.md#scorecards). Numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
