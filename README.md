@@ -40,40 +40,40 @@ Regenerate: `scripts/bench_vs_sota.sh <corpus_dir>`.
 
 | file | vs lz4-9 | vs zstd-1 |
 |------|:--------:|:---------:|
-| dickens | lose / win / split | lose / lose / lose |
+| dickens | lose / **win** / split | lose / lose / lose |
 | webster | lose / lose / lose | lose / lose / lose |
 | nci | lose / lose / lose | lose / lose / lose |
-| mr | win / win / **win** | lose / lose / lose |
-| json | tie / win / **win** | tie / win / **win** |
+| mr | **win** / **win** / **win** | lose / lose / lose |
+| json | tie / **win** / **win** | tie / **win** / **win** |
 
 **rcn `-3` vs gzip -9:**
 
 | file | vs gzip-9 |
 |------|:---------:|
 | dickens | lose / lose / lose |
-| webster | lose / win / split |
-| nci | lose / win / split |
-| mr | win / lose / split |
+| webster | lose / **win** / split |
+| nci | lose / **win** / split |
+| mr | **win** / lose / split |
 | json | lose / lose / lose |
 
 **rcn `-9` vs `zstd -19` (default gate):**
 
 | file | vs zstd-19 |
 |------|:----------:|
-| dickens | win / win / **win** |
-| webster | win / win / **win** |
-| nci | win / win / **win** |
-| mr | win / lose / split |
+| dickens | **win** / **win** / **win** |
+| webster | **win** / **win** / **win** |
+| nci | **win** / **win** / **win** |
+| mr | **win** / lose / split |
 | json | tie / lose / split |
 
 **rcn `-9` vs other peers:**
 
 | file | vs xz-9 | vs brotli-11 | vs gzip-9 | vs lz4-9 | vs zstd-1 |
 |------|:-------:|:------------:|:---------:|:--------:|:---------:|
-| dickens | win / win / **win** | win / win / **win** | win / lose / split | win / lose / split | win / lose / split |
-| webster | lose / win / split | tie / win / **win** | win / lose / split | win / lose / split | win / lose / split |
-| nci | win / win / **win** | lose / win / split | win / lose / split | win / lose / split | win / lose / split |
-| mr | win / lose / split | win / lose / split | win / lose / split | win / lose / split | win / lose / split |
+| dickens | **win** / **win** / **win** | **win** / **win** / **win** | **win** / lose / split | **win** / lose / split | **win** / lose / split |
+| webster | lose / **win** / split | tie / **win** / **win** | **win** / lose / split | **win** / lose / split | **win** / lose / split |
+| nci | **win** / **win** / **win** | lose / **win** / split | **win** / lose / split | **win** / lose / split | **win** / lose / split |
+| mr | **win** / lose / split | **win** / lose / split | **win** / lose / split | **win** / lose / split | **win** / lose / split |
 | json | tie / lose / split | tie / lose / split | tie / lose / split | tie / lose / split | tie / lose / split |
 
 ## Design methodology
