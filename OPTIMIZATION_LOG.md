@@ -167,6 +167,6 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 | 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |
 | 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |
 | 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated |
-| 2026-09-12 | Levels `-1`/`-3`/`-9`/`-19`; dual-axis scorecards; RCN1 freeze deferred (methods 19–20). **199/199** |
+| 2026-09-12 | Levels `-1`/`-3`/`-9`/`-19`; dual-axis scorecards; RCN1 v1 documented as stable. **199/199** |
 | 2026-09-11 | V1 BWT payload cache; R1 Hybrid; R2 Fast XWRT+DP-LZP (nci 4.97%); V2 NEON walk_dist; V3 `release-prof` + `StackModel`; **default → hybrid**; **187/187** |
 | 2026-09-11 | **W1–W7:** Binary 1 MiB + match hist; Fast o3 (mr 35.1%→31.5%); parallel Fast Text; XWRT-1024; Binary Indirect A/B **killed**; kind DP costs; libsais default + PGO docs. Hybrid gate held (mr 27.33%, nci 4.99%). **187/187** |

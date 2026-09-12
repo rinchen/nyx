@@ -2,8 +2,7 @@
 
 `rcn` — **R**ust **C**ompressor, **N**ew — is a leveled command-line compressor
 written in Rust. It combines a hash-chain LZ wire engine, context mixing,
-Burrows–Wheeler Transform (BWT), and DP-LZP matching. The `.rcn` (RCN1)
-container and CLI may still change while new level methods settle.
+Burrows–Wheeler Transform (BWT), and DP-LZP matching.
 
 Optimization tickets, A/B history, and CI notes:
 [DEVELOPMENT.md](DEVELOPMENT.md) · [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
@@ -174,11 +173,9 @@ Magic `RCN1`, header `VERSION = 1`. Layout is documented in
 
 `[MAGIC 4][Header 7][optional global dict][BlockEntry × N][payloads…]`
 
-The format is versioned and unknown methods fail closed, but it is **not
-frozen** yet: levels `-1`/`-3` added method bytes 19–20. The may-change
-warning stays until those methods (or a decision to drop them) settle and
-committed `.rcn` fixtures exist. Do not assume interchange stability across
-releases until that freeze.
+RCN1 `VERSION = 1` is the stable container. Unknown methods fail closed.
+New engines add method bytes; they do not change the header or block-entry
+layout.
 
 ## Peers (crates.io and CLI equivalents)
 
