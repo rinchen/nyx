@@ -2,8 +2,8 @@
 //!
 //! Before compressing a block, `rcn` estimates its character with a cheap order-0 Shannon
 //! entropy over the block and a few structural signals. This chooses which predictor stack
-//! to run (and whether to just copy random data), which is what keeps speed near `zstd`
-//! while allowing CM-quality prediction only where it pays off.
+//! to run (and whether to just copy random data), so expensive CM/BWT work runs
+//! only where it pays off. Level `-1` skips BWT and uses the wire LZ engine.
 
 /// The kind of data a block looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

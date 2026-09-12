@@ -26,8 +26,9 @@
 //!   This is also the decoder default for any future method value, so old
 //!   streams remain valid.
 //!
-//! Default compress mode is **Hybrid**: Text/Random use the Fast byte path;
-//! Binary/Exec use the Slow bit path above.
+//! Default compress mode is **Hybrid** (level `-9`): Text/Random use the Fast
+//! byte path; Binary/Exec use the Slow bit path above. Level `-1` is the
+//! [`crate::wire`] LZ engine; level `-3` is byte CM without BWT trials.
 //!
 //! ## DP-optimal LZP match pre-pass (default)
 //!
@@ -153,6 +154,10 @@ pub const METHOD_BYTE_CSV_SPLIT: u8 = 17;
 pub const METHOD_BYTE_XML_SPLIT: u8 = 18;
 /// Exec E8E9 transform, byte-coded (fast).
 pub const METHOD_BYTE_EXEC_E8E9: u8 = 14;
+/// Level `-1` wire engine: hash-chain LZ77 + optional order-0 rANS.
+pub const METHOD_WIRE: u8 = 19;
+/// Byte CM on Text without cross-block match history (level `-3`).
+pub const METHOD_BYTE_TEXT: u8 = 20;
 
 /// One block's compression summary, reported by [`compress_mode_diag`] for
 /// `--verbose` progress output.
@@ -191,6 +196,8 @@ pub fn method_label(method: u8) -> &'static str {
         METHOD_BYTE_CSV_SPLIT => "byte-CSV-split→BWT",
         METHOD_BYTE_XML_SPLIT => "byte-XML-split→BWT",
         METHOD_BYTE_EXEC_E8E9 => "byte-E8E9→CM",
+        METHOD_WIRE => "wire-LZ",
+        METHOD_BYTE_TEXT => "byte-CM(text)",
         _ => "?",
     }
 }
@@ -199,7 +206,7 @@ pub fn method_label(method: u8) -> &'static str {
 fn method_for_pipeline(pipeline: bwt::BwtPipeline, mode: CodecMode) -> u8 {
     // Hybrid Text uses Fast method bytes; Hybrid Binary/Exec never calls this.
     let mode = match mode {
-        CodecMode::Hybrid => CodecMode::Fast,
+        CodecMode::Hybrid | CodecMode::General | CodecMode::Wire => CodecMode::Fast,
         other => other,
     };
     match (mode, pipeline) {
@@ -217,7 +224,9 @@ fn method_for_pipeline(pipeline: bwt::BwtPipeline, mode: CodecMode) -> u8 {
         (CodecMode::Fast, bwt::BwtPipeline::XwrtBwtMtfRle) => METHOD_BYTE_XWRT_BWT_MTF_RLE,
         (CodecMode::Fast, bwt::BwtPipeline::CsvSplit) => METHOD_BYTE_CSV_SPLIT,
         (CodecMode::Fast, bwt::BwtPipeline::XmlSplit) => METHOD_BYTE_XML_SPLIT,
-        (CodecMode::Hybrid, _) => unreachable!("Hybrid remapped above"),
+        (CodecMode::Hybrid | CodecMode::General | CodecMode::Wire, _) => {
+            unreachable!("remapped to Fast above")
+        }
     }
 }
 
@@ -254,12 +263,17 @@ fn inverse_transform_for_method(
 /// Encoding strategy for [`compress_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecMode {
-    /// Bit-level CM: 8–9 models + two-level bank mixer + bit rANS.
+    /// Bit-level CM: 8–9 models + two-level bank mixer + bit rANS. Level `-19`.
     Slow,
-    /// Byte-level CM: orders 0–2 count models + byte rANS.
+    /// Byte-level CM with BWT trials. Not a numbered level (see [`General`]).
     Fast,
     /// Per-block adaptive: Fast entropy for Text/Random, Slow+DP-LZP for Binary/Exec.
+    /// Level `-9` (default).
     Hybrid,
+    /// Hash-chain LZ + optional order-0 rANS. Level `-1`.
+    Wire,
+    /// Byte CM + DP-LZP, no BWT trials. Level `-3`.
+    General,
 }
 
 /// Decay factor for cross-block weight persistence. 0.995 keeps 99.5% of learned
@@ -294,6 +308,33 @@ pub fn compress_fast(buf: &[u8]) -> Result<Vec<u8>> {
 /// Returns [`RcnError`] if an entropy primitive fails.
 pub fn compress_hybrid(buf: &[u8]) -> Result<Vec<u8>> {
     compress_mode(buf, CodecMode::Hybrid)
+}
+
+/// Compress `buf` using the level `-1` wire engine.
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if an entropy primitive fails.
+pub fn compress_wire(buf: &[u8]) -> Result<Vec<u8>> {
+    compress_mode(buf, CodecMode::Wire)
+}
+
+/// Compress `buf` using the level `-3` general engine (byte CM, no BWT).
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if an entropy primitive fails.
+pub fn compress_general(buf: &[u8]) -> Result<Vec<u8>> {
+    compress_mode(buf, CodecMode::General)
+}
+
+/// Compress `buf` at a named [`crate::level::Level`].
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if an entropy primitive fails.
+pub fn compress_level(buf: &[u8], level: crate::level::Level) -> Result<Vec<u8>> {
+    compress_mode(buf, level.mode())
 }
 
 pub fn compress_with<F>(buf: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
@@ -339,18 +380,21 @@ where
         let mut offset = 0usize;
         while offset < buf.len() {
             let kind = crate::classify::classify(&buf[offset..]);
-            let block_size = block_size_for_kind(kind, &buf[offset..], offset, buf.len());
+            let block_size = block_size_for_kind(kind, offset, buf.len(), mode);
             let end = (offset + block_size).min(buf.len());
             segments.push((offset, end, kind));
             offset = end;
         }
     }
 
-    let global_dict: Option<XwrtDictionary> = Some(XwrtDictionary::build_from_data(buf));
+    let global_dict: Option<XwrtDictionary> = match mode {
+        CodecMode::Wire | CodecMode::General => None,
+        _ => Some(XwrtDictionary::build_from_data(buf)),
+    };
 
     let use_slow_for = |kind: crate::classify::BlockKind| match mode {
         CodecMode::Slow => true,
-        CodecMode::Fast => false,
+        CodecMode::Fast | CodecMode::General | CodecMode::Wire => false,
         CodecMode::Hybrid => matches!(
             kind,
             crate::classify::BlockKind::Binary | crate::classify::BlockKind::Exec
@@ -366,6 +410,9 @@ where
         .iter()
         .enumerate()
         .filter(|(_, (_, _, kind))| {
+            if mode == CodecMode::Wire {
+                return true;
+            }
             !use_slow_for(*kind)
                 && matches!(
                     kind,
@@ -382,7 +429,13 @@ where
             .map(|&i| {
                 let (start, end, kind) = segments[i];
                 let mut hist = Vec::new();
-                let r = encode_block_fast(&buf[start..end], kind, dict_ref, &mut hist);
+                let r = encode_block_fastish(
+                    mode,
+                    &buf[start..end],
+                    kind,
+                    dict_ref,
+                    &mut hist,
+                );
                 (i, r)
             })
             .collect();
@@ -392,7 +445,8 @@ where
     } else if let Some(&i) = parallel_idxs.first() {
         let (start, end, kind) = segments[i];
         let mut hist = Vec::new();
-        encoded[i] = Some(encode_block_fast(
+        encoded[i] = Some(encode_block_fastish(
+            mode,
             &buf[start..end],
             kind,
             global_dict.as_ref(),
@@ -436,7 +490,13 @@ where
                 &mut match_hist,
             )
         } else {
-            encode_block_fast(block_data, kind, global_dict.as_ref(), &mut match_hist)
+            encode_block_fastish(
+                mode,
+                block_data,
+                kind,
+                global_dict.as_ref(),
+                &mut match_hist,
+            )
         };
 
         if use_slow && method != METHOD_COPY {
@@ -489,6 +549,61 @@ where
     }
     out.extend_from_slice(&payloads);
     Ok((out, diags))
+}
+
+/// Dispatch Fast / General / Wire per-block encode (no Slow bit CM).
+fn encode_block_fastish(
+    mode: CodecMode,
+    block_data: &[u8],
+    kind: crate::classify::BlockKind,
+    global_dict: Option<&crate::model::word::XwrtDictionary>,
+    match_hist: &mut Vec<u8>,
+) -> (Vec<u8>, u8, usize) {
+    match mode {
+        CodecMode::Wire => encode_block_wire(block_data),
+        CodecMode::General => encode_block_general(block_data, kind, match_hist),
+        _ => encode_block_fast(block_data, kind, global_dict, match_hist),
+    }
+}
+
+/// Level `-1`: hash-chain LZ. Copy when the wire payload does not shrink.
+fn encode_block_wire(block_data: &[u8]) -> (Vec<u8>, u8, usize) {
+    if block_data.is_empty() {
+        return (Vec::new(), METHOD_COPY, 0);
+    }
+    let comp = crate::wire::compress(block_data);
+    if comp.len() >= block_data.len() {
+        (block_data.to_vec(), METHOD_COPY, block_data.len())
+    } else {
+        (comp, METHOD_WIRE, block_data.len())
+    }
+}
+
+/// Level `-3`: byte CM + DP-LZP, no BWT / XWRT trials.
+fn encode_block_general(
+    block_data: &[u8],
+    kind: crate::classify::BlockKind,
+    match_hist: &mut Vec<u8>,
+) -> (Vec<u8>, u8, usize) {
+    if kind == crate::classify::BlockKind::Random {
+        match_hist.clear();
+        return (block_data.to_vec(), METHOD_COPY, block_data.len());
+    }
+    if kind == crate::classify::BlockKind::Exec {
+        let transformed = crate::model::e8e9::e8e9_transform(block_data);
+        let comp = compress_byte_with_matches(&transformed, kind, match_hist);
+        append_match_hist(match_hist, &transformed);
+        return (comp, METHOD_BYTE_EXEC_E8E9, transformed.len());
+    }
+    if kind == crate::classify::BlockKind::Binary {
+        let comp = compress_byte_with_matches(block_data, kind, match_hist);
+        append_match_hist(match_hist, block_data);
+        (comp, METHOD_BYTE_CM, block_data.len())
+    } else {
+        match_hist.clear();
+        let comp = compress_byte_with_matches(block_data, kind, &[]);
+        (comp, METHOD_BYTE_TEXT, block_data.len())
+    }
 }
 
 /// Fast-mode per-block encode: byte-level CM, or copy for random blocks.
@@ -616,10 +731,13 @@ fn append_match_hist(hist: &mut Vec<u8>, data: &[u8]) {
 
 fn block_size_for_kind(
     kind: crate::classify::BlockKind,
-    _block: &[u8],
     offset: usize,
     total: usize,
+    mode: CodecMode,
 ) -> usize {
+    if mode == CodecMode::Wire {
+        return (4 * 1024 * 1024).min(total.saturating_sub(offset)).max(1);
+    }
     match kind {
         crate::classify::BlockKind::Text => {
             let max_text = 4 * 1024 * 1024;
@@ -1281,9 +1399,14 @@ where
             match_hist.clear();
             hist_kind = None;
             comp.to_vec()
+        } else if entry.method == METHOD_WIRE {
+            match_hist.clear();
+            hist_kind = None;
+            crate::wire::decompress(comp, entry.orig_len as usize)?
         } else if matches!(
             entry.method,
             METHOD_BYTE_CM
+                | METHOD_BYTE_TEXT
                 | METHOD_BYTE_BWT_MTF_RLE
                 | METHOD_BYTE_LZP_BWT_MTF
                 | METHOD_BYTE_JSON_SPLIT
@@ -1411,6 +1534,7 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         | METHOD_CSV_SPLIT
         | METHOD_XML_SPLIT => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_CM
+        | METHOD_BYTE_TEXT
         | METHOD_BYTE_BWT_MTF_RLE
         | METHOD_BYTE_LZP_BWT_MTF
         | METHOD_BYTE_JSON_SPLIT
@@ -1418,6 +1542,7 @@ fn kind_for_method(method: u8) -> Result<crate::classify::BlockKind> {
         | METHOD_BYTE_CSV_SPLIT
         | METHOD_BYTE_XML_SPLIT => Ok(crate::classify::BlockKind::Text),
         METHOD_BYTE_EXEC_E8E9 => Ok(crate::classify::BlockKind::Exec),
+        METHOD_WIRE => Ok(crate::classify::BlockKind::Binary),
         _ => Err(RcnError::InvalidContainer(format!(
             "unknown method {}",
             method
@@ -1649,6 +1774,68 @@ mod tests {
     #[test]
     fn method_label_covers_method_byte_exec_e8e9() {
         assert_ne!(method_label(METHOD_BYTE_EXEC_E8E9), "?");
+        assert_eq!(method_label(METHOD_WIRE), "wire-LZ");
+    }
+
+    #[test]
+    fn compress_wire_then_decompress_returns_original() {
+        let original = mixed_fixture();
+        let comp = compress_wire(&original).expect("compress_wire");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "wire round-trip mismatch");
+    }
+
+    #[test]
+    fn compress_general_then_decompress_returns_original() {
+        let original = mixed_fixture();
+        let comp = compress_general(&original).expect("compress_general");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original, "general round-trip mismatch");
+    }
+
+    #[test]
+    fn decompress_byte_text_two_blocks_does_not_reuse_hist() {
+        // METHOD_BYTE_TEXT must not inherit Binary match history across blocks.
+        let a = b"alpha alpha alpha alpha alpha alpha".repeat(40);
+        let b = b"bravo bravo bravo bravo bravo bravo".repeat(40);
+        let ca = crate::bytecodec::compress_block_with_matches(&a, &[], false);
+        let cb = crate::bytecodec::compress_block_with_matches(&b, &[], false);
+        let mut buf = Vec::new();
+        Header {
+            version: VERSION,
+            flags: 0,
+            block_size_log: 16,
+            num_blocks: 2,
+        }
+        .write(&mut buf);
+        BlockEntry {
+            comp_len: ca.len() as u32,
+            orig_len: a.len() as u32,
+            method: METHOD_BYTE_TEXT,
+            crc32: crc32(&a),
+        }
+        .write(&mut buf);
+        BlockEntry {
+            comp_len: cb.len() as u32,
+            orig_len: b.len() as u32,
+            method: METHOD_BYTE_TEXT,
+            crc32: crc32(&b),
+        }
+        .write(&mut buf);
+        buf.extend_from_slice(&ca);
+        buf.extend_from_slice(&cb);
+        let back = decompress(&buf).expect("decompress");
+        let mut expect = a;
+        expect.extend_from_slice(&b);
+        assert_eq!(back, expect);
+    }
+
+    #[test]
+    fn compress_level_archive_matches_hybrid() {
+        let original = b"level archive should match hybrid default".repeat(200);
+        let a = compress_level(&original, crate::level::Level::Archive).expect("archive");
+        let b = compress_hybrid(&original).expect("hybrid");
+        assert_eq!(a, b);
     }
 
     #[test]

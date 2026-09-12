@@ -1,8 +1,8 @@
 # Rcn Optimization Opportunity Log
 
-Last updated: 2026-09-11
-Test status: 187/187 passing (`cargo test --lib`, with or without `no_avx2`)
-Headline benches: refreshed 2026-09-11 after W1–W7 (README).
+Last updated: 2026-09-12
+Test status: see `cargo test --lib` (198+; with or without `no_avx2`)
+Headline benches: W1–W7 on 2026-09-11; levels `-1`/`-3` + dual scorecards 2026-09-12 (README).
 
 Human-readable TODO, A/B history, and CI notes: [DEVELOPMENT.md](DEVELOPMENT.md).
 Product overview and headline benches: [README.md](README.md).
@@ -111,13 +111,27 @@ json 0.1%. Scorecard: [README.md](README.md#goal).
 
 ## Recommended Next Step
 
-1. **Hold the gate:** hybrid stays default while ratio vs `-19` remains green on
-   the headline set after any further changes.
-2. Stretch: stronger `nci` if still above brotli-11 (4.5%); Fast `mr` is 31.5%
-   (was 35.1%) — still just above the 31.2% `-19` line.
+1. **Level `-9`:** keep hybrid default. Close the `mr` dual-axis split vs
+   `zstd -19` (need ≤31.2% at ≫1 cmp MB/s — Fast Binary is 31.5% / ~4 MB/s).
+2. **Level `-1`:** raise wire LZ ratio toward `zstd -1` and cmp speed toward
+   `zstd -1` (parallel tokens, longer chain, SIMD match).
+3. **Level `-3`:** beat `gzip -9` on both axes (BWT budget or stronger byte
+   models without Slow).
 
 Do **not** re-default Text Indirect, re-open Binary DP ≥24, or re-bump Text PPMd
 order without a ≥0.3pt measure. A/B history: [DEVELOPMENT.md](DEVELOPMENT.md).
+
+---
+
+## Levels (L1–L19, 2026-09-12)
+
+| Ticket | Change | Status |
+|--------|--------|--------|
+| L1 | Hash-chain LZ wire engine (`METHOD_WIRE` 19); `--level 1` | Landed — dual-axis vs lz4/`zstd -1` still open |
+| L3 | Byte CM, no BWT (`METHOD_BYTE_TEXT` 20); `--level 3` | Landed — dual-axis vs gzip-9 still open |
+| L9 | Hybrid remains default (`--level 9`) | Landed — both-win vs `-19` on text/`nci`; `mr`/json split |
+| L19 | Slow aliased as `--level 19` | Landed |
+| D1 | Dual ratio+cmp+both W-L-T in `bench_vs_sota.sh` + README | Landed |
 
 ---
 
@@ -152,6 +166,7 @@ macOS `sample` on release `rcn` (ARM64, stripped — no demangled frames):
 | 2026-09-08 | C5 global XWRT-128 |
 | 2026-09-09 | Docs truth; C6–C9 / S8–S10; triage S11/S12/C11; C10 reverted; hygiene + de-exp docs; C11 fixtures; `--verbose`; fast-default gate documented |
 | 2026-09-11 | Hardening pass: fallible BWT/dict/decompress bounds; Fast/CSV/XML + corrupt-container tests; `split_common` + method-map dedup; orphan `delta.rs` removed; AVX2↔scalar parity tests; pre-commit mirrors CI `no_avx2` — **186/186** |
-| 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated for this machine |
+| 2026-09-11 | Full headline re-bench (slow + fast + peers) on `.work/bench5`; README tables refreshed; ratios unchanged vs prior stitch; speeds updated |
+| 2026-09-12 | Levels `-1`/`-3`/`-9`/`-19`; dual-axis scorecards; RCN1 freeze deferred (methods 19–20). **199/199** |
 | 2026-09-11 | V1 BWT payload cache; R1 Hybrid; R2 Fast XWRT+DP-LZP (nci 4.97%); V2 NEON walk_dist; V3 `release-prof` + `StackModel`; **default → hybrid**; **187/187** |
 | 2026-09-11 | **W1–W7:** Binary 1 MiB + match hist; Fast o3 (mr 35.1%→31.5%); parallel Fast Text; XWRT-1024; Binary Indirect A/B **killed**; kind DP costs; libsais default + PGO docs. Hybrid gate held (mr 27.33%, nci 4.99%). **187/187** |

@@ -4,8 +4,9 @@ Optimization tickets, A/B history, CI/testing notes, and roadmaps.
 For product overview and headline benchmarks, see [README.md](README.md).
 Ticket tables also live in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
-Last updated: 2026-09-11. Test status: see `cargo test --lib` / CI. Headline
-benches refreshed 2026-09-11 after W1–W7 (see [README.md](README.md#benchmarks)).
+Last updated: 2026-09-12. Test status: see `cargo test --lib` / CI. Headline
+benches: W1–W7 on 2026-09-11; levels `-1`/`-3` + dual scorecards on
+2026-09-12 (see [README.md](README.md#benchmarks)).
 
 ---
 
@@ -28,6 +29,8 @@ Closed through C11 / S12 (C10 tried and reverted), plus V1–V3 / R1–R2
 - ✅ **R1 — Hybrid mode** – Fast Text/Random, Slow Binary/Exec; mixed methods in one container
 - ✅ **R2 — Fast nci** – global XWRT on Fast trials + DP-LZP on byte path → nci **4.97%**
 - ✅ **Default → hybrid** after full headline gate cleared
+- ✅ **L1 / L3 / L9 / L19** — numbered levels + wire/general engines (2026-09-12)
+- ✅ **D1** — dual ratio + cmp-speed + both scorecards
 
 ### Speed
 
@@ -83,13 +86,23 @@ cargo pgo optimize -- --release --bin rcn
 `bwt_libsais` is now a **default** feature (W7); disable with
 `--no-default-features --features two_pass` if needed.
 
-## Ratio backlog
+## Dual-axis backlog (2026-09-12)
 
-**Closed through R2; W1–W7 landed 2026-09-11.** North star gate **cleared** by Hybrid default.
+North star is no longer ratio-only. Each level must beat its peer class on
+**ratio and compress MB/s**. See [README.md](README.md#goal).
 
-Hold Hybrid vs `zstd -19`. Stretch: `nci` toward brotli-11 (4.5%).
+| Level | Status on headline set |
+|------:|------------------------|
+| `-9` vs `zstd -19` | both-win text/`nci`; **split** `mr` (ratio win, 0.03 MB/s) and json |
+| `-1` vs `lz4 -9` / `zstd -1` | both-win json/`mr` vs lz4; **lose cmp** vs `zstd -1` almost everywhere |
+| `-3` vs `gzip -9` | no both-win yet (ratio or speed splits) |
+| `-19` | Slow text still loses `-19` on ratio; `mr` leads peers on ratio |
+
 Do not reopen Text Indirect / Binary DP≥24 / Order-12 without ≥0.3pt evidence.
 Binary-only Indirect was A/B'd (W5) and **killed** (mr regression).
+
+Next levers: faster `-9` Binary (stay ≤31.2% vs `-19`); stronger/faster
+wire LZ for `-1`; BWT-budget or hybrid Fast for `-3` vs gzip.
 
 ---
 
@@ -173,7 +186,7 @@ is default and SSM is isolated from DP.
 | change | files tested | result | action |
 |---|---|---|---|
 | round-trip verification | all 5 | lossless | every pass round-trip verified |
-| test suite | all | 187/187 green (`cargo test --lib`) | kept |
+| test suite | all | 198+ green (`cargo test --lib`) | kept |
 | bit-identical output | dickens 2MB | each pass `cmp`-identical to prior where claimed | kept |
 | container / BWT hardening (2026-09-11) | unit + Fast/CSV/XML round-trips | corrupt payloads/`comp_len`/dict → `RcnError`; AVX2↔scalar parity | kept |
 | orphan delta transform | — | never wired into codec | **deleted** (`src/model/delta.rs`) |

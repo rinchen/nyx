@@ -20,15 +20,17 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use rcn::codec::{self, decompress, CodecMode};
+use rcn::level::Level;
 
 #[derive(Parser)]
 #[command(
     name = "rcn",
     version,
-    about = "Rcn: ratio-first context-mixing compressor (goal: beat zstd -19)",
-    long_about = "Rcn is a ratio-first context-mixing compressor. The success \
-metric is beating zstd -19 on ratio — not matching zstd -1 on speed. It stages \
-BWT, LZP, and online logistic mixing, then entropy-codes with rANS. \
+    about = "Rcn: leveled compressor (win ratio and compress speed vs each peer class)",
+    long_about = "Rcn is a leveled compressor. Each level owns a peer class on \
+both ratio and compress throughput: -1 vs lz4-9/zstd-1, -3 vs gzip-9, \
+-9 (default, hybrid) vs zstd-19, -19 vs archival peers. It stages BWT, LZP, \
+hash-chain LZ, and context mixing, then entropy-codes with rANS. \
 Subcommands compress and decompress .rcn (RCN1) containers, bench a corpus, \
 or run the library self-test.",
     after_help = "See also: man rcn (if installed), or man/rcn.1 in the source tree.",
@@ -40,15 +42,59 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum, Default)]
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum ModeArg {
-    /// Adaptive: Fast for Text, Slow for Binary/Exec (beats/ties zstd -19 on headline set).
-    #[default]
+    /// Level -9: Fast for Text, Slow for Binary/Exec.
     Hybrid,
-    /// Bit-level CM. Stronger on some binary; much slower; loses text to zstd -19.
+    /// Level -19: bit-level CM on every block.
     Slow,
-    /// Byte-level CM. Usually better text ratio + throughput; loses to zstd -19 on mr.
+    /// Byte-level CM with BWT trials (not a numbered level).
     Fast,
+    /// Level -1: hash-chain LZ + optional order-0 rANS.
+    Wire,
+    /// Level -3: byte CM + DP-LZP, no BWT trials.
+    General,
+}
+
+impl ModeArg {
+    fn to_mode(self) -> CodecMode {
+        match self {
+            Self::Slow => CodecMode::Slow,
+            Self::Fast => CodecMode::Fast,
+            Self::Hybrid => CodecMode::Hybrid,
+            Self::Wire => CodecMode::Wire,
+            Self::General => CodecMode::General,
+        }
+    }
+}
+
+fn parse_level(s: &str) -> Result<Level, String> {
+    let n: i32 = s
+        .parse()
+        .map_err(|_| format!("invalid level '{s}' (use 1, 3, 9, 19 or -1, -3, -9, -19)"))?;
+    Level::from_i32(n).ok_or_else(|| {
+        format!("unsupported level {n} (use 1, 3, 9, 19 or -1, -3, -9, -19)")
+    })
+}
+
+fn resolve_engine(level: Option<Level>, mode: Option<ModeArg>) -> Result<CodecMode, String> {
+    match (level, mode) {
+        (Some(level), Some(mode)) => {
+            let from_level = level.mode();
+            let from_mode = mode.to_mode();
+            if from_level != from_mode {
+                return Err(format!(
+                    "--level {} maps to {:?}, which conflicts with --mode",
+                    level.number(),
+                    from_level
+                ));
+            }
+            Ok(from_level)
+        }
+        (Some(level), None) => Ok(level.mode()),
+        (None, Some(mode)) => Ok(mode.to_mode()),
+        (None, None) => Ok(CodecMode::Hybrid),
+    }
 }
 
 #[derive(Subcommand)]
@@ -64,9 +110,14 @@ enum Cmd {
         /// Entropy backend (only `rans` is built in).
         #[arg(long, default_value = "rans")]
         backend: String,
-        /// Entropy mode: `hybrid` (default; Text→fast, Binary→slow), `slow`, or `fast`.
-        #[arg(long, value_enum, default_value_t = ModeArg::Hybrid)]
-        mode: ModeArg,
+        /// Level: 1 (wire), 3 (general), 9 (hybrid, default), 19 (max).
+        /// Also accepts -1 / -3 / -9 / -19.
+        #[arg(short = 'L', long = "level", value_parser = parse_level)]
+        level: Option<Level>,
+        /// Engine alias: `hybrid` (-9), `slow` (-19), `fast` (BWT byte CM),
+        /// `wire` (-1), or `general` (-3). Default hybrid when `--level` omitted.
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
         /// Print per-block kind, method, and sizes to stderr.
         #[arg(long, short = 'v')]
         verbose: bool,
@@ -88,12 +139,24 @@ enum Cmd {
         /// Reserved for SOTA comparison (see `scripts/bench_vs_sota.sh`).
         #[arg(long)]
         vs: Option<String>,
-        /// Use the byte-level (fast) entropy mode.
+        /// Level: 1 / 3 / 9 / 19 (or negative aliases). Default 9.
+        #[arg(short = 'L', long = "level", value_parser = parse_level)]
+        level: Option<Level>,
+        /// Use the byte-level BWT (fast) entropy mode.
         #[arg(long)]
         fast: bool,
-        /// Use Hybrid mode (Text→fast, Binary→slow). Default when neither flag set.
+        /// Use Hybrid mode (Text→fast, Binary→slow). Default when no flags set.
         #[arg(long)]
         hybrid: bool,
+        /// Use the level -1 wire engine.
+        #[arg(long)]
+        wire: bool,
+        /// Use the level -3 general engine.
+        #[arg(long)]
+        general: bool,
+        /// Use Slow bit CM (level -19).
+        #[arg(long)]
+        slow: bool,
     },
     /// Run the library test suite and report PASS/FAIL.
     SelfTest,
@@ -113,16 +176,30 @@ fn run() -> Result<(), String> {
             input,
             output,
             backend,
+            level,
             mode,
             verbose,
-        } => cmd_compress(&input, &output, &backend, mode, verbose),
+        } => cmd_compress(&input, &output, &backend, level, mode, verbose),
         Cmd::Decompress { input, output } => cmd_decompress(&input, &output),
         Cmd::Bench {
             corpus,
             vs,
+            level,
             fast,
             hybrid,
-        } => cmd_bench(&corpus, vs.as_deref(), fast, hybrid),
+            wire,
+            general,
+            slow,
+        } => cmd_bench(
+            &corpus,
+            vs.as_deref(),
+            level,
+            fast,
+            hybrid,
+            wire,
+            general,
+            slow,
+        ),
         Cmd::SelfTest => cmd_selftest(),
     }
 }
@@ -131,7 +208,8 @@ fn cmd_compress(
     input: &PathBuf,
     output: &PathBuf,
     backend: &str,
-    mode: ModeArg,
+    level: Option<Level>,
+    mode: Option<ModeArg>,
     verbose: bool,
 ) -> Result<(), String> {
     if backend != "rans" {
@@ -139,12 +217,8 @@ fn cmd_compress(
             "unsupported backend '{backend}' (only 'rans' is built in)"
         ));
     }
+    let mode = resolve_engine(level, mode)?;
     let data = fs::read(input).map_err(|e| format!("read {}: {e}", input.display()))?;
-    let mode = match mode {
-        ModeArg::Slow => CodecMode::Slow,
-        ModeArg::Fast => CodecMode::Fast,
-        ModeArg::Hybrid => CodecMode::Hybrid,
-    };
     let (compressed, diags) = codec::compress_mode_diag(&data, mode)
         .map_err(|e| format!("compress failed: {e}"))?;
     if verbose {
@@ -184,21 +258,43 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_bench(corpus: &PathBuf, vs: Option<&str>, fast: bool, hybrid: bool) -> Result<(), String> {
+fn cmd_bench(
+    corpus: &PathBuf,
+    vs: Option<&str>,
+    level: Option<Level>,
+    fast: bool,
+    hybrid: bool,
+    wire: bool,
+    general: bool,
+    slow: bool,
+) -> Result<(), String> {
     if !corpus.is_dir() {
         return Err(format!(
             "corpus path {} is not a directory",
             corpus.display()
         ));
     }
-    let mode = if fast {
-        CodecMode::Fast
+    let flag_count = [fast, hybrid, wire, general, slow]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if flag_count > 1 {
+        return Err("use only one of --fast / --hybrid / --wire / --general / --slow".into());
+    }
+    let mode_from_flag = if fast {
+        Some(ModeArg::Fast)
     } else if hybrid {
-        CodecMode::Hybrid
+        Some(ModeArg::Hybrid)
+    } else if wire {
+        Some(ModeArg::Wire)
+    } else if general {
+        Some(ModeArg::General)
+    } else if slow {
+        Some(ModeArg::Slow)
     } else {
-        // Bench default matches CLI compress default.
-        CodecMode::Hybrid
+        None
     };
+    let mode = resolve_engine(level, mode_from_flag)?;
     println!(
         "{:<28} {:>10} {:>10} {:>9} {:>11} {:>11}",
         "name", "orig_kb", "comp_kb", "ratio%", "cmp_MBps", "dec_MBps"
