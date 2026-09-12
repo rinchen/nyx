@@ -1,7 +1,10 @@
 //! Self-describing container format for `rcn` (`RCN1`).
 //!
-//! Layout: `[MAGIC(4)][Header(7)][global_dict_len:u32][global_dict_bytes...][BlockEntry * num_blocks (13 each)][block payloads...]`.
-//! Each block payload is preceded by its `BlockEntry` (compressed length, original length,
+//! v1 layout: `[MAGIC(4)][Header(7)][optional global dict][BlockEntry * num_blocks (13 each)][payloads…]`.
+//! v2 layout: same, plus a member table after the optional global dict:
+//! `[u32 member_count][Member × N][BlockEntry × num_blocks][payloads…]`.
+//!
+//! Each block payload is described by its `BlockEntry` (compressed length, original length,
 //! method, CRC32 of the *original* block).
 //!
 //! Global XWRT dictionary: when present (flags bit 0), the dictionary is stored
@@ -12,10 +15,16 @@ use crc32fast::Hasher;
 use std::io::{Cursor, Read};
 
 pub const MAGIC: &[u8; 4] = b"RCN1";
+/// Single-stream container (no member table).
 pub const VERSION: u8 = 1;
+/// Named-member archive (member table after the optional global dict).
+pub const VERSION_V2: u8 = 2;
 
 /// Flag: global XWRT dictionary present in container.
 pub const FLAG_GLOBAL_DICT: u8 = 0x01;
+
+/// Maximum UTF-8 byte length of a stored member path.
+pub const MAX_MEMBER_NAME_LEN: usize = 4096;
 
 /// Container header (7 bytes after the 4-byte magic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +42,15 @@ pub struct BlockEntry {
     pub orig_len: u32,
     pub method: u8,
     pub crc32: u32,
+}
+
+/// One named file in a v2 archive. `first_block` / `num_blocks` index the
+/// container's `BlockEntry` table (contiguous range; `num_blocks == 0` is empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub name: String,
+    pub first_block: u32,
+    pub num_blocks: u32,
 }
 
 impl Header {
@@ -149,6 +167,148 @@ pub fn write_global_dict(out: &mut Vec<u8>, dict_bytes: &[u8]) -> usize {
     4 + dict_bytes.len()
 }
 
+/// Validate a stored member path: relative, `/`-separated, no `..` / `.` /
+/// empty components, no NUL, no `\`, not absolute.
+///
+/// # Errors
+///
+/// Returns [`RcnError::InvalidContainer`] when `name` is not a safe archive path.
+pub fn validate_member_name(name: &str) -> Result<(), crate::error::RcnError> {
+    if name.is_empty() {
+        return Err(crate::error::RcnError::InvalidContainer(
+            "empty member name".into(),
+        ));
+    }
+    if name.len() > MAX_MEMBER_NAME_LEN {
+        return Err(crate::error::RcnError::InvalidContainer(format!(
+            "member name exceeds {MAX_MEMBER_NAME_LEN} bytes"
+        )));
+    }
+    if name.starts_with('/') {
+        return Err(crate::error::RcnError::InvalidContainer(
+            "absolute member path".into(),
+        ));
+    }
+    if name.contains('\0') {
+        return Err(crate::error::RcnError::InvalidContainer(
+            "member name contains NUL".into(),
+        ));
+    }
+    if name.contains('\\') {
+        return Err(crate::error::RcnError::InvalidContainer(
+            "member name contains backslash".into(),
+        ));
+    }
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(crate::error::RcnError::InvalidContainer(format!(
+                "unsafe member path component in '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize a v2 member table onto `out`.
+///
+/// # Errors
+///
+/// Returns [`RcnError::InvalidContainer`] when a name is invalid or longer than
+/// [`u16::MAX`] / [`MAX_MEMBER_NAME_LEN`].
+pub fn write_members(
+    out: &mut Vec<u8>,
+    members: &[Member],
+) -> Result<usize, crate::error::RcnError> {
+    let start = out.len();
+    out.extend_from_slice(&(members.len() as u32).to_le_bytes());
+    for m in members {
+        validate_member_name(&m.name)?;
+        let name_bytes = m.name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(crate::error::RcnError::InvalidContainer(
+                "member name exceeds u16 length".into(),
+            ));
+        }
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&m.first_block.to_le_bytes());
+        out.extend_from_slice(&m.num_blocks.to_le_bytes());
+    }
+    Ok(out.len() - start)
+}
+
+/// Read a v2 member table from `data` starting at `offset`.
+///
+/// Returns `(members, new_offset)`.
+///
+/// # Errors
+///
+/// Returns [`RcnError::InvalidContainer`] on truncation, a bad name, or a
+/// name longer than [`MAX_MEMBER_NAME_LEN`].
+pub fn read_members(
+    data: &[u8],
+    offset: usize,
+) -> Result<(Vec<Member>, usize), crate::error::RcnError> {
+    if offset + 4 > data.len() {
+        return Err(crate::error::RcnError::InvalidContainer(
+            "truncated member count".into(),
+        ));
+    }
+    let count = u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize;
+    let mut off = offset + 4;
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 2 > data.len() {
+            return Err(crate::error::RcnError::InvalidContainer(
+                "truncated member name length".into(),
+            ));
+        }
+        let name_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+        off += 2;
+        if name_len == 0 || name_len > MAX_MEMBER_NAME_LEN {
+            return Err(crate::error::RcnError::InvalidContainer(format!(
+                "invalid member name length {name_len}"
+            )));
+        }
+        if off + name_len + 8 > data.len() {
+            return Err(crate::error::RcnError::InvalidContainer(
+                "truncated member record".into(),
+            ));
+        }
+        let name_bytes = &data[off..off + name_len];
+        off += name_len;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| {
+            crate::error::RcnError::InvalidContainer("member name is not UTF-8".into())
+        })?;
+        validate_member_name(name)?;
+        let first_block = u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]);
+        off += 4;
+        let num_blocks = u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]);
+        off += 4;
+        members.push(Member {
+            name: name.to_string(),
+            first_block,
+            num_blocks,
+        });
+    }
+    Ok((members, off))
+}
+
 /// CRC32 of `buf` (used to validate decompressed blocks against corruption).
 #[must_use]
 pub fn crc32(buf: &[u8]) -> u32 {
@@ -239,5 +399,64 @@ mod tests {
         let (got, end) = read_global_dict(&buf, 0, FLAG_GLOBAL_DICT).expect("read");
         assert_eq!(got, dict);
         assert_eq!(end, buf.len());
+    }
+
+    #[test]
+    fn member_table_roundtrip() {
+        let members = vec![
+            Member {
+                name: "input.bin".into(),
+                first_block: 0,
+                num_blocks: 2,
+            },
+            Member {
+                name: "mydir/a.txt".into(),
+                first_block: 2,
+                num_blocks: 1,
+            },
+            Member {
+                name: "mydir/empty.dat".into(),
+                first_block: 0,
+                num_blocks: 0,
+            },
+        ];
+        let mut buf = Vec::new();
+        write_members(&mut buf, &members).expect("write");
+        let (got, end) = read_members(&buf, 0).expect("read");
+        assert_eq!(got, members);
+        assert_eq!(end, buf.len());
+    }
+
+    #[test]
+    fn validate_member_name_rejects_unsafe_paths() {
+        assert!(validate_member_name("input.bin").is_ok());
+        assert!(validate_member_name("mydir/a.txt").is_ok());
+        assert!(validate_member_name("").is_err());
+        assert!(validate_member_name("/abs").is_err());
+        assert!(validate_member_name("..").is_err());
+        assert!(validate_member_name("../x").is_err());
+        assert!(validate_member_name("a/../b").is_err());
+        assert!(validate_member_name("a/./b").is_err());
+        assert!(validate_member_name("a//b").is_err());
+        assert!(validate_member_name("a\\b").is_err());
+        assert!(validate_member_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn read_members_rejects_dotdot_name() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        let name = b"../etc/passwd";
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        assert!(read_members(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_members_truncated_count_errors() {
+        let err = read_members(&[0, 1], 0).unwrap_err();
+        assert!(matches!(err, crate::error::RcnError::InvalidContainer(_)));
     }
 }

@@ -157,7 +157,7 @@ cargo build --release --bin rcn
 rcn -h
 rcn --version
 
-# Compress (default level -9 / hybrid)
+# Compress a file (default level -9 / hybrid)
 rcn compress input.bin output.rcn
 
 # Numbered levels (1/3/9/19 or -1/-3/-9/-19)
@@ -174,8 +174,14 @@ rcn compress --mode general input.bin output.rcn
 rcn compress --mode fast input.bin output.rcn
 rcn compress --mode slow input.bin output.rcn
 
-# Decompress
-rcn decompress output.rcn restored.bin
+# Compress a folder into one archive (recursive regular files)
+rcn compress mydir out.rcn
+
+# Decompress: omit OUTPUT to restore the stored name (or folder tree)
+rcn decompress output.rcn
+rcn decompress out.rcn
+rcn decompress out.rcn /tmp/restore
+rcn decompress output.rcn restored.bin --force
 
 # Benchmark one engine
 rcn bench path/to/corpus
@@ -194,6 +200,15 @@ install -m 644 man/rcn.1 "$(manpath | cut -d: -f1)/man1/rcn.1"
 
 `cargo install` installs the binary only, not the man page.
 
+`compress` and `decompress` accept a **file or a folder**. A directory is
+packed into one `.rcn` archive (recursive regular files; relative paths under
+the folder’s basename). Empty directories, permissions, and timestamps are not
+stored. `decompress` writes the stored name next to the `.rcn` for a single
+file, or restores the tree under the current directory (or `OUTPUT`). v1
+containers have no stored name: pass `OUTPUT`, or name the input `*.rcn` so
+the suffix can be stripped. Existing files are not overwritten unless
+`--force`.
+
 ### Installation
 
 `rcn` is installed via `cargo install --locked rcn` or downloaded as a binary
@@ -210,14 +225,18 @@ stdin/stdout piping. Compress accepts `--verbose` for per-block method and size.
 
 ## Stability (RCN1)
 
-Magic `RCN1`, header `VERSION = 1`. Layout is documented in
-[`src/container.rs`](src/container.rs):
+Magic `RCN1`. Layout is documented in [`src/container.rs`](src/container.rs).
 
+v1 (library `compress*`):  
 `[MAGIC 4][Header 7][optional global dict][BlockEntry × N][payloads…]`
 
-RCN1 `VERSION = 1` is the stable container. Unknown methods fail closed.
-New engines add method bytes; they do not change the header or block-entry
-layout.
+v2 (CLI `compress`, `compress_archive`): same header and block-entry layout,
+plus a member table after the optional global dict so decompress can restore
+the original file or folder paths.
+
+RCN1 v1 remains readable. Unknown methods fail closed. New engines add method
+bytes; they do not change the header or block-entry layout. Old decoders
+reject v2 (`unsupported version`).
 
 ## License
 

@@ -13,7 +13,9 @@ rcn \- leveled compressor (ratio and compress speed vs each peer class)
 .I INPUT OUTPUT
 .PP
 .B rcn decompress
-.I INPUT OUTPUT
+[\fIOPTIONS\fR]
+.I INPUT
+[\fIOUTPUT\fR]
 .PP
 .B rcn bench
 [\fIOPTIONS\fR]
@@ -55,11 +57,14 @@ for per-command help.
 .SH COMMANDS
 .TP
 .B compress
-Compress a file into a .rcn (RCN1) container.
+Compress a file or folder into a .rcn (RCN1) container.
 .RS
 .TP
 .I INPUT
-Path to the input file.
+Path to the input file or directory. A directory is packed as one archive
+of recursive regular files (relative paths under the folder basename).
+Empty directories, permissions, and timestamps are not stored. Symlinks
+and special files are skipped.
 .TP
 .I OUTPUT
 Path for the compressed .rcn output.
@@ -101,14 +106,26 @@ Print per-block kind, method, and sizes to stderr.
 .RE
 .TP
 .B decompress
-Decompress a .rcn (RCN1) container back to a file.
+Decompress a .rcn (RCN1) container to the stored file or folder tree.
 .RS
 .TP
 .I INPUT
 Path to the .rcn container.
 .TP
 .I OUTPUT
-Path for the restored output file.
+Optional restore path. For a single stored file this is the output file.
+For a folder archive it is the directory under which stored relative paths
+are written. When omitted, a single file is written next to
+.I INPUT
+using the stored basename (v1 containers strip a trailing
+.B .rcn
+from
+.IR INPUT );
+a folder archive is extracted under the current directory.
+.TP
+.BR \-f ", " \-\-force
+Overwrite existing files. Without this flag, decompress refuses to replace
+an existing path.
 .RE
 .TP
 .B bench
@@ -183,11 +200,29 @@ rcn compress \-\-level 1 input.bin output.rcn
 .fi
 .RE
 .PP
-Decompress:
+Decompress (restore the stored name):
 .PP
 .RS
 .nf
-rcn decompress output.rcn restored.bin
+rcn decompress output.rcn
+.fi
+.RE
+.PP
+Compress a folder and restore it:
+.PP
+.RS
+.nf
+rcn compress mydir out.rcn
+rcn decompress out.rcn
+rcn decompress out.rcn /tmp/restore
+.fi
+.RE
+.PP
+Decompress to an explicit path, overwriting if needed:
+.PP
+.RS
+.nf
+rcn decompress output.rcn restored.bin \-\-force
 .fi
 .RE
 .PP

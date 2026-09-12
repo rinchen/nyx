@@ -7,7 +7,7 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Use mimalloc as the global allocator for reduced BWT trial allocation overhead
 use mimalloc::MiMalloc;
@@ -19,7 +19,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use rcn::codec::{self, decompress, CodecMode};
+use rcn::codec::{self, decompress_archive, CodecMode};
+use rcn::container::validate_member_name;
 use rcn::level::Level;
 
 #[derive(Parser)]
@@ -99,9 +100,9 @@ fn resolve_engine(level: Option<Level>, mode: Option<ModeArg>) -> Result<CodecMo
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Compress a file into a .rcn (RCN1) container.
+    /// Compress a file or folder into a .rcn (RCN1) container.
     Compress {
-        /// Path to the input file.
+        /// Path to the input file or directory.
         #[arg(value_name = "INPUT")]
         input: PathBuf,
         /// Path for the compressed .rcn output.
@@ -122,14 +123,17 @@ enum Cmd {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// Decompress a .rcn (RCN1) container back to a file.
+    /// Decompress a .rcn (RCN1) container to the stored file or folder.
     Decompress {
         /// Path to the .rcn container.
         #[arg(value_name = "INPUT")]
         input: PathBuf,
-        /// Path for the restored output file.
+        /// Optional restore path (file for one member, directory for an archive).
         #[arg(value_name = "OUTPUT")]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Overwrite existing files.
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Benchmark rcn over every file in a corpus directory.
     Bench {
@@ -180,7 +184,11 @@ fn run() -> Result<(), String> {
             mode,
             verbose,
         } => cmd_compress(&input, &output, &backend, level, mode, verbose),
-        Cmd::Decompress { input, output } => cmd_decompress(&input, &output),
+        Cmd::Decompress {
+            input,
+            output,
+            force,
+        } => cmd_decompress(&input, output.as_deref(), force),
         Cmd::Bench {
             corpus,
             vs,
@@ -218,8 +226,12 @@ fn cmd_compress(
         ));
     }
     let mode = resolve_engine(level, mode)?;
-    let data = fs::read(input).map_err(|e| format!("read {}: {e}", input.display()))?;
-    let (compressed, diags) = codec::compress_mode_diag(&data, mode)
+    let (owned, orig_len) = collect_compress_members(input, output)?;
+    let refs: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    let (compressed, diags) = codec::compress_archive_diag(&refs, mode)
         .map_err(|e| format!("compress failed: {e}"))?;
     if verbose {
         for (i, d) in diags.iter().enumerate() {
@@ -234,26 +246,203 @@ fn cmd_compress(
         }
     }
     fs::write(output, &compressed).map_err(|e| format!("write {}: {e}", output.display()))?;
-    let ratio = compressed.len() as f64 / (data.len() as f64).max(1.0);
+    let ratio = compressed.len() as f64 / (orig_len as f64).max(1.0);
     eprintln!(
-        "compressed {} -> {} ({:.3}x, {} bytes)",
+        "compressed {} -> {} ({:.3}x, {} bytes, {} file{})",
         input.display(),
         output.display(),
         ratio,
-        compressed.len()
+        compressed.len(),
+        owned.len(),
+        if owned.len() == 1 { "" } else { "s" }
     );
     Ok(())
 }
 
-fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn collect_compress_members(
+    input: &Path,
+    output: &Path,
+) -> Result<(Vec<(String, Vec<u8>)>, u64), String> {
+    let meta = fs::symlink_metadata(input).map_err(|e| format!("stat {}: {e}", input.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing to compress symlink {}", input.display()));
+    }
+    if meta.is_file() {
+        let name = input
+            .file_name()
+            .ok_or_else(|| format!("{} has no file name", input.display()))?
+            .to_string_lossy()
+            .into_owned();
+        validate_member_name(&name).map_err(|e| e.to_string())?;
+        let data = fs::read(input).map_err(|e| format!("read {}: {e}", input.display()))?;
+        let len = data.len() as u64;
+        return Ok((vec![(name, data)], len));
+    }
+    if meta.is_dir() {
+        let root_label = input
+            .file_name()
+            .ok_or_else(|| format!("{} has no directory name", input.display()))?
+            .to_string_lossy()
+            .into_owned();
+        validate_member_name(&root_label).map_err(|e| e.to_string())?;
+        let mut members = Vec::new();
+        let mut total = 0u64;
+        collect_dir(input, input, &root_label, output, &mut members, &mut total)?;
+        if members.is_empty() {
+            return Err("nothing to compress".into());
+        }
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok((members, total));
+    }
+    Err(format!(
+        "{} is not a regular file or directory",
+        input.display()
+    ))
+}
+
+fn collect_dir(
+    dir: &Path,
+    root: &Path,
+    root_label: &str,
+    output: &Path,
+    members: &mut Vec<(String, Vec<u8>)>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| format!("read dir {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        if same_path(&path, output) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            eprintln!("rcn: skipping symlink {}", path.display());
+            continue;
+        }
+        if meta.is_dir() {
+            collect_dir(&path, root, root_label, output, members, total)?;
+            continue;
+        }
+        if !meta.is_file() {
+            eprintln!("rcn: skipping special file {}", path.display());
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| format!("{} is not under {}", path.display(), root.display()))?;
+        let mut name = root_label.to_string();
+        for c in rel.components() {
+            match c {
+                std::path::Component::Normal(p) => {
+                    name.push('/');
+                    name.push_str(&p.to_string_lossy());
+                }
+                _ => {
+                    return Err(format!("unsupported path component in {}", path.display()));
+                }
+            }
+        }
+        validate_member_name(&name).map_err(|e| format!("{}: {e}", path.display()))?;
+        let data = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        *total += data.len() as u64;
+        members.push((name, data));
+    }
+    Ok(())
+}
+
+fn dest_from_stored(root: &Path, stored: &str) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for part in stored.split('/') {
+        p.push(part);
+    }
+    p
+}
+
+fn strip_rcn_name(input: &Path) -> Option<PathBuf> {
+    let name = input.file_name()?.to_str()?;
+    let stripped = name.strip_suffix(".rcn")?;
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(input.with_file_name(stripped))
+}
+
+fn write_restored_file(dest: &Path, data: &[u8], force: bool) -> Result<(), String> {
+    if dest.exists() && !force {
+        return Err(format!("{} exists (use --force)", dest.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    fs::write(dest, data).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
+fn cmd_decompress(input: &Path, output: Option<&Path>, force: bool) -> Result<(), String> {
     let data = fs::read(input).map_err(|e| format!("read {}: {e}", input.display()))?;
-    let restored = decompress(&data).map_err(|e| format!("decompress failed: {e}"))?;
-    fs::write(output, &restored).map_err(|e| format!("write {}: {e}", output.display()))?;
+    let members =
+        decompress_archive(&data).map_err(|e| format!("decompress failed: {e}"))?;
+    if members.is_empty() {
+        return Err("archive has no members".into());
+    }
+
+    let is_tree = members.len() > 1 || members.iter().any(|(n, _)| n.contains('/'));
+    if !is_tree {
+        let (name, bytes) = &members[0];
+        let dest = if let Some(out) = output {
+            out.to_path_buf()
+        } else if !name.is_empty() {
+            input.with_file_name(name)
+        } else {
+            strip_rcn_name(input).ok_or_else(|| {
+                "v1 container has no stored name; pass OUTPUT or use a .rcn input".to_string()
+            })?
+        };
+        write_restored_file(&dest, bytes, force)?;
+        eprintln!(
+            "decompressed {} -> {} ({} bytes)",
+            input.display(),
+            dest.display(),
+            bytes.len()
+        );
+        return Ok(());
+    }
+
+    let dest_root = output.unwrap_or_else(|| Path::new("."));
+    let mut total = 0usize;
+    for (name, bytes) in &members {
+        if name.is_empty() {
+            return Err("archive member has an empty name".into());
+        }
+        validate_member_name(name).map_err(|e| e.to_string())?;
+        let dest = dest_from_stored(dest_root, name);
+        write_restored_file(&dest, bytes, force)?;
+        total += bytes.len();
+    }
     eprintln!(
-        "decompressed {} -> {} ({} bytes)",
+        "decompressed {} -> {} ({} file{}, {} bytes)",
         input.display(),
-        output.display(),
-        restored.len()
+        dest_root.display(),
+        members.len(),
+        if members.len() == 1 { "" } else { "s" },
+        total
     );
     Ok(())
 }
@@ -331,7 +520,7 @@ fn cmd_bench(
         let enc_ms = enc_start.elapsed().as_secs_f64() * 1000.0;
 
         let dec_start = Instant::now();
-        let Ok(restored) = decompress(&compressed) else {
+        let Ok(restored) = codec::decompress(&compressed) else {
             continue;
         };
         let dec_ms = dec_start.elapsed().as_secs_f64() * 1000.0;

@@ -50,7 +50,8 @@
 
 use crate::bwt::{self};
 use crate::container::{
-    read_global_dict, write_global_dict, BlockEntry, Header, FLAG_GLOBAL_DICT, VERSION,
+    read_global_dict, read_members, write_global_dict, write_members, BlockEntry, Header, Member,
+    FLAG_GLOBAL_DICT, VERSION, VERSION_V2,
 };
 use crate::entropy::range::{BitDecoder, BitEncoder};
 use crate::entropy::side_fse;
@@ -364,6 +365,33 @@ pub fn compress_mode_diag(buf: &[u8], mode: CodecMode) -> Result<(Vec<u8>, Vec<B
     compress_impl(buf, mode, &mut build_stack_for_kind)
 }
 
+/// Compress named members into a v2 `RCN1` archive (Hybrid by default via `mode`).
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if `members` is empty, a name is unsafe, or encoding fails.
+pub fn compress_archive(members: &[(&str, &[u8])], mode: CodecMode) -> Result<Vec<u8>> {
+    Ok(compress_archive_diag(members, mode)?.0)
+}
+
+/// Compress named members into a v2 archive, also returning per-block [`BlockDiag`].
+///
+/// # Errors
+///
+/// Returns [`RcnError`] if `members` is empty, a name is unsafe, or encoding fails.
+pub fn compress_archive_diag(
+    members: &[(&str, &[u8])],
+    mode: CodecMode,
+) -> Result<(Vec<u8>, Vec<BlockDiag>)> {
+    if members.is_empty() {
+        return Err(RcnError::InvalidContainer("nothing to compress".into()));
+    }
+    for (name, _) in members {
+        crate::container::validate_member_name(name)?;
+    }
+    compress_archive_impl(members, mode, &mut build_stack_for_kind)
+}
+
 fn compress_impl<F>(
     buf: &[u8],
     mode: CodecMode,
@@ -372,24 +400,102 @@ fn compress_impl<F>(
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
+    let encoded = encode_members(&[buf], mode, build_stack)?;
+    Ok(assemble_container(encoded, VERSION, &[]))
+}
+
+fn compress_archive_impl<F>(
+    members: &[(&str, &[u8])],
+    mode: CodecMode,
+    build_stack: &mut F,
+) -> Result<(Vec<u8>, Vec<BlockDiag>)>
+where
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
+{
+    let bufs: Vec<&[u8]> = members.iter().map(|(_, b)| *b).collect();
+    let encoded = encode_members(&bufs, mode, build_stack)?;
+    let table: Vec<Member> = members
+        .iter()
+        .zip(encoded.ranges.iter())
+        .map(|((name, _), &(first_block, num_blocks))| Member {
+            name: (*name).to_string(),
+            first_block,
+            num_blocks,
+        })
+        .collect();
+    Ok(assemble_container(encoded, VERSION_V2, &table))
+}
+
+struct EncodedArchive {
+    global_dict_bytes: Option<Vec<u8>>,
+    ranges: Vec<(u32, u32)>,
+    entries: Vec<BlockEntry>,
+    payloads: Vec<u8>,
+    diags: Vec<BlockDiag>,
+}
+
+fn assemble_container(
+    encoded: EncodedArchive,
+    version: u8,
+    members: &[Member],
+) -> (Vec<u8>, Vec<BlockDiag>) {
+    let mut out = Vec::new();
+    let header = Header {
+        version,
+        flags: if encoded.global_dict_bytes.is_some() {
+            FLAG_GLOBAL_DICT
+        } else {
+            0
+        },
+        block_size_log: DEFAULT_BLOCK_SIZE_LOG,
+        num_blocks: encoded.entries.len() as u32,
+    };
+    header.write(&mut out);
+    if let Some(ref dict) = encoded.global_dict_bytes {
+        write_global_dict(&mut out, dict);
+    }
+    if version == VERSION_V2 {
+        write_members(&mut out, members).expect("member names validated before encode");
+    }
+    for e in &encoded.entries {
+        e.write(&mut out);
+    }
+    out.extend_from_slice(&encoded.payloads);
+    (out, encoded.diags)
+}
+
+fn encode_members<F>(
+    bufs: &[&[u8]],
+    mode: CodecMode,
+    build_stack: &mut F,
+) -> Result<EncodedArchive>
+where
+    F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
+{
     use rayon::prelude::*;
 
-    // Phase 1: classify the whole input into block segments (deterministic).
-    let mut segments: Vec<(usize, usize, crate::classify::BlockKind)> = Vec::new();
-    {
+    // Phase 1: classify each member independently (do not concatenate first).
+    let mut segments: Vec<(usize, usize, usize, crate::classify::BlockKind)> = Vec::new();
+    for (mi, buf) in bufs.iter().enumerate() {
         let mut offset = 0usize;
         while offset < buf.len() {
             let kind = crate::classify::classify(&buf[offset..]);
             let block_size = block_size_for_kind(kind, offset, buf.len(), mode);
             let end = (offset + block_size).min(buf.len());
-            segments.push((offset, end, kind));
+            segments.push((mi, offset, end, kind));
             offset = end;
         }
     }
 
     let global_dict: Option<XwrtDictionary> = match mode {
         CodecMode::Wire | CodecMode::General => None,
-        _ => Some(XwrtDictionary::build_from_data(buf)),
+        _ => {
+            let mut concat = Vec::new();
+            for buf in bufs {
+                concat.extend_from_slice(buf);
+            }
+            Some(XwrtDictionary::build_from_data(&concat))
+        }
     };
 
     let use_slow_for = |kind: crate::classify::BlockKind| match mode {
@@ -409,7 +515,7 @@ where
     let parallel_idxs: Vec<usize> = segments
         .iter()
         .enumerate()
-        .filter(|(_, (_, _, kind))| {
+        .filter(|(_, (_, _, _, kind))| {
             if mode == CodecMode::Wire {
                 return true;
             }
@@ -427,11 +533,11 @@ where
         let parallel_out: Vec<(usize, (Vec<u8>, u8, usize))> = parallel_idxs
             .par_iter()
             .map(|&i| {
-                let (start, end, kind) = segments[i];
+                let (mi, start, end, kind) = segments[i];
                 let mut hist = Vec::new();
                 let r = encode_block_fastish(
                     mode,
-                    &buf[start..end],
+                    &bufs[mi][start..end],
                     kind,
                     dict_ref,
                     &mut hist,
@@ -443,11 +549,11 @@ where
             encoded[i] = Some(r);
         }
     } else if let Some(&i) = parallel_idxs.first() {
-        let (start, end, kind) = segments[i];
+        let (mi, start, end, kind) = segments[i];
         let mut hist = Vec::new();
         encoded[i] = Some(encode_block_fastish(
             mode,
-            &buf[start..end],
+            &bufs[mi][start..end],
             kind,
             global_dict.as_ref(),
             &mut hist,
@@ -456,18 +562,24 @@ where
 
     // Phase 2: serial encode for Slow blocks and Fast Binary/Exec (match hist).
     let mut last_kind: Option<crate::classify::BlockKind> = None;
+    let mut last_member: Option<usize> = None;
     let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
     let mut match_hist: Vec<u8> = Vec::new();
 
-    for (i, &(start, end, kind)) in segments.iter().enumerate() {
+    for (i, &(mi, start, end, kind)) in segments.iter().enumerate() {
+        if last_member != Some(mi) {
+            last_member = Some(mi);
+            last_kind = None;
+            match_hist.clear();
+        }
         if encoded[i].is_some() {
             // Already done in the parallel Fast Text/Random pass.
             match_hist.clear();
             continue;
         }
-        let block_data = &buf[start..end];
+        let block_data = &bufs[mi][start..end];
         let use_slow = use_slow_for(kind);
 
         if use_slow && last_kind != Some(kind) {
@@ -505,15 +617,20 @@ where
         encoded[i] = Some((comp, method, store_orig_len));
     }
 
-    // Phase 3: assemble container in segment order.
-    let mut out = Vec::new();
+    // Phase 3: assemble entries in segment order and record per-member ranges.
     let mut entries: Vec<BlockEntry> = Vec::new();
     let mut payloads: Vec<u8> = Vec::new();
     let mut diags: Vec<BlockDiag> = Vec::new();
+    let mut first_block = vec![0u32; bufs.len()];
+    let mut num_blocks = vec![0u32; bufs.len()];
 
-    for (i, &(start, end, kind)) in segments.iter().enumerate() {
-        let block_data = &buf[start..end];
+    for (i, &(mi, start, end, kind)) in segments.iter().enumerate() {
+        let block_data = &bufs[mi][start..end];
         let (comp, method, store_orig_len) = encoded[i].take().expect("block encoded");
+        if num_blocks[mi] == 0 {
+            first_block[mi] = entries.len() as u32;
+        }
+        num_blocks[mi] += 1;
         entries.push(BlockEntry {
             comp_len: comp.len() as u32,
             orig_len: store_orig_len as u32,
@@ -529,26 +646,15 @@ where
         payloads.extend_from_slice(&comp);
     }
 
-    let header = Header {
-        version: VERSION,
-        flags: if global_dict.is_some() {
-            FLAG_GLOBAL_DICT
-        } else {
-            0
-        },
-        block_size_log: DEFAULT_BLOCK_SIZE_LOG,
-        num_blocks: entries.len() as u32,
-    };
-    header.write(&mut out);
-    if let Some(ref dict) = global_dict {
-        let dict_bytes = dict.to_bytes();
-        write_global_dict(&mut out, &dict_bytes);
-    }
-    for e in &entries {
-        e.write(&mut out);
-    }
-    out.extend_from_slice(&payloads);
-    Ok((out, diags))
+    let ranges: Vec<(u32, u32)> = first_block.into_iter().zip(num_blocks).collect();
+    let global_dict_bytes = global_dict.as_ref().map(XwrtDictionary::to_bytes);
+    Ok(EncodedArchive {
+        global_dict_bytes,
+        ranges,
+        entries,
+        payloads,
+        diags,
+    })
 }
 
 /// Dispatch Fast / General / Wire per-block encode (no Slow bit CM).
@@ -1318,10 +1424,32 @@ fn decode_block_with_matches(
 
 /// Decompress a `RCN1` container back to the original bytes.
 ///
+/// v1 streams and v2 archives with exactly one member succeed. A v2 archive
+/// with two or more members returns [`RcnError::InvalidContainer`]; use
+/// [`decompress_archive`] instead.
+///
+/// # Errors
+///
+/// Returns [`RcnError`] on a malformed container, corrupt block, CRC mismatch,
+/// or a multi-member v2 archive.
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let members = decompress_impl(data, &mut build_stack_for_kind)?;
+    if members.len() > 1 {
+        return Err(RcnError::InvalidContainer(
+            "multi-member archive; use decompress_archive".into(),
+        ));
+    }
+    Ok(members.into_iter().next().map(|(_, b)| b).unwrap_or_default())
+}
+
+/// Decompress a v1 stream or v2 archive into named members.
+///
+/// v1 containers have no stored name; the single member's name is empty.
+///
 /// # Errors
 ///
 /// Returns [`RcnError`] on a malformed container, corrupt block, or CRC mismatch.
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+pub fn decompress_archive(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     decompress_impl(data, &mut build_stack_for_kind)
 }
 
@@ -1334,27 +1462,81 @@ pub fn decompress_with<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
-    decompress_impl(data, build_stack)
+    let members = decompress_impl(data, build_stack)?;
+    if members.len() > 1 {
+        return Err(RcnError::InvalidContainer(
+            "multi-member archive; use decompress_archive".into(),
+        ));
+    }
+    Ok(members.into_iter().next().map(|(_, b)| b).unwrap_or_default())
 }
 
-fn decompress_impl<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<u8>>
+fn member_index_for_block(members: &[Member], bi: usize) -> Option<usize> {
+    members.iter().position(|m| {
+        let start = m.first_block as usize;
+        let end = start.saturating_add(m.num_blocks as usize);
+        bi >= start && bi < end
+    })
+}
+
+fn split_archive_output(
+    out: &[u8],
+    entries: &[BlockEntry],
+    members: &[Member],
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut ends = Vec::with_capacity(entries.len());
+    let mut pos = 0usize;
+    for e in entries {
+        pos = pos.saturating_add(e.orig_len as usize);
+        ends.push(pos);
+    }
+    let mut result = Vec::with_capacity(members.len());
+    for m in members {
+        let start = m.first_block as usize;
+        let n = m.num_blocks as usize;
+        if start.saturating_add(n) > entries.len() {
+            return Err(RcnError::InvalidContainer(format!(
+                "member '{}' block range {}+{} overruns {} entries",
+                m.name,
+                m.first_block,
+                m.num_blocks,
+                entries.len()
+            )));
+        }
+        if n == 0 {
+            result.push((m.name.clone(), Vec::new()));
+            continue;
+        }
+        let start_off = if start == 0 { 0 } else { ends[start - 1] };
+        let end_off = ends[start + n - 1];
+        result.push((m.name.clone(), out[start_off..end_off].to_vec()));
+    }
+    Ok(result)
+}
+
+fn decompress_impl<F>(data: &[u8], build_stack: &mut F) -> Result<Vec<(String, Vec<u8>)>>
 where
     F: FnMut(crate::classify::BlockKind) -> (Vec<crate::model::stack_enum::StackModel>, MixerBank, Option<usize>),
 {
     use std::io::Cursor;
     let mut cur = Cursor::new(data);
     let header = Header::read(&mut cur).map_err(|e| RcnError::InvalidContainer(e.to_string()))?;
-    if header.version != VERSION {
+    if header.version != VERSION && header.version != VERSION_V2 {
         return Err(RcnError::InvalidContainer(format!(
             "unsupported version {}",
             header.version
         )));
     }
     // Consume the global XWRT dictionary (if present) from between the header
-    // and the BlockEntry table; every XWRT block refers back to it.
+    // and the member table / BlockEntry table; every XWRT block refers back to it.
     let (global_dict_bytes, dict_end) =
         read_global_dict(data, cur.position() as usize, header.flags)?;
-    cur.set_position(dict_end as u64);
+    let (members_meta, table_end) = if header.version == VERSION_V2 {
+        read_members(data, dict_end)?
+    } else {
+        (Vec::new(), dict_end)
+    };
+    cur.set_position(table_end as u64);
     let global_dict = XwrtDictionary::from_bytes(&global_dict_bytes);
 
     // Bound entry-table size against remaining bytes (13 bytes each).
@@ -1379,15 +1561,39 @@ where
     let payload_start = cur.position() as usize;
     let payloads = &data[payload_start..];
 
+    for m in &members_meta {
+        let start = m.first_block as usize;
+        let n = m.num_blocks as usize;
+        if start.saturating_add(n) > entries.len() {
+            return Err(RcnError::InvalidContainer(format!(
+                "member '{}' block range {}+{} overruns {} entries",
+                m.name,
+                m.first_block,
+                m.num_blocks,
+                entries.len()
+            )));
+        }
+    }
+
     let mut out = Vec::new();
     let mut pos = 0usize;
     let mut last_kind: Option<crate::classify::BlockKind> = None;
+    let mut last_member: Option<usize> = None;
     let mut models: Vec<crate::model::stack_enum::StackModel> = Vec::new();
     let mut mixer = MixerBank::new(0);
     let mut lzp_idx: Option<usize> = None;
     let mut match_hist: Vec<u8> = Vec::new();
     let mut hist_kind: Option<crate::classify::BlockKind> = None;
     for (bi, entry) in entries.iter().enumerate() {
+        if header.version == VERSION_V2 {
+            let cur_m = member_index_for_block(&members_meta, bi);
+            if cur_m != last_member {
+                last_member = cur_m;
+                last_kind = None;
+                match_hist.clear();
+                hist_kind = None;
+            }
+        }
         let comp_len = entry.comp_len as usize;
         if pos.saturating_add(comp_len) > payloads.len() {
             return Err(RcnError::TruncatedStream(bi));
@@ -1517,7 +1723,10 @@ where
             mixer.decay(BLOCK_DECAY);
         }
     }
-    Ok(out)
+    if header.version == VERSION {
+        return Ok(vec![("".into(), out)]);
+    }
+    split_archive_output(&out, &entries, &members_meta)
 }
 
 /// Reverse map: container method byte → `BlockKind`. Unknown methods error.
@@ -1903,5 +2112,74 @@ mod tests {
             err,
             RcnError::TruncatedStream(_) | RcnError::InvalidContainer(_)
         ));
+    }
+
+    #[test]
+    fn compress_archive_single_file_round_trips_name_and_bytes() {
+        let original = b"named single file payload".repeat(80);
+        let comp = compress_archive(&[("input.bin", original.as_slice())], CodecMode::Hybrid)
+            .expect("compress_archive");
+        let members = decompress_archive(&comp).expect("decompress_archive");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "input.bin");
+        assert_eq!(members[0].1, original);
+        let via_decompress = decompress(&comp).expect("decompress single member");
+        assert_eq!(via_decompress, original);
+    }
+
+    #[test]
+    fn compress_archive_two_files_round_trips_and_decompress_errors() {
+        let a = b"alpha file contents alpha file contents".repeat(40);
+        let b = b"bravo file contents bravo file contents".repeat(40);
+        let comp = compress_archive(
+            &[("mydir/a.txt", a.as_slice()), ("mydir/b.txt", b.as_slice())],
+            CodecMode::Hybrid,
+        )
+        .expect("compress_archive");
+        let members = decompress_archive(&comp).expect("decompress_archive");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], ("mydir/a.txt".into(), a));
+        assert_eq!(members[1], ("mydir/b.txt".into(), b));
+        let err = decompress(&comp).unwrap_err();
+        assert!(matches!(err, RcnError::InvalidContainer(_)));
+        assert!(err.to_string().contains("multi-member"));
+    }
+
+    #[test]
+    fn v1_decompress_archive_has_empty_name() {
+        let original = b"anonymous v1 stream".repeat(50);
+        let comp = compress(&original).expect("compress v1");
+        let back = decompress(&comp).expect("decompress");
+        assert_eq!(back, original);
+        let members = decompress_archive(&comp).expect("decompress_archive");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "");
+        assert_eq!(members[0].1, original);
+    }
+
+    #[test]
+    fn compress_archive_empty_file_round_trips() {
+        let other = b"sibling".repeat(20);
+        let comp = compress_archive(
+            &[("empty.dat", &[] as &[u8]), ("other.txt", other.as_slice())],
+            CodecMode::Wire,
+        )
+        .expect("compress_archive");
+        let members = decompress_archive(&comp).expect("decompress_archive");
+        assert_eq!(members[0], ("empty.dat".into(), Vec::new()));
+        assert_eq!(members[1], ("other.txt".into(), other));
+    }
+
+    #[test]
+    fn compress_archive_empty_member_list_errors() {
+        let err = compress_archive(&[], CodecMode::Hybrid).unwrap_err();
+        assert!(matches!(err, RcnError::InvalidContainer(_)));
+        assert!(err.to_string().contains("nothing to compress"));
+    }
+
+    #[test]
+    fn compress_archive_rejects_dotdot_name() {
+        let err = compress_archive(&[("../x", b"data".as_slice())], CodecMode::Wire).unwrap_err();
+        assert!(matches!(err, RcnError::InvalidContainer(_)));
     }
 }
