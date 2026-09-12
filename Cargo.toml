@@ -1,6 +1,6 @@
 [package]
 name = "rcn"
-version = "0.2.2"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Leveled Rust compressor (wire LZ, byte CM, hybrid BWT/CM) aiming to win ratio and compress speed vs each peer class"
